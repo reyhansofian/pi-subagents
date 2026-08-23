@@ -461,6 +461,26 @@ test("edit and write tool calls count as mutation attempts", () => {
 	assert.equal(hasMutationToolCall([assistantToolCall("write", { path: "a.ts" })]), true);
 });
 
+test("failed apply_patch tool calls count as mutation attempts", () => {
+	const messages = [
+		assistantToolCall("apply_patch", { patch: "*** Begin Patch\n*** End Patch" }),
+		{ role: "toolResult", toolName: "apply_patch", isError: true, content: [{ type: "text", text: "patch failed" }] } as Message,
+	];
+
+	assert.equal(isMutatingTool("apply_patch", { patch: "*** Begin Patch\n*** End Patch" }), true);
+	assert.equal(hasMutationToolCall(messages), true);
+	assert.deepEqual(evaluateCompletionMutationGuard({
+		agent: "worker",
+		task: "Implement the approved fix",
+		messages,
+	}), {
+		expectedMutation: true,
+		attemptedMutation: true,
+		triggered: false,
+		blocked: false,
+	});
+});
+
 test("obvious mutating bash commands count as mutation attempts", () => {
 	assert.equal(hasMutationToolCall([assistantToolCall("bash", { command: "mkdir -p src && cat > src/file.ts <<'EOF'\nhi\nEOF" })]), true);
 	assert.equal(hasMutationToolCall([assistantToolCall("bash", { command: "cat <<'EOF' > src/file.ts\nhi\nEOF" })]), true);
