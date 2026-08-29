@@ -843,7 +843,7 @@ async function runSingleAttempt(
 			return key ? removeActiveToolCallKey(key) : undefined;
 		};
 		const openToolAttentionTarget = (now: number): ActiveToolCall | undefined => [...activeToolCalls.values()]
-			.filter((active) => shouldEmitOpenToolAttention({ config: controlConfig, currentTool: active.tool, currentToolStartedAt: active.startedAt, now }))
+			.filter((active) => shouldEmitOpenToolAttention({ config: controlConfig, currentTool: active.tool, currentToolStartedAt: active.startedAt, lastActivityAt: progress.lastActivityAt, now }))
 			.sort((left, right) => left.startedAt - right.startedAt)[0];
 		const mutatingFailures = createMutatingFailureState();
 		const mutatingFailureWindowMs = 5 * 60_000;

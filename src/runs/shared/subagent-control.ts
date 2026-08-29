@@ -113,12 +113,14 @@ export function shouldEmitOpenToolAttention(input: {
 	config: ResolvedControlConfig;
 	currentTool?: string;
 	currentToolStartedAt?: number;
+	lastActivityAt?: number;
 	now?: number;
 }): boolean {
 	if (!input.config.enabled || !input.currentTool || input.currentToolStartedAt === undefined) return false;
 	if (isToolTimeoutExempt(input.currentTool)) return false;
 	const now = input.now ?? Date.now();
-	return Math.max(0, now - input.currentToolStartedAt) >= input.config.activeNoticeAfterMs;
+	const lastActivity = Math.max(input.currentToolStartedAt, input.lastActivityAt ?? input.currentToolStartedAt);
+	return Math.max(0, now - lastActivity) >= input.config.activeNoticeAfterMs;
 }
 
 export function buildControlEvent(input: {
