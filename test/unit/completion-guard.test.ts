@@ -482,6 +482,23 @@ test("declared extension mutation tools count without weakening unknown tools", 
 	}).triggered, true);
 });
 
+test("failed apply_patch tool calls count as mutation attempts", () => {
+	const messages = [assistantToolCall("apply_patch", { patch: "*** Begin Patch\n*** End Patch" })];
+	assert.equal(isMutatingTool("apply_patch", {}), true);
+	assert.equal(hasMutationToolCall(messages), true);
+	assert.deepEqual(evaluateCompletionMutationGuard({
+		agent: "worker",
+		task: "Implement the approved fix",
+		messages,
+		tools: ["read", "apply_patch"],
+	}), {
+		expectedMutation: true,
+		attemptedMutation: true,
+		triggered: false,
+		blocked: false,
+	});
+});
+
 test("obvious mutating bash commands count as mutation attempts", () => {
 	assert.equal(hasMutationToolCall([assistantToolCall("bash", { command: "mkdir -p src && cat > src/file.ts <<'EOF'\nhi\nEOF" })]), true);
 	assert.equal(hasMutationToolCall([assistantToolCall("bash", { command: "cat <<'EOF' > src/file.ts\nhi\nEOF" })]), true);

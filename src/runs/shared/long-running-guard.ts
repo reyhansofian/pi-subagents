@@ -144,7 +144,7 @@ export function isMutatingBashCommand(command: string): boolean {
 export function isMutatingTool(toolName: string | undefined, args: Record<string, unknown> | undefined, mutationTools?: readonly string[]): boolean {
 	if (!toolName) return false;
 	if (mutationTools?.includes(toolName)) return true;
-	if (toolName === "edit" || toolName === "write") return true;
+	if (toolName === "edit" || toolName === "write" || toolName === "apply_patch") return true;
 	if (toolName === "cursor") {
 		const activityTitle = typeof args?.activityTitle === "string" ? args.activityTitle : "";
 		return /^Cursor (?:edit|write)\b/i.test(activityTitle);
