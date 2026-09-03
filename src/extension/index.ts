@@ -63,6 +63,7 @@ import { applyModelExclusionsConfig, loadConfig, resolveAsyncByDefault, resolveS
 import { buildSubagentToolDescription, buildSubagentToolPromptMetadata } from "./tool-description.ts";
 import { formatWorkflowPreflightSummary, normalizeWorkflowPreflight } from "../workflows/workflow-preflight.ts";
 import { finalizeToolResult } from "./tool-result.ts";
+import { registerSubagentCodeMode } from "./code-mode.ts";
 import { collectGoalContinuationNotices } from "../missions/goal-driver.ts";
 import { restoreForegroundRunHistory } from "../runs/foreground/foreground-history.ts";
 import { resolveMissionStoreLocation } from "../missions/store.ts";
@@ -752,6 +753,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	};
 
 	pi.registerTool(tool);
+	const codeModeRegistration = registerSubagentCodeMode(pi, tool);
 
 	registerWaitTool(pi, state, waitToolConfig.enabled, waitSubscriptionManager, waitToolConfig.defaultTimeoutMs);
 
@@ -958,6 +960,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		cleanup() {
 			if (runtimeCleaned) return;
 			runtimeCleaned = true;
+			codeModeRegistration.unregister();
 			const shuttingDownParentSession = parentSessionEnvValue;
 			// Workflow continuations retain their launch context; abort them before
 			// teardown so a reload cannot launch through a stale context.
