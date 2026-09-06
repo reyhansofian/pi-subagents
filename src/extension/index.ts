@@ -709,7 +709,11 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		parameters,
 
 		async execute(id, params, signal, onUpdate, ctx) {
-			return finalizeToolResult(await executeSubagentCollapsed(id, params as SubagentParamsLike, signal ?? new AbortController().signal, onUpdate, ctx));
+			const result = finalizeToolResult(await executeSubagentCollapsed(id, params as SubagentParamsLike, signal ?? new AbortController().signal, onUpdate, ctx));
+			if (result.details.mode === "workflow" && result.details.asyncId && state.asyncJobs.has(result.details.asyncId)) {
+				herdrStatusBridge.syncRuns();
+			}
+			return result;
 		},
 
 		renderCall(args, theme) {

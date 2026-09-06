@@ -677,6 +677,67 @@ describe("subagent extension child mode", () => {
 		execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env: parentToolEnv(), stdio: "pipe" });
 	});
 
+	it("keeps Herdr busy for a registered async workflow launched through an outer tool", () => {
+		const script = String.raw`
+			import * as fs from "node:fs";
+			import * as os from "node:os";
+			import * as path from "node:path";
+			import registerSubagentExtension from "./index.ts";
+			import { createMockPi } from "./test/support/helpers.ts";
+			const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-herdr-workflow-"));
+			const releasePath = path.join(projectDir, "release-child");
+			const mockPi = createMockPi();
+			mockPi.install();
+			mockPi.onCall({ waitForPath: releasePath, output: "child complete" });
+			fs.mkdirSync(path.join(projectDir, ".pi", "agents"), { recursive: true });
+			fs.writeFileSync(path.join(projectDir, ".pi", "agents", "worker.md"), "---\\nname: worker\\ndescription: test worker\\ncompletionGuard: false\\n---\\nWait for completion.");
+			const listeners = new Map();
+			const handlers = new Map();
+			const busy = [];
+			const events = {
+				on(channel, handler) { const set = listeners.get(channel) ?? new Set(); set.add(handler); listeners.set(channel, set); return () => set.delete(handler); },
+				emit(channel, payload) { if (channel === "herdr:busy") busy.push(payload); for (const handler of listeners.get(channel) ?? []) handler(payload); },
+			};
+			let registeredTool;
+			process.env.HERDR_ENV = "1";
+			process.env.HERDR_PANE_ID = "w1:p1";
+			const fakePi = new Proxy({
+				events,
+				on(channel, handler) { handlers.set(channel, handler); },
+				registerTool(tool) { if (tool.name === "subagent") registeredTool = tool; },
+				registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, sendMessage() {}, getSessionName() { return undefined; },
+				exec() { return Promise.resolve({ code: 0, stdout: "", stderr: "", killed: false }); },
+			}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
+			const ctx = {
+				cwd: projectDir, hasUI: true,
+				ui: { setToolsExpanded() {}, setWidget() {}, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } },
+				sessionManager: { getSessionId() { return "herdr-workflow-session"; }, getSessionFile() { return null; }, getEntries() { return []; } },
+				modelRegistry: { getAvailable() { return []; } },
+			};
+			try {
+				registerSubagentExtension(fakePi);
+				handlers.get("session_start")({ reason: "startup" }, ctx);
+				const result = await registeredTool.execute("outer-exec-child", {
+					workflowScript: "return await runs.run('pending', { agent: 'worker', task: 'wait', async: false });",
+					async: true,
+				}, new AbortController().signal, undefined, ctx);
+				if (result.details.mode !== "workflow" || !result.details.asyncId) throw new Error("registered workflow did not return rich async details: " + JSON.stringify(result.details));
+				handlers.get("tool_result")({ toolName: "exec", details: { nestedResult: result } }, ctx);
+				if (!busy.some((event) => event.active === true)) throw new Error("Herdr busy was not raised through the registered launch: " + JSON.stringify(busy));
+				if (result.details.workflowChildren?.workflowRunId !== result.details.asyncId) throw new Error("workflow child metadata was replaced: " + JSON.stringify(result.details));
+				fs.writeFileSync(releasePath, "release");
+				const deadline = Date.now() + 10000;
+				while (!busy.some((event) => event.active === false) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+				if (!busy.some((event) => event.active === false)) throw new Error("Herdr busy did not lower after actual workflow completion: " + JSON.stringify(busy));
+				await handlers.get("session_shutdown")();
+			} finally {
+				mockPi.uninstall();
+				fs.rmSync(projectDir, { recursive: true, force: true });
+			}
+		`;
+		execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env: parentToolEnv(), stdio: "pipe" });
+	});
+
 	it("keeps independent extension runtimes active in one process", () => {
 		const script = String.raw`
 			import registerSubagentExtension from "./index.ts";
