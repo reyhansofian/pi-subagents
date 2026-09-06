@@ -2,7 +2,11 @@
 .pi/subagents/
 .pi-subagents/
 .DS_Store
+.worktrees/
+.serena/
 node_modules/
+# CocoIndex Code (ccc)
+/.cocoindex_code/
 .fallow/
 tmp/
 
