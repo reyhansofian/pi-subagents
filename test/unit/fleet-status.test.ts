@@ -178,6 +178,16 @@ describe("below-editor subagent FleetView", () => {
 			assert.ok(compactLines[0]!.includes("↓/← to inspect"));
 			assert.ok(visibleWidth(compactLines[0]!) <= 80);
 
+			state.activeAsyncCapacity = { used: 0, limit: 0 };
+			const unlimitedIdleSummary = component.render(80)[0]!;
+			assert.match(unlimitedIdleSummary, /7 active agents/);
+			assert.doesNotMatch(unlimitedIdleSummary, /Async runs 0\/∞/);
+			state.activeAsyncCapacity = { used: 2, limit: 0 };
+			assert.match(component.render(80)[0]!, /Async runs 2\/∞/);
+			state.activeAsyncCapacity = { used: 0, limit: 4 };
+			assert.match(component.render(80)[0]!, /Async runs 0\/4/);
+			state.activeAsyncCapacity = { used: 2, limit: 4 };
+
 			assert.deepEqual(fleet.handleKey("\x1b[B"), { consume: true });
 			const expandedLines = component.render(80);
 			assert.ok(expandedLines.some((line) => line.includes("> main")));
@@ -256,6 +266,46 @@ describe("below-editor subagent FleetView", () => {
 		} finally {
 			fleet.dispose();
 		}
+	});
+
+	it("repaints unchanged running entries but keeps queued-only ticks quiet", () => {
+		const refreshCount = (status: "running" | "queued"): number => {
+			const state = stateForTest();
+			state.asyncJobs.set(`run-${status}`, {
+				asyncId: `run-${status}`,
+				asyncDir: `/tmp/run-${status}`,
+				status,
+				mode: "single",
+				startedAt: 10,
+				updatedAt: 20,
+			});
+			let widgetFactory: ((tui: unknown, theme: typeof theme) => { render(width: number): string[] }) | undefined;
+			let renderRequests = 0;
+			const ctx = {
+				hasUI: true,
+				ui: {
+					setWidget(_key: string, content: typeof widgetFactory | undefined) { if (content) widgetFactory = content; },
+					onTerminalInput() { return () => {}; },
+					getEditorText() { return ""; },
+					requestRender() {},
+					notify() {},
+					theme,
+				},
+			} as unknown as ExtensionContext;
+			const fleet = new SubagentFleetStatus(state, () => {}, { refreshMs: 60_000 });
+			try {
+				fleet.setContext(ctx);
+				assert.ok(widgetFactory);
+				widgetFactory!({ requestRender() { renderRequests++; } }, theme);
+				fleet.refresh();
+				return renderRequests;
+			} finally {
+				fleet.dispose();
+			}
+		};
+
+		assert.equal(refreshCount("running"), 1);
+		assert.equal(refreshCount("queued"), 0);
 	});
 
 	it("counts project panes in compact status", () => {
@@ -966,6 +1016,27 @@ describe("below-editor subagent FleetView", () => {
 		assert.deepEqual(workflow?.workflowRows?.map((row) => row.name), ["review (reviewer)"]);
 	});
 
+	it("keeps advisory preflight declarations out of Fleet runtime rows and counts", () => {
+		const state = stateForTest();
+		state.asyncJobs.set("workflow-preflight", {
+			asyncId: "workflow-preflight",
+			asyncDir: "/tmp/workflow-preflight",
+			status: "running",
+			mode: "workflow",
+			startedAt: 10,
+			updatedAt: 20,
+			preflight: { version: 1, coverage: "partial", lanes: [{ key: "pr14", mode: "review" }] },
+			steps: [{ agent: "reviewer", workflowKey: "pr14-quality", status: "running" }],
+		});
+
+		const workflow = collectFleetStatusEntries(state).find((entry) => entry.key === "async:workflow-preflight");
+		assert.deepEqual(workflow?.workflowRows?.map((row) => [row.name, row.state]), [["pr14-quality (reviewer)", "running"]]);
+		assert.deepEqual(
+			workflow?.workflowChecklist && { total: workflow.workflowChecklist.total, running: workflow.workflowChecklist.running, queued: workflow.workflowChecklist.queued },
+			{ total: 1, running: 1, queued: 0 },
+		);
+	});
+
 	it("renders bounded workflow progress rows under the workflow parent", () => {
 		const state = stateForTest();
 		const workflowJob = {
@@ -977,8 +1048,8 @@ describe("below-editor subagent FleetView", () => {
 			startedAt: 10,
 			updatedAt: 20,
 			steps: [
-				{ agent: "scout", workflowKey: "scan", phase: "Plan", label: "Find seams", status: "complete" as const, index: 0, tokens: { input: 10, output: 5, total: 15 } },
-				{ agent: "reviewer", workflowKey: "review", phase: "Review", status: "running" as const, index: 1, currentTool: "grep", tokens: { input: 20, output: 5, total: 25 } },
+				{ agent: "scout", workflowKey: "scan", phase: "Plan", label: "Find seams", status: "complete" as const, index: 0, context: "fresh" as const, model: "openai-codex/gpt-5.6-luna", thinking: "max", tokens: { input: 10, output: 5, total: 15 } },
+				{ agent: "reviewer", workflowKey: "review", phase: "Review", status: "running" as const, index: 1, context: "fork" as const, currentTool: "grep", tokens: { input: 20, output: 5, total: 25 } },
 				{ agent: "tester", workflowKey: "test", phase: "Verify", status: "pending" as const, index: 2 },
 			],
 		};
@@ -1007,8 +1078,8 @@ describe("below-editor subagent FleetView", () => {
 			assert.deepEqual(fleet.handleKey("\x1b[B"), { consume: true });
 			const lines = component.render(140).join("\n");
 			assert.match(lines, /workflow · running/);
-			assert.match(lines, /Plan: scan · Find seams \(scout\) · complete/);
-			assert.match(lines, /Review: review \(reviewer\) · running · tool grep/);
+			assert.match(lines, /Plan: scan · Find seams \(scout\) \[fresh\] \(gpt-5\.6-luna · thinking max\) · complete/);
+			assert.match(lines, /Review: review \(reviewer\) \[fork\] · running · tool grep/);
 			assert.match(lines, /Verify: test \(tester\) · pending/);
 		} finally {
 			fleet.dispose();

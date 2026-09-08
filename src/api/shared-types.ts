@@ -5,6 +5,8 @@ export {
 	type AcceptanceInput,
 	type AcceptanceLedger,
 	type AcceptanceLevel,
+	type AgentCapabilitiesSnapshot,
+	type AgentCapabilityRow,
 	type AsyncStartedEvent,
 	type ControlEvent,
 	type Details,
@@ -18,4 +20,8 @@ export {
 	type SubagentResultStatus,
 	type SubagentRunMode,
 	type Usage,
+	type ManagedWorktreeProvider,
+	type WorktreeNaming,
+	type WorktreeProvider,
+	type WorkflowResourceProvenance,
 } from "../shared/types.ts";

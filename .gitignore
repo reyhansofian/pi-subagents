@@ -2,15 +2,17 @@
 .pi/subagents/
 .pi-subagents/
 .DS_Store
-.worktrees/
-.serena/
 node_modules/
-# CocoIndex Code (ccc)
-/.cocoindex_code/
 .fallow/
 tmp/
+.worktrees/
+.serena/
+# CocoIndex Code (ccc)
+/.cocoindex_code/
 
 # Fallback ignores for local ad-hoc agent and lane reports.
+/memory.md
+/todo.md
 /reports/
 /*-report*.json
 /issue-*-council-*.json

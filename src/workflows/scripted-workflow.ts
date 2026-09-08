@@ -4,11 +4,21 @@ import { dirname, resolve as resolvePath } from "node:path";
 import { Worker } from "node:worker_threads";
 import { DEFAULT_GLOBAL_CONCURRENCY_LIMIT, Semaphore } from "../runs/shared/parallel-utils.ts";
 import { HOST_STEP_MAX_COUNT } from "../runs/shared/host-step-status.ts";
-import type { HostStepNodeV1, SingleResult } from "../shared/types.ts";
+import { classifyTaskMutationIntent } from "../runs/shared/task-intent.ts";
+import { describeGateAcceptanceConflict } from "../runs/shared/acceptance.ts";
+import type { AcceptanceRecoveryMetadata, HostStepNode, SingleResult } from "../shared/types.ts";
 import { normalizeWorkflowHostCommandParams, type WorkflowHostCommandParams, type WorkflowHostCommandResult } from "./host-command.ts";
 
 const KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const BASE_REF_VALIDATION_ERROR = "baseRef must be a valid Git ref: use HEAD or a supported named ref (for example, refs/heads/main). Full 40/64-character commit IDs and revision expressions are unsupported.";
+function validGitRef(ref: unknown): ref is string {
+	if (typeof ref !== "string" || !ref || ref === "@" || Buffer.byteLength(ref, "utf-8") > 1024 || ref.startsWith("/") || ref.endsWith("/") || ref.includes("//") || ref.includes("..") || ref.includes("@{")) return false;
+	if (/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu.test(ref)) return false;
+	if (/[[\]\\~^:?*\u0000-\u0020\u007f]/u.test(ref) || ref.endsWith(".") || ref.endsWith(".lock")) return false;
+	return ref.split("/").every((component) => component.length > 0 && component !== "." && component !== ".." && !component.startsWith(".") && !component.endsWith(".") && !component.endsWith(".lock"));
+}
 const requireFromPackage = createRequire(import.meta.url);
+const WORKFLOW_ASSEMBLY_FLUSH_TIMEOUT_MS = 5_000;
 
 export interface WorkflowScriptValidationError {
 	message: string;
@@ -48,6 +58,12 @@ let suppressNativePromiseConsumption = 0;
 const activeNativePromises = [];
 const pending = new Map();
 const runKeyPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+function validGitRef(ref) {
+  if (typeof ref !== "string" || !ref || ref === "@" || new TextEncoder().encode(ref).length > 1024 || ref.startsWith("/") || ref.endsWith("/") || ref.includes("//") || ref.includes("..") || ref.includes("@{")) return false;
+  if (/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu.test(ref)) return false;
+  if (/[[\]\\~^:?*\u0000-\u0020\u007f]/u.test(ref) || ref.endsWith(".") || ref.endsWith(".lock")) return false;
+  return ref.split("/").every((component) => component.length > 0 && component !== "." && component !== ".." && !component.startsWith(".") && !component.endsWith(".") && !component.endsWith(".lock"));
+}
 const trackedPromiseTrackers = new WeakMap();
 const trackedPromiseTargets = new WeakMap();
 let nativePromiseTrackers = new WeakMap();
@@ -58,6 +74,12 @@ function stableRunJson(value) {
   if (Array.isArray(value)) return "[" + value.map(stableRunJson).join(",") + "]";
   if (value && typeof value === "object") return "{" + Object.keys(value).sort().map((key) => JSON.stringify(key) + ":" + stableRunJson(value[key])).join(",") + "}";
   return JSON.stringify(value) ?? "undefined";
+}
+
+function canonicalRunParams(params) {
+  if (params.gate === undefined || params.acceptance !== false) return params;
+  const { acceptance: _acceptance, ...withoutAcceptance } = params;
+  return withoutAcceptance;
 }
 
 function isDirectWorkflowScriptPromiseHandlerCall() {
@@ -431,7 +453,7 @@ function validateLaneSpecs(laneSpecs) {
       validateLaneStageBounds(validationParams, stageLabel);
       validateRunCall(generatedKey, validationParams, stageLabel, validationFingerprints);
       const existingFingerprint = runFingerprints.get(generatedKey);
-      if (existingFingerprint !== undefined && (resume === "previous" || existingFingerprint !== stableRunJson(params))) {
+      if (existingFingerprint !== undefined && (resume === "previous" || existingFingerprint !== stableRunJson(canonicalRunParams(params)))) {
         throw new Error("runs.lanes generated child key '" + generatedKey + "' is already used with incompatible launch params.");
       }
       stages.push({ key: stageKey, generatedKey, resume, params });
@@ -500,8 +522,26 @@ function runLane(lane, firstResult, observe) {
   return visit(0, firstResult);
 }
 
+function workflowPlanStringMetadata(params) {
+  return {
+    ...(typeof params.phase === "string" && params.phase.trim() ? { phase: params.phase.trim() } : {}),
+    ...(typeof params.label === "string" && params.label.trim() ? { label: params.label.trim() } : {}),
+    ...(typeof params.agent === "string" && params.agent.trim() ? { agent: params.agent.trim() } : {}),
+  };
+}
+
 function runLanes(laneSpecs) {
   const lanes = validateLaneSpecs(laneSpecs);
+  parentPort.postMessage({ type: "lanePlan", lanes: lanes.map((lane) => ({
+    key: lane.key,
+    stages: lane.stages.map((stage) => ({
+      key: stage.key,
+      generatedKey: stage.generatedKey,
+      ...workflowPlanStringMetadata(stage.params),
+      ...(typeof stage.params.as === "string" && stage.params.as.trim() ? { outputName: stage.params.as.trim() } : {}),
+      ...(stage.params.outputSchema !== undefined ? { structured: true } : {}),
+    })),
+  })) });
   const firstItems = lanes.map((lane) => {
     const first = lane.stages[0];
     return { key: first.generatedKey, ...first.params };
@@ -582,19 +622,33 @@ function validateLaneMetadata(value, label, workflowKey) {
   }
 }
 
+function describeGateAcceptanceConflict(gate, acceptance) {
+  const render = (value) => {
+    let encoded;
+    try {
+      encoded = JSON.stringify(value) ?? String(value);
+    } catch {
+      encoded = String(value);
+    }
+    return encoded.length > 120 ? encoded.slice(0, 120) + "..." : encoded;
+  };
+  return " Both fields were present: gate=" + render(gate) + " acceptance=" + render(acceptance) + ".";
+}
+
 function validateRunCall(key, params, label, fingerprints) {
   if (typeof key !== "string" || !runKeyPattern.test(key)) throw new Error(label + " has an invalid key.");
   if (hostKeys.has(key)) throw new Error("Workflow key '" + key + "' is already used by runs.host.");
   if (!params || typeof params !== "object" || Array.isArray(params)) throw new Error(label + " requires a params object.");
-  if (Object.prototype.hasOwnProperty.call(params, "action") || Object.prototype.hasOwnProperty.call(params, "workflowScript") || Object.prototype.hasOwnProperty.call(params, "tasks") || Object.prototype.hasOwnProperty.call(params, "chain") || Object.prototype.hasOwnProperty.call(params, "parallel") || Object.prototype.hasOwnProperty.call(params, "concurrency") || Object.prototype.hasOwnProperty.call(params, "chainDir")) {
+  if (Object.prototype.hasOwnProperty.call(params, "action") || Object.prototype.hasOwnProperty.call(params, "workflowScript") || Object.prototype.hasOwnProperty.call(params, "globalConcurrencyLimit") || Object.prototype.hasOwnProperty.call(params, "maxSubagentSpawnsPerRun") || Object.prototype.hasOwnProperty.call(params, "tasks") || Object.prototype.hasOwnProperty.call(params, "chain") || Object.prototype.hasOwnProperty.call(params, "parallel") || Object.prototype.hasOwnProperty.call(params, "concurrency") || Object.prototype.hasOwnProperty.call(params, "chainDir")) {
     const hint = label === "runs.run" ? "; use runs.all(...) and JavaScript control flow for orchestration." : ".";
     throw new Error(label + " accepts one child via { agent, task } and execution controls only" + hint);
   }
   if (Object.prototype.hasOwnProperty.call(params, "clarify")) throw new Error(label + " does not support clarify UI.");
   if (params.worktree !== undefined && typeof params.worktree !== "boolean") throw new Error(label + " worktree must be true or false.");
+  if (params.baseRef !== undefined && (typeof params.baseRef !== "string" || !validGitRef(params.baseRef))) throw new Error(label + " baseRef must be a valid Git ref: use HEAD or a supported named ref (for example, refs/heads/main). Full 40/64-character commit IDs and revision expressions are unsupported.");
   validateLaneMetadata(params.lane, label + " lane", key);
   if (params.gate !== undefined && (typeof params.gate !== "string" || !params.gate.trim())) throw new Error(label + " gate must be a non-empty command string.");
-  if (params.gate !== undefined && params.acceptance !== undefined) throw new Error(label + " gate cannot be combined with acceptance; use one gate command or acceptance.verify.");
+  if (params.gate !== undefined && params.acceptance !== undefined && params.acceptance !== false) throw new Error(label + " gate cannot be combined with acceptance; use one gate command or acceptance.verify." + describeGateAcceptanceConflict(params.gate, params.acceptance));
   if (params.gate !== undefined && params.resume !== undefined) throw new Error(label + " gate is not supported with retained resume.");
   if (params.extensionBindings !== undefined && params.resume !== undefined) throw new Error(label + " extensionBindings is not supported with retained resume; resume uses the original retained child binding.");
   if (params.resume !== undefined && typeof params.resume !== "string") {
@@ -611,7 +665,7 @@ function validateRunCall(key, params, label, fingerprints) {
   if (params.resume !== undefined && (typeof params.task !== "string" || !params.task.trim())) throw new Error(label + " resume requires a non-empty task follow-up.");
   validateExtensionBindings(params.extensionBindings, label);
   assertJsonValue(params, label + " params");
-  const fingerprint = stableRunJson(params);
+  const fingerprint = stableRunJson(canonicalRunParams(params));
   const existing = fingerprints.get(key);
   if (existing !== undefined && existing !== fingerprint) throw new Error("Duplicate workflow key '" + key + "' used with incompatible launch params.");
   fingerprints.set(key, fingerprint);
@@ -624,7 +678,12 @@ function validateHostCommand(key, params) {
   if (!params || typeof params !== "object" || Array.isArray(params)) throw new Error("runs.host('" + key + "') params must be an object.");
   const allowed = new Set(["kind", "command", "timeoutMs", "output", "role", "provider"]);
   const unknown = Object.keys(params).filter((field) => !allowed.has(field));
-  if (unknown.length) throw new Error("runs.host('" + key + "') params have unsupported fields: " + unknown.join(", ") + ".");
+  if (unknown.length) {
+    const cwdHint = unknown.includes("cwd")
+      ? " The host step does not accept per-step cwd; commands and relative output paths use the workflow cwd. Set cwd on the outer subagent request, or put a trusted directory change in command (for example, 'cd /path/to/worktree && npm test')."
+      : "";
+    throw new Error("runs.host('" + key + "') params have unsupported fields: " + unknown.join(", ") + "." + cwdHint);
+  }
   if (params.kind !== "command") throw new Error("runs.host('" + key + "') kind must be 'command'.");
   if (typeof params.command !== "string" || !params.command.trim() || params.command.includes("\u0000") || new TextEncoder().encode(params.command.trim()).byteLength > 16384) throw new Error("runs.host('" + key + "') command must be a non-empty string of at most 16384 bytes without NUL.");
   if (!Number.isInteger(params.timeoutMs) || params.timeoutMs < 1 || params.timeoutMs > 86400000) throw new Error("runs.host('" + key + "') timeoutMs must be an integer from 1 to 86400000.");
@@ -952,6 +1011,7 @@ export interface WorkflowScriptChildResult {
 	requestedContext?: "fresh" | "fork";
 	resolvedContext?: "fresh" | "fork" | "mixed";
 	outputReference?: string;
+	recovery?: AcceptanceRecoveryMetadata;
 	outputPathMapping?: { requestedPath: string; savedPath: string };
 	externalAdapter?: import("../shared/types.ts").ExternalCliReceiptMetadata;
 	resumability?: { state: "resumable" } | { state: "not-resumable"; reason: string };
@@ -975,6 +1035,22 @@ export interface WorkflowScriptTraceEntry {
 	generatedLaneKey?: string;
 	lane?: import("../shared/types.ts").WorkflowLaneMetadata;
 	warning?: string;
+}
+
+/** Bounded plan metadata emitted when a workflow materializes a runs.lanes graph. */
+export interface WorkflowLanePlanStage {
+	key: string;
+	generatedKey: string;
+	agent?: string;
+	phase?: string;
+	label?: string;
+	outputName?: string;
+	structured?: boolean;
+}
+
+export interface WorkflowLanePlan {
+	key: string;
+	stages: WorkflowLanePlanStage[];
 }
 
 export interface WorkflowSteerOptions {
@@ -1029,21 +1105,24 @@ export interface RunWorkflowScriptOptions {
 	oneUsePermit?: { claim: (key: string) => string | undefined };
 	timeoutMs?: number;
 	signal?: AbortSignal;
+	/** Let an async workflow flush pure result assembly after reload once every child is terminal. */
+	continueAfterAbortWhenChildrenSettled?: (abortError: Error) => boolean;
 	/** Maximum children executing concurrently within this workflow. Defaults to 20. */
 	globalConcurrencyLimit?: number;
 	admit?: (calls: Array<{ key: string; params: Record<string, unknown> }>) => void | Promise<void>;
 	launch: (key: string, params: Record<string, unknown>, signal: AbortSignal, admission: { admitted: boolean; batch: boolean }) => Promise<WorkflowScriptChildResult>;
-	resolveResume?: (reference: WorkflowReceiptResumeReference, signal: AbortSignal) => string | WorkflowResolvedResumeReference | Promise<string | WorkflowResolvedResumeReference>;
+	resolveResume?: (reference: WorkflowReceiptResumeReference | string, signal: AbortSignal, index?: number) => string | WorkflowResolvedResumeReference | Promise<string | WorkflowResolvedResumeReference>;
 	status: (keyOrRunId: string, signal: AbortSignal) => Promise<WorkflowScriptChildResult>;
 	steer?: (key: string, message: string, options: WorkflowSteerOptions, signal: AbortSignal) => Promise<WorkflowSteerResult>;
 	host?: (key: string, params: WorkflowHostCommandParams, signal: AbortSignal) => Promise<WorkflowHostCommandResult>;
-	onHostStep?: (hostStep: HostStepNodeV1) => void;
+	onHostStep?: (hostStep: HostStepNode) => void;
 	state?: {
 		get: (key: string) => unknown | Promise<unknown>;
 		set: (key: string, value: unknown) => void | Promise<void>;
 	};
 	registerStopChild?: (stop: ((key: string, message?: string) => boolean) | undefined) => void;
 	onTrace?: (trace: WorkflowScriptTraceEntry[]) => void;
+	onLanePlan?: (lanes: WorkflowLanePlan[]) => void;
 	onEmit?: (emits: unknown[]) => void;
 }
 
@@ -1065,6 +1144,138 @@ function combinedAbortSignal(signals: AbortSignal[]): AbortSignal {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function isAcceptanceMetadataRecovery(result: WorkflowScriptChildResult): boolean {
+	return !result.ok
+		&& result.recovery?.status === "available-for-review"
+		&& result.recovery.reason === "acceptance-metadata-rejected";
+}
+
+const RECOVERY_REVIEW_MUTATION_VERB_PATTERN = /\b(?:add(?:ing)?|append(?:ing)?|apply(?:ing)?|cherry[ -]pick(?:ing)?|change|changing|clean(?:ing)?|commit(?:ting)?|cop(?:y|ying)|create|creating|delete|deleting|edit(?:ing)?|fix(?:ing)?|implement(?:ing)?|insert(?:ing)?|make|making|merge|merging|mov(?:e|ing)|modify(?:ing)?|mutate|mutating|open(?:ing)?|patch(?:ing)?|prepend(?:ing)?|push(?:ing)?|rebase|rebasing|refactor(?:ing)?|remove|removing|rename|renaming|replace|replacing|revert(?:ing)?|revise|revising|rewrite|rewriting|sav(?:e|ing)|stag(?:e|ing)|stash(?:ing)?|tag(?:ging)?|touch(?:ing)?|update|updating|write|writing)\b/i;
+const RECOVERY_REVIEW_READ_ONLY_PATTERN = /\b(?:read[- ]only|review only|only return findings|return findings only|suggest fixes only|without\s+(?:editing|modifying|changing|writing|touching)|do not\s+(?:edit|modify|change|write|touch)|don't\s+(?:edit|modify|change|write|touch)|must not\s+(?:edit|modify|change|write|touch))\b/i;
+const RECOVERY_REVIEW_NO_MUTATION_CLAUSE_PATTERN = /\b(?:do not|don't|must not)\s+(?:edit|modify|change|write|touch)(?:\s+files?)?(?:\s*,\s*(?:commit|push|comment|merge|launch(?:\s+subagents?)?)(?=\s*(?:,|\bor\b|[.;!?\n)]|$)))*(?:\s*,?\s*or\s+(?:commit|push|comment|merge|launch(?:\s+subagents?)?)(?=\s*(?:[.;!?\n)]|$)))?/gi;
+const RECOVERY_REVIEW_DELIVERABLE_PATTERN = /\b(?:compose|create|draft|prepare|produce|write)\s+(?:(?:a|an|the|your)\s+)?(?:findings?|review|report|summary|analysis|recommendations?)(?:\s+(?:to|at|in)\s+\S+)?/gi;
+const RECOVERY_REVIEW_CONTEXT_OBJECT_PATTERN = /\breview\s+(?:(?:the|this|that|saved)\s+)?(?:patch|diff|changes?|implementation|report)\b/gi;
+const RECOVERY_REVIEW_MUTATION_NOUN_CONTEXT_PATTERN = /\b(?:later\s+real\s+)?update\s+imperatives?\b/gi;
+const RECOVERY_REVIEW_PRIOR_FIX_CONTEXT_PATTERN = /\bthe\s+prior\s+fix\s+keeps\b/gi;
+const RECOVERY_REVIEW_DETECTION_CONTEXT_PATTERN = /\b(?:mutation\s+detection\s+now\s+includes\s+move\/rename\/copy\s+file\s+mutation\s+imperatives|delegation\s+detection\s+now\s+blocks\s+get\/let\/have\/tell\/ask\s+follow-up\s+forms)(?=[,.;!?\n]|\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b|$)/gi;
+const RECOVERY_REVIEW_PATTERN_CHANGE_CONTEXT_PATTERN = /\bRECOVERY_REVIEW_MUTATION_VERB_PATTERN\s+now\s+includes\s+append,\s+prepend,\s+and\s+sav(?:e|ing)\b(?=\s*(?:[,.;!?\n)]|$))/gi;
+const RECOVERY_REVIEW_GIT_PATTERN_CHANGE_CONTEXT_PATTERN = /\bfixed\s+mutating\s+git\s+follow-up\s+bypasses\b|\b(?:added|adding)\s+[a-z][a-z-]*(?:\/[a-z][a-z-]*)*(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+)[a-z][a-z-]*(?:\/[a-z][a-z-]*)*)*\s+to\s+the\s+(?:mutation\s+imperative|mutating\s+git\s+command)\s+pattern\b|\band\s+[a-z][a-z-]*(?:\/[a-z][a-z-]*)*(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+)[a-z][a-z-]*(?:\/[a-z][a-z-]*)*)*\s+to\s+the\s+mutating\s+git\s+command\s+pattern\b/gi;
+const RECOVERY_REVIEW_VALIDATION_EVIDENCE_PATTERN = /\bvalidation(?:\s+after\s+fix)?\s*:/gi;
+const RECOVERY_REVIEW_CONTRACT_PROHIBITION_PATTERN = /\b(?:do not|don't|must not)\s+(?:mutate\s+durable\s+state|launch\s+(?:mutating|destructive|mutating\/destructive)\s+work)(?:\s+or\s+(?:mutate\s+durable\s+state|launch\s+(?:mutating|destructive|mutating\/destructive)\s+work))*/gi;
+const RECOVERY_REVIEW_ONLY_REVIEW_CONTRACT_PATTERN = /\bmay\s+only\s+launch\s+explicit\s+read-only\s+review\s+children\s+with\s+acceptance:false\b/gi;
+const RECOVERY_REVIEW_BLOCKED_CONTEXT_FRAGMENT_PATTERN = /\bstate\.set, runs\.host, runs\.steer, ordinary\/mutating children, and destructive command wording are blocked(?=[,.;!?\n)\]}]|$)/gi;
+const RECOVERY_REVIEW_REGRESSION_EVIDENCE_PATTERN = /\b(?:existing regressions cover plain rm and git clean\/reset\/restore|prior regressions covering rm\/git clean as evidence only)(?=[,.;!?\n)\]}]|$)/gi;
+const RECOVERY_REVIEW_BLOCKED_QUOTED_EXAMPLE_PATTERN = /(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+")(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+)(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+"))*\s+(?:is|are|remains?)\s+(?:blocked|(?:an?\s+)?blocked\s+examples?)(?=[,.;!?\n)\]}]|$)/gi;
+const RECOVERY_REVIEW_CONTEXT_QUOTED_EXAMPLE_PATTERN = /\b(?:examples?|phrasing|forms|variants):\s*(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+")(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+)(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+"))*/gi;
+const RECOVERY_REVIEW_LISTED_BLOCKED_EXAMPLE_PATTERN = /(?:^|[.;!?\n]\s*)blocked\s+examples:\s*(?:\r?\n[ \t]*(?:[-*]|\d+[.)])\s+[^\r\n]+)+/gim;
+const RECOVERY_REVIEW_BLOCKS_QUOTED_EXAMPLE_PATTERN = /\b(?:this\s+)?blocks?\s+examples?\s+like\s+(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+")(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+)(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+"))*/gi;
+const RECOVERY_REVIEW_EXAMPLES_LIKE_BLOCKED_PATTERN = /\bexamples?\s+like\s+(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+")(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+)(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+"))*\s+(?:is|are|remains?)\s+blocked\b/gi;
+const RECOVERY_REVIEW_QUOTED_VISIBLE_BLOCKED_PATTERN = /(?:\b(?:(?:the\s+)?examples?|commands?\s+hidden\s+in)\s+|(?:^|[\s([{]))(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+")(?:(?:\s*,\s*(?:and\s+|or\s+)?|\s+(?:and|or)\s+)(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+"))*\s+(?:(?:is|are|remains?)\s+)?visible\s+and\s+blocked\b/gi;
+const RECOVERY_REVIEW_PROMPTS_LIKE_BLOCKED_PATTERN = /\bdescribed\s+prompts?\s+like\s+Run\s+git\s+rebase\s+main,\s+git\s+rebase\s+main,\s+Run\s+git\s+cherry-pick\s+abc123,\s+cherry-pick\s+abc123,\s+and\s+Stage\s+the\s+changed\s+files\s+as\s+blocked\b/gi;
+const RECOVERY_REVIEW_GIT_MUTATIONS_BROADER_CONTEXT_PATTERN = /\bpositive\s+git\s+mutations\s+are\s+broader:\s*git\s+branch\s+-D\s+old,\s+git\s+tag\s+-d\s+v1\.0,\s+git\s+stash,\s+git\s+revert\s+abc123,\s+and\s+natural\s+cherry\s+pick\s+abc123\s+now\s+trips?\s+the\s+recovery\s+barrier\b/gi;
+const RECOVERY_REVIEW_GIT_COVERAGE_CONTEXT_PATTERN = /\bbroadened\s+positive\s+git\s+mutation\s+coverage\s+for\s+natural\s+`cherry\s+pick`,\s+`revert`,\s+`stash`,\s+`tag`,\s+plus\s+git\s+`branch\|revert\|stash\|tag`/gi;
+const RECOVERY_REVIEW_REGRESSION_QUOTED_EXAMPLE_PATTERN = /\b(?:added\s+)?exact\s+regressions?\s+for\s+(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+")(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+)(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+"))*/gi;
+const RECOVERY_REVIEW_REGRESSION_ANAPHORIC_EXAMPLE_PATTERN = /\b(?:added\s+)?exact\s+regressions?\s+for\s+(?:do|run|execute|perform|apply)\s+(?:it|that|this|(?:the\s+)?(?:(?:previous(?:ly)?|prior|above|quoted|blocked)\s+){0,4}(?:command|example|operation|action|phrase|instruction|request))(?:[\s,]+(?:now|still|again|really|actually|immediately)){0,3}[\s,]+anyway(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+)(?:do|run|execute|perform|apply)\s+(?:it|that|this|(?:the\s+)?(?:(?:previous(?:ly)?|prior|above|quoted|blocked)\s+){0,4}(?:command|example|operation|action|phrase|instruction|request))(?:[\s,]+(?:now|still|again|really|actually|immediately)){0,3}[\s,]+anyway)*/gi;
+const RECOVERY_REVIEW_REGRESSION_FOLLOWED_BY_ANAPHORIC_PATTERN = /\badded\s+(?:exact\s+)?regressions?\s+for\s+quoted\s+rm\s+remaining\s+blocked\s+followed\s+by\s+execute\s+the\s+previous\s+command\b(?=\s*(?:[,.;!?\n)]|\bwhile\b|$))/gi;
+const RECOVERY_REVIEW_REGRESSION_FOLLOWED_BY_NAMED_RM_PATTERN = /\b(?:added\s+)?(?:exact\s+)?regressions?\s+for\s+quoted\s+rm\s+remaining\s+blocked\s+followed\s+by\s+(?:do|run|execute|perform|apply)\s+(?:it|that|this|(?:the\s+)?(?:(?:previous(?:ly)?|prior|above|quoted|blocked)\s+){0,4}(?:command|example|operation|action|phrase|instruction|request))(?:[\s,]+(?:now|still|again|really|actually|immediately)){0,3}(?:[\s,]+anyway)?(?=\s*(?:[,.;!?\n)]|\bwhile\b|$))/gi;
+const RECOVERY_REVIEW_BLOCKED_LIVE_VARIANT_CONTEXT_PATTERN = /\b(?:while\s+)?keeping\s+live-command\s+variants\s+such\s+as\s+followed\s+by\s+execute\s+the\s+previous\s+command\s+then\s+update\s+tests\s+blocked\b(?=\s*(?:[,.;!?\n)]|$))/gi;
+const RECOVERY_REVIEW_ANAPHORIC_REFERENCES_CONTEXT_PATTERN = /\bdirect\s+anaphoric\s+references\s+now\s+include\s+numeric\s+and\s+word\s+ordinals\s+through\s+tenth\s+plus\s+one,\s+so\s+(?:do|run|execute|perform|apply)\s+(?:it|that|this|(?:the\s+)?(?:(?:\d+(?:st|nd|rd|th)|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|last|next|previous(?:ly)?|prior|above|quoted|blocked)\s+){0,4}(?:command|example|operation|action|phrase|instruction|request|one))(?:[\s,]+(?:right|now|still|again|really|actually|immediately)){0,4}[\s,]+anyway(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+)(?:do|run|execute|perform|apply)\s+(?:it|that|this|(?:the\s+)?(?:(?:\d+(?:st|nd|rd|th)|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|last|next|previous(?:ly)?|prior|above|quoted|blocked)\s+){0,4}(?:command|example|operation|action|phrase|instruction|request|one))(?:[\s,]+(?:right|now|still|again|really|actually|immediately)){0,4}[\s,]+anyway)*\s+(?:is|are|remains?)\s+blocked\b(?:\s+after\s+quoted\s+destructive\s+examples\s+are\s+scrubbed)?/gi;
+const RECOVERY_REVIEW_NO_ANAPHORIC_MUTATION_CLAUSE_PATTERN = /\b(?:do not|don't|must not)\s+(?:do|run|execute|perform|apply)\s+(?:it|that|this|(?:the\s+)?(?:(?:\d+(?:st|nd|rd|th)|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|last|next|previous(?:ly)?|prior|above|quoted|blocked)\s+){0,4}(?:command|example|operation|action|phrase|instruction|request|one))(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n—–-]){0,80}/gi;
+const RECOVERY_REVIEW_NO_DELEGATION_CLAUSE_PATTERN = /\b(?:do not|don't|must not)\s+(?:(?:launch|start|spawn|run)\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*(?:workers?|reviewers?|agents?|subagents?|children|child|runs?)|(?:get|let|request|hand\s+off|assign|use|have|tell)\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*(?:workers?|reviewers?|agents?|subagents?|children|child)|(?:get|let|have|tell|request)\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*(?:review|implementation|fix(?:es)?|changes?|follow-up)\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*\b(?:from|with|via|by)\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*(?:workers?|reviewers?|agents?|subagents?|children|child)|ask\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*(?:(?:workers?|reviewers?|agents?|subagents?|children|child)\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*\b(?:continue|implement|review|fix|edit|write|modify|change|patch|update|delete|remove|create|follow-up)|(?:review|implementation|fix(?:es)?|changes?|follow-up)\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*\b(?:from|via)\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*(?:workers?|reviewers?|agents?|subagents?|children|child)))\b/gi;
+const RECOVERY_REVIEW_DELEGATION_PATTERN = /\b(?:launch|start|spawn|run)\b[^,.;!?\n]*(?:workers?|reviewers?|agents?|subagents?|children|child|runs?)\b|\b(?:delegate|hand\s+off|assign)\s+(?:remediation|implementation(?:\s+follow-up)?|changes?|fix(?:es)?|follow-up)\s+to\s+(?:(?:a|an|the)\s+)?(?:workers?|reviewers?|agents?|subagents?|children|child)\b|\b(?:get|let|have|tell|request)\b[^,.;!?\n]*(?:workers?|reviewers?|agents?|subagents?|children|child)\b[^,.;!?\n]*\b(?:continue|implement|review|fix|edit|write|modify|change|patch|update|delete|remove|create|follow-up)\b|\b(?:get|let|have|tell|request)\b[^,.;!?\n]*(?:review|implementation|fix(?:es)?|changes?|follow-up)\b[^,.;!?\n]*\b(?:from|with|via|by)\b[^,.;!?\n]*(?:workers?|reviewers?|agents?|subagents?|children|child)\b|\bask\b[^,.;!?\n]*(?:(?:workers?|reviewers?|agents?|subagents?|children|child)\b[^,.;!?\n]*\b(?:continue|implement|review|fix|edit|write|modify|change|patch|update|delete|remove|create|follow-up)|(?:review|implementation|fix(?:es)?|changes?|follow-up)\b[^,.;!?\n]*\b(?:from|via)\b[^,.;!?\n]*(?:workers?|reviewers?|agents?|subagents?|children|child))\b|\buse\b[^,.;!?\n]*(?:workers?|reviewers?|agents?|subagents?|children|child|runs?)\s+(?:for|to)\s+(?:implementation|follow-up|remediation|fix|edit|write|modify|change|patch|update|delete|remove|create)\b/i;
+const RECOVERY_REVIEW_ANAPHORIC_MUTATION_PATTERN = /\b(?:do|run|execute|perform|apply)\s+(?:it|that|this|(?:the\s+)?(?:(?:\d+(?:st|nd|rd|th)|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|last|next|previous(?:ly)?|prior|above|quoted|blocked)\s+){0,4}(?:command|example|operation|action|phrase|instruction|request|one))(?!(?:\s+(?:(?:now|still|also|already)\s+)*(?:is|are|remains?)\s+blocked\b))(?:(?:[\s,]+\w+){0,4}[\s,]+anyway|(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n]){0,80})(?=\s*(?:[,.;!?\n)]|\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b|$))/i;
+const RECOVERY_REVIEW_DESTRUCTIVE_COMMAND_PATTERN = /(?:^|[\s;,.`'"([{])(?:\S*\/)?(?:rm|rmdir|unlink|truncate|mv|cp|chmod|chown)\b|\bgit\b(?:\s+(?:-[A-Za-z](?:\s+(?:"[^"\n]*"|'[^'\n]*'|\S+))?|--(?:git-dir|work-tree|namespace|exec-path|config-env)(?:=(?:"[^"\n]*"|'[^'\n]*'|\S+)|\s+(?:"[^"\n]*"|'[^'\n]*'|\S+))|--[A-Za-z0-9-]+(?:=(?:"[^"\n]*"|'[^'\n]*'|\S+))?))*\s+(?:add|branch|cherry-pick|clean|commit|merge|rebase|reset|restore|revert|stash|tag|checkout|switch)\b/i;
+const RECOVERY_REVIEW_DASH_LIVE_ACTION_PATTERN = /(?:[—–]|--|\s-\s|:|\s\/\s)\s*(?:then\s+)?(?:(?:add|append|apply|change|cherry[ -]pick|clean|commit|copy|create|delete|edit|fix|implement|insert|make|merge|move|modify|mutate|open|patch|prepend|push|rebase|refactor|remove|rename|replace|revert|revise|rewrite|save|stage|stash|tag|touch|update|write)\b|(?:launch|start|spawn|run)\b[^,.;!?\n]*(?:workers?|reviewers?|agents?|subagents?|children|child|runs?)\b|(?:\S*\/)?(?:rm|rmdir|unlink|truncate|mv|cp|chmod|chown)\b|git\b[^,.;!?\n]*\b(?:add|branch|cherry-pick|clean|commit|merge|rebase|reset|restore|revert|stash|tag|checkout|switch)\b)/i;
+
+function isExplicitReadOnlyRecoveryReview(params: Record<string, unknown>): boolean {
+	const agent = typeof params.agent === "string" ? params.agent.trim() : "";
+	const task = typeof params.task === "string" ? params.task.trim() : "";
+	const taskDestructiveCommandText = task
+		.replace(RECOVERY_REVIEW_BLOCKED_CONTEXT_FRAGMENT_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_REGRESSION_EVIDENCE_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_BLOCKED_QUOTED_EXAMPLE_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_CONTEXT_QUOTED_EXAMPLE_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_LISTED_BLOCKED_EXAMPLE_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_BLOCKS_QUOTED_EXAMPLE_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_EXAMPLES_LIKE_BLOCKED_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_QUOTED_VISIBLE_BLOCKED_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_PROMPTS_LIKE_BLOCKED_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_GIT_MUTATIONS_BROADER_CONTEXT_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_GIT_COVERAGE_CONTEXT_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_REGRESSION_FOLLOWED_BY_NAMED_RM_PATTERN, " ");
+	const taskDashLiveActionText = task
+		.replace(RECOVERY_REVIEW_DELIVERABLE_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_CONTEXT_OBJECT_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_MUTATION_NOUN_CONTEXT_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_PRIOR_FIX_CONTEXT_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_DETECTION_CONTEXT_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_PATTERN_CHANGE_CONTEXT_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_GIT_PATTERN_CHANGE_CONTEXT_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_VALIDATION_EVIDENCE_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_CONTRACT_PROHIBITION_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_ONLY_REVIEW_CONTRACT_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_BLOCKED_QUOTED_EXAMPLE_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_CONTEXT_QUOTED_EXAMPLE_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_LISTED_BLOCKED_EXAMPLE_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_BLOCKS_QUOTED_EXAMPLE_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_EXAMPLES_LIKE_BLOCKED_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_QUOTED_VISIBLE_BLOCKED_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_PROMPTS_LIKE_BLOCKED_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_GIT_MUTATIONS_BROADER_CONTEXT_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_GIT_COVERAGE_CONTEXT_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_REGRESSION_QUOTED_EXAMPLE_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_REGRESSION_ANAPHORIC_EXAMPLE_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_REGRESSION_FOLLOWED_BY_ANAPHORIC_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_BLOCKED_LIVE_VARIANT_CONTEXT_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_ANAPHORIC_REFERENCES_CONTEXT_PATTERN, " ");
+	const taskMutationText = task
+		.replace(RECOVERY_REVIEW_DELIVERABLE_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_CONTEXT_OBJECT_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_MUTATION_NOUN_CONTEXT_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_PRIOR_FIX_CONTEXT_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_DETECTION_CONTEXT_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_PATTERN_CHANGE_CONTEXT_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_GIT_PATTERN_CHANGE_CONTEXT_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_VALIDATION_EVIDENCE_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_CONTRACT_PROHIBITION_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_ONLY_REVIEW_CONTRACT_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_BLOCKED_CONTEXT_FRAGMENT_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_REGRESSION_EVIDENCE_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_BLOCKED_QUOTED_EXAMPLE_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_CONTEXT_QUOTED_EXAMPLE_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_LISTED_BLOCKED_EXAMPLE_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_BLOCKS_QUOTED_EXAMPLE_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_EXAMPLES_LIKE_BLOCKED_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_QUOTED_VISIBLE_BLOCKED_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_PROMPTS_LIKE_BLOCKED_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_GIT_MUTATIONS_BROADER_CONTEXT_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_GIT_COVERAGE_CONTEXT_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_REGRESSION_QUOTED_EXAMPLE_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_REGRESSION_ANAPHORIC_EXAMPLE_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_REGRESSION_FOLLOWED_BY_ANAPHORIC_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_BLOCKED_LIVE_VARIANT_CONTEXT_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_ANAPHORIC_REFERENCES_CONTEXT_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_NO_ANAPHORIC_MUTATION_CLAUSE_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_NO_DELEGATION_CLAUSE_PATTERN, " ")
+		.replace(RECOVERY_REVIEW_NO_MUTATION_CLAUSE_PATTERN, " ")
+		.replace(new RegExp(RECOVERY_REVIEW_READ_ONLY_PATTERN.source, "gi"), " ");
+	return params.acceptance === false
+		&& agent !== ""
+		&& /\b(?:advisor|oracle|review|reviewer)\b/i.test(agent)
+		&& RECOVERY_REVIEW_READ_ONLY_PATTERN.test(task)
+		&& !RECOVERY_REVIEW_DESTRUCTIVE_COMMAND_PATTERN.test(taskDestructiveCommandText)
+		&& !RECOVERY_REVIEW_MUTATION_VERB_PATTERN.test(taskMutationText)
+		&& !RECOVERY_REVIEW_DELEGATION_PATTERN.test(taskMutationText)
+		&& !RECOVERY_REVIEW_ANAPHORIC_MUTATION_PATTERN.test(taskMutationText)
+		&& !RECOVERY_REVIEW_DESTRUCTIVE_COMMAND_PATTERN.test(taskMutationText)
+		&& !RECOVERY_REVIEW_DASH_LIVE_ACTION_PATTERN.test(taskDashLiveActionText)
+		&& classifyTaskMutationIntent(agent, task).kind === "read-only";
+}
+
+function recoveryBarrierMessage(sourceKey: string, target: string): string {
+	return `Run '${target}' cannot launch after run '${sourceKey}' returned rejected acceptance recovery; only explicit read-only review children with acceptance:false may follow.`;
 }
 
 function isPlainJsonObject(value: unknown): value is Record<string, unknown> {
@@ -1180,6 +1391,12 @@ function stableJson(value: unknown): string {
 	return JSON.stringify(value) ?? "undefined";
 }
 
+function canonicalRunParams(params: Record<string, unknown>): Record<string, unknown> {
+	if (params.gate === undefined || params.acceptance !== false) return params;
+	const { acceptance: _acceptance, ...withoutAcceptance } = params;
+	return withoutAcceptance;
+}
+
 function validateKey(value: unknown, owner = "runs.run"): string {
 	if (typeof value !== "string" || !KEY_PATTERN.test(value)) {
 		throw new Error(`${owner} key must be 1-128 characters using letters, numbers, '.', '_' or '-', and start with a letter or number.`);
@@ -1227,7 +1444,7 @@ function validateStaticHostCall(call: AstNode): WorkflowScriptValidationError[] 
 	for (const property of params.properties) {
 		if (!astNode(property)) continue;
 		const name = staticPropertyKey(property);
-		if (name !== undefined && !allowed.has(name)) errors.push({ message: `runs.host params contain unsupported field '${name}'.`, ...nodeLocation(property) });
+		if (name !== undefined && !allowed.has(name)) errors.push({ message: name === "cwd" ? "runs.host params contain unsupported field 'cwd'. The host step does not accept per-step cwd; commands and relative output paths use the workflow cwd. Set cwd on the outer subagent request, or put a trusted directory change in command (for example, 'cd /path/to/worktree && npm test')." : `runs.host params contain unsupported field '${name}'.`, ...nodeLocation(property) });
 	}
 	const kindNode = directObjectPropertyValue(params, "kind");
 	const commandNode = directObjectPropertyValue(params, "command");
@@ -1286,7 +1503,7 @@ function definitelyNonJson(node: AstNode, normalizeUndefined = false): string | 
 	if (node.type === "ObjectExpression" && Array.isArray(node.properties)) {
 		const values = new Map<string, AstNode>();
 		for (const property of node.properties) {
-			if (!astNode(property) || property.type !== "Property" || !astNode(property.value)) return undefined;
+			if (!astNode(property) || property.type !== "Property" || !astNode(property.value) || property.kind !== "init") return undefined;
 			const key = staticPropertyKey(property);
 			if (key === undefined) return undefined;
 			values.set(key, property.value);
@@ -1313,6 +1530,26 @@ function directObjectPropertyValue(node: AstNode, name: string): AstNode | undef
 		if (staticPropertyKey(property) === name) value = property.value;
 	}
 	return value;
+}
+
+function validateStaticBaseRef(params: AstNode, owner: string): WorkflowScriptValidationError[] {
+	if (params.type !== "ObjectExpression" || !Array.isArray(params.properties)) return [];
+	// Inspect the final definition only. A later spread or unknown key may overwrite it.
+	for (let index = params.properties.length - 1; index >= 0; index--) {
+		const property = params.properties[index];
+		if (!astNode(property) || property.type !== "Property") return [];
+		const key = staticPropertyKey(property);
+		if (key === undefined) return [];
+		if (key !== "baseRef") continue;
+		if (property.kind !== "init" || !astNode(property.value)) return [];
+		const valueNode = property.value;
+		const value = literalString(valueNode);
+		if ((value !== undefined || valueNode.type === "Literal") && !validGitRef(value)) {
+			return [{ message: `${owner} ${BASE_REF_VALIDATION_ERROR}`, ...nodeLocation(valueNode) }];
+		}
+		return [];
+	}
+	return [];
 }
 
 function directRunsAllKeys(call: AstNode): Array<{ key: string; node: AstNode }> {
@@ -1356,6 +1593,7 @@ export function validateWorkflowScript(script: string): WorkflowScriptValidation
 			const key = literalString(keyNode);
 			if (keyNode && key !== undefined && !KEY_PATTERN.test(key)) errors.push({ message: "runs.run key must be 1-128 characters using letters, numbers, '.', '_' or '-', and start with a letter or number.", ...nodeLocation(keyNode) });
 			if (astNode(args[1])) {
+				errors.push(...validateStaticBaseRef(args[1], "runs.run"));
 				const message = definitelyNonJson(args[1]);
 				if (message) errors.push({ message: `runs.run params are invalid: ${message}.`, ...nodeLocation(args[1]) });
 			}
@@ -1365,6 +1603,7 @@ export function validateWorkflowScript(script: string): WorkflowScriptValidation
 			const args = Array.isArray(node.arguments) ? node.arguments : [];
 			if (astNode(args[0]) && args[0].type === "ArrayExpression" && Array.isArray(args[0].elements)) {
 				for (const item of args[0].elements) if (astNode(item)) {
+					errors.push(...validateStaticBaseRef(item, "runs.all item"));
 					const message = definitelyNonJson(item);
 					if (message) errors.push({ message: `runs.all item params are invalid: ${message}.`, ...nodeLocation(item) });
 				}
@@ -1440,7 +1679,7 @@ function resolveWorkflowParserEntry(): string {
 	}
 }
 
-const AUTO_RESUME_PARAM_KEYS = ["acceptance", "agentContract", "index", "intercomBridge", "label", "lane", "maxRuntimeMs", "output", "outputMode", "outputSchema", "phase", "skill", "skills", "task", "timeoutMs", "toolBudget", "worktree"] as const;
+const AUTO_RESUME_PARAM_KEYS = ["acceptance", "agentContract", "baseRef", "index", "intercomBridge", "label", "lane", "maxRuntimeMs", "output", "outputMode", "outputSchema", "phase", "skill", "skills", "task", "timeoutMs", "toolBudget", "worktree"] as const;
 
 function isZeroUsage(usage: unknown): boolean {
 	if (!isRecord(usage)) return false;
@@ -1478,7 +1717,7 @@ function setupAbortResumeParams(params: Record<string, unknown>, result: Workflo
 export async function runWorkflowScript(options: RunWorkflowScriptOptions): Promise<WorkflowScriptResult> {
 	if (!options.script.trim()) throw new Error("workflowScript must not be empty.");
 	if (options.timeoutMs !== undefined && (!Number.isInteger(options.timeoutMs) || options.timeoutMs < 1)) throw new Error("workflow script timeout must be a positive integer.");
-	if (options.globalConcurrencyLimit !== undefined && (!Number.isInteger(options.globalConcurrencyLimit) || options.globalConcurrencyLimit < 1)) {
+	if (options.globalConcurrencyLimit !== undefined && (!Number.isSafeInteger(options.globalConcurrencyLimit) || options.globalConcurrencyLimit < 1)) {
 		throw new Error("workflow script global concurrency limit must be a positive integer.");
 	}
 	const launchSemaphore = new Semaphore(options.globalConcurrencyLimit ?? DEFAULT_GLOBAL_CONCURRENCY_LIMIT);
@@ -1505,8 +1744,12 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 	const observedSteerCalls = new Set<number>();
 	const observedHostCalls = new Set<number>();
 	const childController = new AbortController();
+	let acceptanceRecoveryBarrier: { key: string } | undefined;
 	let settled = false;
 	let finishing = false;
+	let assemblyAbortRequested = false;
+	let assemblyFlushTimer: ReturnType<typeof setTimeout> | undefined;
+	let abortError: Error | undefined;
 
 	const partial = (): Omit<WorkflowScriptResult, "value"> => ({ emits, console: consoleEntries, trace, children: childOrder.flatMap((key) => {
 		const child = children.get(key);
@@ -1524,7 +1767,14 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 			console.error("Workflow onTrace callback failed:", error);
 		}
 	};
-	const hostStepChanged = (hostStep: HostStepNodeV1) => {
+	const lanePlanChanged = (lanes: WorkflowLanePlan[]) => {
+		try {
+			options.onLanePlan?.(lanes);
+		} catch (error) {
+			console.error("Workflow onLanePlan callback failed:", error);
+		}
+	};
+	const hostStepChanged = (hostStep: HostStepNode) => {
 		try {
 			options.onHostStep?.(hostStep);
 		} catch (error) {
@@ -1535,6 +1785,13 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 	const responseBoundaryFailure = (key: string, error: unknown): WorkflowScriptChildResult => {
 		const text = error instanceof Error ? error.message : String(error);
 		return { key, ok: false, output: text, error: text, artifactPaths: [] };
+	};
+	const assertRecoveryBarrierAllowsRun = (key: string, params: Record<string, unknown>): void => {
+		if (!acceptanceRecoveryBarrier || isExplicitReadOnlyRecoveryReview(params)) return;
+		throw new Error(recoveryBarrierMessage(acceptanceRecoveryBarrier.key, key));
+	};
+	const recordAcceptanceRecoveryBarrier = (key: string, result: WorkflowScriptChildResult): void => {
+		if (isAcceptanceMetadataRecovery(result)) acceptanceRecoveryBarrier = { key };
 	};
 	const stopChild = (key: string, message = `Workflow child '${key}' stopped by user.`): boolean => {
 		if (!launches.has(key) || children.has(key)) return false;
@@ -1561,6 +1818,10 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 		const finish = (outcome: { value: unknown } | { error: Error & { workflowErrorKind?: unknown } }) => {
 			if (settled || finishing) return;
 			finishing = true;
+			if (assemblyFlushTimer !== undefined) {
+				clearTimeout(assemblyFlushTimer);
+				assemblyFlushTimer = undefined;
+			}
 			childController.abort("error" in outcome ? outcome.error : new Error("Workflow script completed."));
 			void Promise.allSettled([...steers.values(), ...hostCalls.values()].map(({ promise }) => promise)).then(() => {
 				if (settled) return;
@@ -1592,6 +1853,26 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				: typeof signalReason === "string"
 					? new Error(signalReason)
 					: new Error("Workflow script aborted.");
+			if (finishing) return;
+			abortError = error;
+			const allChildrenSettled = launches.size > 0
+				&& [...launches.keys()].every((key) => children.has(key));
+			let mayFlushAssembly = false;
+			try {
+				mayFlushAssembly = options.continueAfterAbortWhenChildrenSettled?.(error) === true;
+			} catch (callbackError) {
+				const callbackMessage = callbackError instanceof Error ? callbackError.message : String(callbackError);
+				return finish({ error: new Error(`Workflow assembly flush eligibility failed: ${callbackMessage}`) });
+			}
+			if (mayFlushAssembly && allChildrenSettled) {
+				// A reloaded async workflow may already be past its last child launch.
+				// Keep the worker alive for pure result assembly, but abort the child
+				// signal so any later launch or side effect cannot use stale context.
+				assemblyAbortRequested = true;
+				childController.abort(error);
+				assemblyFlushTimer = setTimeout(() => finish({ error }), WORKFLOW_ASSEMBLY_FLUSH_TIMEOUT_MS);
+				return;
+			}
 			for (const key of launches.keys()) {
 				if (children.has(key)) continue;
 				stoppedLaunches.add(key);
@@ -1626,6 +1907,10 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 		});
 		worker.on("message", (message: Record<string, unknown>) => {
 			if (settled) return;
+			if (message.type === "lanePlan" && Array.isArray(message.lanes)) {
+				lanePlanChanged(message.lanes as WorkflowLanePlan[]);
+				return;
+			}
 			if (message.type === "emit") {
 				try {
 					assertWorkflowJsonValue(message.value, "emit");
@@ -1680,6 +1965,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				return;
 			}
 			if (message.type !== "call" || typeof message.callId !== "number" || typeof message.method !== "string" || !isRecord(message.args)) return;
+			if (assemblyAbortRequested) return finish({ error: abortError ?? new Error("Workflow context was replaced or reloaded.") });
 
 			const respond = (promise: Promise<unknown>, responsePath?: string, onBoundaryError?: (error: unknown) => void) => {
 				void promise.then(
@@ -1712,6 +1998,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 					return respond(Promise.reject(error));
 				}
 				if (message.method === "state.get") return respond(Promise.resolve().then(() => options.state!.get(key)));
+				if (acceptanceRecoveryBarrier) return respond(Promise.reject(new Error(recoveryBarrierMessage(acceptanceRecoveryBarrier.key, `state.set('${key}')`))));
 				const value = message.args.value;
 				try {
 					assertWorkflowJsonValue(value, `state.set('${key}') value`);
@@ -1748,6 +2035,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				const steerMessage = message.args.message;
 				if (typeof steerMessage !== "string" || !steerMessage.trim()) return respond(Promise.reject(new Error(`runs.steer('${key}') requires a non-empty message.`)));
 				const steerOptions = isRecord(message.args.options) ? message.args.options as WorkflowSteerOptions : {};
+				if (acceptanceRecoveryBarrier) return respond(Promise.reject(new Error(recoveryBarrierMessage(acceptanceRecoveryBarrier.key, `runs.steer('${key}')`))));
 				const startedAt = Date.now();
 				trace.push({ operation: "steer", key, state: "started" });
 				traceChanged();
@@ -1778,10 +2066,11 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				} catch (error) {
 					return respond(Promise.reject(error));
 				}
+				if (acceptanceRecoveryBarrier) return respond(Promise.reject(new Error(recoveryBarrierMessage(acceptanceRecoveryBarrier.key, `runs.host('${key}')`))));
 				if (!options.host) return respond(Promise.reject(new Error("runs.host is unavailable in this host context.")));
 				if (hostCalls.size >= HOST_STEP_MAX_COUNT) return respond(Promise.reject(new Error(`workflowScript supports at most ${HOST_STEP_MAX_COUNT} runs.host calls.`)));
 				const startedAt = Date.now();
-				const startedStep: HostStepNodeV1 = {
+				const startedStep: HostStepNode = {
 					version: 1,
 					kind: "host-step",
 					monitorKind: "command",
@@ -1833,14 +2122,16 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 			const deliver = (promise: Promise<WorkflowScriptChildResult>) => collectFailure
 				? promise
 				: promise.then((result) => {
-					if (!result.ok && !result.stopped) {
+					const recoverableAcceptanceMetadata = result.recovery?.status === "available-for-review"
+						&& result.recovery.reason === "acceptance-metadata-rejected";
+					if (!result.ok && !result.stopped && !recoverableAcceptanceMetadata) {
 						const childError = new Error(result.detached ? `Run '${key}' detached: ${result.error ?? result.output}` : `Run '${key}' failed: ${result.error ?? result.output}`) as Error & { workflowErrorKind?: "detached-child" };
 						if (result.detached) childError.workflowErrorKind = "detached-child";
 						throw childError;
 					}
 					return result;
 				});
-			const fingerprint = stableJson(params);
+			const fingerprint = stableJson(canonicalRunParams(params));
 			const existing = launches.get(key);
 			if (existing) {
 				if (existing.fingerprint !== fingerprint) return respond(Promise.reject(new Error(`Duplicate workflow key '${key}' used with incompatible launch params.`)));
@@ -1861,11 +2152,14 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 			if (params.worktree !== undefined && typeof params.worktree !== "boolean") {
 				return respond(Promise.reject(new Error(`runs.run('${key}') worktree must be true or false.`)));
 			}
+			if (params.baseRef !== undefined && (typeof params.baseRef !== "string" || !validGitRef(params.baseRef))) {
+				return respond(Promise.reject(new Error(`runs.run('${key}') ${BASE_REF_VALIDATION_ERROR}`)));
+			}
 			if (params.gate !== undefined && (typeof params.gate !== "string" || !params.gate.trim())) {
 				return respond(Promise.reject(new Error(`runs.run('${key}') gate must be a non-empty command string.`)));
 			}
-			if (params.gate !== undefined && params.acceptance !== undefined) {
-				return respond(Promise.reject(new Error(`runs.run('${key}') gate cannot be combined with acceptance; use one gate command or acceptance.verify.`)));
+			if (params.gate !== undefined && params.acceptance !== undefined && params.acceptance !== false) {
+				return respond(Promise.reject(new Error(`runs.run('${key}') gate cannot be combined with acceptance; use one gate command or acceptance.verify.` + describeGateAcceptanceConflict(params.gate, params.acceptance))));
 			}
 			if (params.gate !== undefined && params.resume !== undefined) {
 				return respond(Promise.reject(new Error(`runs.run('${key}') gate is not supported with retained resume.`)));
@@ -1897,6 +2191,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				});
 				admission = Promise.resolve().then(() => {
 					if (settled || finishing) return;
+					for (const call of calls) assertRecoveryBarrierAllowsRun(call.key, call.params);
 					return options.admit?.(calls);
 				});
 				if (batch) batchAdmissions.set(batch.id, admission);
@@ -1911,10 +2206,11 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				const childStopController = new AbortController();
 				childStopControllers.set(key, childStopController);
 				const childSignal = combinedAbortSignal([childController.signal, childStopController.signal]);
-				const resolvedResumeValue = resumeReference
+				const resumeInput = resumeReference ?? (typeof params.resume === "string" && options.resolveResume ? params.resume : undefined);
+				const resolvedResumeValue = resumeInput
 					? await Promise.resolve().then(() => {
 						if (!options.resolveResume) throw new Error("Keyed workflow receipt resume is unavailable in this host.");
-						return options.resolveResume(resumeReference, childSignal);
+						return options.resolveResume(resumeInput, childSignal, typeof params.index === "number" ? params.index : undefined);
 					})
 					: undefined;
 				const resolvedResume = typeof resolvedResumeValue === "string"
@@ -1930,6 +2226,10 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 						: [];
 					resolvedResumeLineage = [...new Set(lineage.length ? lineage : [resolvedResumeId!])];
 					if (resolvedResumeLineage.at(-1) !== resolvedResumeId) resolvedResumeLineage.push(resolvedResumeId!);
+					if (typeof resumeInput === "string") {
+						const predecessor = [...children.values()].find((child) => child.runId === resolvedResumeId);
+						if (predecessor?.continuation && predecessor.continuation.runIds.at(-1) === resolvedResumeId) resolvedResumeLineage = predecessor.continuation.runIds;
+					}
 				}
 				const launchParams = resolvedResumeId ? { ...params, resume: resolvedResumeId } : params;
 				await launchSemaphore.acquire();
@@ -1957,6 +2257,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				childStopControllers.delete(key);
 				if (stoppedLaunches.has(key)) return children.get(key) ?? normalized;
 				children.set(key, normalized);
+				recordAcceptanceRecoveryBarrier(key, normalized);
 				const state = normalized.ok ? "completed" : normalized.stopped ? "stopped" : normalized.detached ? "detached" : "failed";
 				trace.push({ operation: "run", key, state, durationMs: Date.now() - startedAt, ...workflowStringMetadata(params), ...(generatedLaneKey ? { generatedLaneKey } : {}), ...(normalized.agent ? { agent: normalized.agent } : {}), ...(normalized.runId ? { runId: normalized.runId } : {}), ...(!normalized.ok ? { error: normalized.error ?? normalized.output } : {}) });
 				traceChanged();

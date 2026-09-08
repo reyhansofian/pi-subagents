@@ -6,9 +6,11 @@ export const KNOWN_FIELDS = new Set([
 	"name",
 	"package",
 	"description",
+	"advertise",
 	"alias",
 	"aliases",
 	"tools",
+	"excludeTools",
 	"allowNestedSubagents",
 	"model",
 	"fallbackModels",
@@ -61,6 +63,7 @@ export function serializeAgent(config: AgentConfig, options: SerializeAgentOptio
 	lines.push(`name: ${frontmatterNameForConfig(config)}`);
 	if (config.packageName) lines.push(`package: ${config.packageName}`);
 	lines.push(`description: ${config.description}`);
+	if (config.advertise === true || preserve("advertise")) lines.push(`advertise: ${config.advertise === true ? "true" : "false"}`);
 	const aliasesValue = joinComma(config.aliases);
 	if (aliasesValue || preserve("alias", "aliases")) lines.push(`aliases: ${aliasesValue ?? ""}`);
 
@@ -70,6 +73,8 @@ export function serializeAgent(config: AgentConfig, options: SerializeAgentOptio
 	];
 	const toolsValue = joinComma(tools);
 	if (toolsValue || preserve("tools")) lines.push(`tools: ${toolsValue ?? ""}`);
+	const excludeToolsValue = joinComma(config.excludeTools);
+	if (excludeToolsValue || preserve("excludeTools")) lines.push(`excludeTools: ${excludeToolsValue ?? ""}`);
 	if (config.allowNestedSubagents === true || preserve("allowNestedSubagents")) {
 		lines.push(`allowNestedSubagents: ${config.allowNestedSubagents === undefined ? "" : config.allowNestedSubagents ? "true" : "false"}`);
 	}

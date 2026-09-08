@@ -107,7 +107,7 @@ describe("non-blocking wait subscriptions", () => {
 		}
 	});
 
-	it("rejects non-blocking subscriptions from headless tool calls", async () => {
+	it("registers bg_wait and rejects non-blocking subscriptions from headless tool calls", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-subscribe-headless-"));
 		try {
 			const state = makeState();
@@ -119,15 +119,16 @@ describe("non-blocking wait subscriptions", () => {
 				updatedAt: Date.now(),
 				children: [{ agent: "worker", index: 0, status: "detached" }],
 			}]]);
-			let tool: { execute: (...args: unknown[]) => Promise<{ content: Array<{ text?: string }>; isError?: boolean }> } | undefined;
+			const registered: Array<{ name: string; description: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text?: string }>; isError?: boolean }> }> = [];
 			registerWaitTool({
 				events: new TestBus(),
-				registerTool(value: unknown) { tool = value as typeof tool; },
+				registerTool(value: unknown) { registered.push(value as typeof registered[number]); },
 			} as never, state, true, {
 				arm() { throw new Error("headless calls must not arm subscriptions"); },
 			});
+			assert.deepEqual(registered.map((entry) => entry.name), ["bg_wait"]);
 			await assert.rejects(
-				tool!.execute("wait", { id: "run-headless", nonBlocking: true }, undefined, undefined, { hasUI: false }),
+				registered[0]!.execute("wait", { id: "run-headless", nonBlocking: true }, undefined, undefined, { hasUI: false }),
 				/long-lived interactive subagent runtime/,
 			);
 		} finally {
@@ -281,7 +282,7 @@ describe("non-blocking wait subscriptions", () => {
 
 			const message = sent[0] ?? "";
 			assert.match(message, /Reply to the supervisor request first/);
-			assert.match(message, /wait with subagent_wait/);
+			assert.match(message, /wait with bg_wait/);
 			assert.match(message, /do not resume or launch a replacement/);
 			assert.doesNotMatch(message, /Resume-first/);
 		} finally {

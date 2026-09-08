@@ -1,17 +1,17 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { discoverAgents, discoverAgentsAll, findBlockingAgentDiagnostic, formatUnknownAgentError, resolveAgentName, unknownAgentDiagnosticContext, type AgentConfig, type AgentScope, type AgentSource } from "../agents/agents.ts";
+import { discoverAgentSnapshot, findBlockingAgentDiagnostic, formatUnknownAgentError, resolveAgentName, unknownAgentDiagnosticContext, type AgentConfig, type AgentDiscoveryAllResult, type AgentScope, type AgentSource } from "../agents/agents.ts";
 import { resolveExecutionAgentScope } from "../agents/agent-scope.ts";
 import { buildSkillInjection, normalizeSkillInput, resolveSkillsWithFallback } from "../agents/skills.ts";
 import { buildAgentMemoryInjection } from "../agents/agent-memory.ts";
-import { buildModelCandidates, inheritsParentModel, resolveEffectiveSubagentModel, type AvailableModelInfo, type ParentModel } from "../runs/shared/model-fallback.ts";
+import { buildModelCandidates, inheritsParentModel, resolveEffectiveSubagentModel, resolveModelOrigin, type AvailableModelInfo, type ParentModel } from "../runs/shared/model-fallback.ts";
 import { resolveModelScopesForAgent } from "../runs/shared/model-scope.ts";
-import { applyThinkingSuffix, resolvePiLaunchToolPlan, type PiLaunchToolPlan } from "../runs/shared/pi-args.ts";
+import { applyThinkingSuffix, resolvePiLaunchToolPlan, type PiLaunchToolPlan } from "../runs/shared/child-tool-plan.ts";
 import { injectOutputPathSystemPrompt, normalizeSingleOutputOverride, resolveSingleOutputPath } from "../runs/shared/single-output.ts";
 import { getArtifactPaths, getArtifactsDir } from "../shared/artifacts.ts";
 import { resolveEffectiveThinking } from "../shared/model-info.ts";
-import { assertThinkingWithinCeiling, decodeThinkingCeiling, intersectThinkingCeilings, SUBAGENT_THINKING_CEILING_ENV, type ThinkingLevel } from "../shared/thinking-ceiling.ts";
+import { assertThinkingWithinCeiling, intersectThinkingCeilings, type ThinkingLevel } from "../shared/thinking-ceiling.ts";
 import { SUBAGENT_LIFECYCLE_ARTIFACT_VERSION, type ArtifactDirPreference, type ArtifactPaths, type JsonSchemaObject, type OutputMode } from "../shared/types.ts";
 import { capabilityCeilingAgentRestrictionMessage, intersectSubagentCapabilityCeilings, type ResolvedSubagentCapabilityCeiling, type SubagentCapabilityAudit } from "../runs/shared/capability-ceiling.ts";
 import { resolvePermissionRules } from "../runs/shared/permissions.ts";
@@ -73,6 +73,7 @@ export interface SubagentLaunchContractInput {
 	/** Current parent leaf required before an implicit `defaultContext: fork` stays `fork`. */
 	parentLeafId?: string | null;
 	sessionRoot?: string;
+	/** Caller directory used as a root keyed by the child run id ("preflight" placeholder when runId is omitted). */
 	sessionDir?: string;
 	runId?: string;
 	/** Root run id supplied by a host when projecting nested async lifecycle paths. */
@@ -111,6 +112,7 @@ export interface SubagentLaunchContractSkills {
 export interface SubagentLaunchContractTools {
 	requestedBuiltin: string[];
 	declaredBuiltin: string[];
+	excludeTools?: string[];
 	effectiveAllowlist: string[];
 	explicitAllowlist: boolean;
 	requiredChildTools: string[];
@@ -222,8 +224,7 @@ function taskWorkspaceScopeAuthorityDiagnostic(task: string | undefined): Subage
 	};
 }
 
-function candidateList(inputAgent: string, selected: AgentConfig | undefined, cwd: string, provider?: string): SubagentLaunchContractAgentCandidate[] {
-	const all = discoverAgentsAll(cwd, provider);
+function candidateList(inputAgent: string, selected: AgentConfig | undefined, all: AgentDiscoveryAllResult): SubagentLaunchContractAgentCandidate[] {
 	return [...all.builtin, ...all.package, ...all.user, ...all.project]
 		.filter((agent) => Boolean(resolveAgentName(inputAgent, [agent]).agent))
 		.map((agent) => ({
@@ -258,7 +259,8 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 	}
 	const scope = resolveExecutionAgentScope(input.agentScope);
 	const parentProvider = input.preferredProvider ?? input.parentModel?.provider;
-	const discovered = discoverAgents(effectiveCwd, scope, parentProvider);
+	const discovery = discoverAgentSnapshot(effectiveCwd, scope, parentProvider, { includeChains: false });
+	const discovered = discovery.effective;
 	const resolvedAgent = resolveAgentName(input.agent, discovered.agents);
 	const ambiguousCandidates = resolvedAgent.error
 		? discovered.agents.filter((agent) => resolveAgentName(input.agent, [agent]).agent)
@@ -317,22 +319,26 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 	const availableModels = normalizeAvailableModels(input.availableModels);
 	const preferredProvider = agent.modelProvider ?? input.preferredProvider ?? input.parentModel?.provider;
 	const modelScopes = resolveModelScopesForAgent(discovered.modelScope, agent.name, input.parentModel);
+	const modelOrigin = resolveModelOrigin({ explicitModel: input.model, agentModel: agent.model, parentModel: input.parentModel });
 	const primaryModel = externalRunner
 		? undefined
-		: resolveEffectiveSubagentModel(input.model, agent.model, input.parentModel, availableModels, preferredProvider, { scope: modelScopes });
+		: resolveEffectiveSubagentModel(input.model, agent.model, input.parentModel, availableModels, preferredProvider, {
+			scope: modelScopes,
+			source: modelOrigin === "explicit" ? "explicit" : "inherited",
+		});
 	const effectiveThinkingConfig = input.thinking !== undefined ? input.thinking : agent.thinking;
 	const thinkingCeiling = externalRunner ? undefined : intersectThinkingCeilings(
 		discovered.maxThinking,
 		input.thinkingCeiling,
 		input.inheritedThinkingCeiling,
-		decodeThinkingCeiling(process.env[SUBAGENT_THINKING_CEILING_ENV]),
 	);
 	const model = externalRunner ? undefined : applyThinkingSuffix(primaryModel, effectiveThinkingConfig, input.thinking !== undefined);
 	const modelCandidates = externalRunner
 		? []
 		: buildModelCandidates(primaryModel, agent.fallbackModels, availableModels, preferredProvider, {
 			scope: modelScopes,
-			primaryModelFromParent: inheritsParentModel(input.model, agent.model, input.parentModel),
+			primaryModelFromParent: modelOrigin === "inherited" || inheritsParentModel(input.model, agent.model, input.parentModel),
+			origin: modelOrigin,
 		})
 			.map((candidate) => applyThinkingSuffix(candidate, effectiveThinkingConfig, input.thinking !== undefined) ?? candidate);
 	if (!externalRunner) {
@@ -351,6 +357,7 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 	try {
 		toolPlan = resolvePiLaunchToolPlan({
 			tools: agent.tools,
+			excludeTools: agent.excludeTools,
 			allowNestedSubagents: agent.allowNestedSubagents,
 			extensions: agent.extensions,
 			subagentOnlyExtensions: agent.subagentOnlyExtensions,
@@ -374,7 +381,10 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 	const artifactsDir = artifactsEnabled ? getArtifactsDir(input.parentSessionFile ?? null, effectiveCwd, input.artifactDir) : undefined;
 	const artifactPaths = artifactsDir ? getArtifactPaths(artifactsDir, runId, agent.name, 0) : undefined;
 	const outputPath = resolveSingleOutputPath(behavior.output, effectiveCwd, effectiveCwd, artifactsDir ? path.join(artifactsDir, "outputs", runId) : undefined);
-	const sessionRoot = input.sessionDir ? path.resolve(input.sessionDir) : input.sessionRoot ? path.join(path.resolve(input.sessionRoot), runId) : undefined;
+	// An explicit sessionDir is a root keyed by the child run id, matching the
+	// sibling sessionRoot derivation; hosts omitting runId get the documented
+	// deterministic "preflight" placeholder.
+	const sessionRoot = input.sessionDir ? path.join(path.resolve(input.sessionDir), runId) : input.sessionRoot ? path.join(path.resolve(input.sessionRoot), runId) : undefined;
 	const sessionDir = sessionRoot ? path.join(sessionRoot, "run-0") : undefined;
 	const lifecycleAsyncDir = input.nestedRootRunId
 		? path.join(TEMP_ROOT_DIR, "nested-subagent-runs", input.nestedRootRunId, runId)
@@ -397,7 +407,7 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 	const memoryInjection = buildAgentMemoryInjection(agent, effectiveCwd);
 	if (memoryInjection) effectiveSystemPrompt = effectiveSystemPrompt ? `${effectiveSystemPrompt}\n\n${memoryInjection}` : memoryInjection;
 	effectiveSystemPrompt = injectOutputPathSystemPrompt(effectiveSystemPrompt, outputPath, agent);
-	const candidates = candidateList(input.agent, agent, effectiveCwd, parentProvider);
+	const candidates = candidateList(input.agent, agent, discovery.all);
 	const shadowedCandidates = candidates.filter((candidate) => !candidate.selected);
 	const definitionDigest = agentDefinitionDigest(agent);
 	const contractBase: Omit<SubagentLaunchContract, "digest"> = {
@@ -430,6 +440,7 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 		tools: {
 			requestedBuiltin: toolPlan.requestedBuiltinTools,
 			declaredBuiltin: toolPlan.declaredBuiltinTools,
+			...(toolPlan.excludeTools.length > 0 ? { excludeTools: toolPlan.excludeTools } : {}),
 			effectiveAllowlist: toolPlan.effectiveToolAllowlist,
 			explicitAllowlist: toolPlan.explicitToolAllowlist,
 			requiredChildTools: toolPlan.requiredChildTools,
@@ -480,6 +491,7 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 			inheritSkills: agent.inheritSkills,
 			skills: requestedSkills,
 			tools: toolPlan.effectiveToolAllowlist,
+			...(toolPlan.excludeTools.length > 0 ? { excludeTools: toolPlan.excludeTools } : {}),
 			extensions: toolPlan.extensionArgs,
 			mcpDirectTools: toolPlan.effectiveMcpTools,
 			...(outputPath ? { outputPath } : {}),

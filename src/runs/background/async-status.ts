@@ -1,8 +1,9 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { formatDuration, formatModelThinking, formatTokens, shortenPath } from "../../shared/formatters.ts";
+import { previewDisplayText } from "../../shared/display-text.ts";
 import { formatActivityLabel, formatParallelOutcome } from "../../shared/status-format.ts";
-import { type ActivityState, type AsyncJobStep, type AsyncParallelGroupStatus, type AsyncStatus, type CostSummary, type Details, type HostStepNodeV1, type HostStepState, type LaunchResolvedChildExtensionsV1, type RuntimeAcknowledgedChildExtensionsV1, type NestedRunSummary, type SteeringStatus, type SubagentRunMode, type TokenUsage, type TurnBudgetState, type UsageBudgetState, type WorkflowPreflightV1 } from "../../shared/types.ts";
+import { type ActivityState, type AsyncJobStep, type AsyncParallelGroupStatus, type AsyncStatus, type CostSummary, type Details, type HostStepNode, type HostStepState, type LaunchResolvedChildExtensions, type RuntimeAcknowledgedChildExtensions, type NestedRunSummary, type SteeringStatus, type SubagentRunMode, type TimeoutRecoveryProjection, type TokenUsage, type TurnBudgetState, type UsageBudgetState, type WorktreeNaming, type WorkflowPreflight, type WorkflowGraphSnapshot } from "../../shared/types.ts";
 import type { ResolvedSubagentCapabilityCeiling, SubagentCapabilityAudit } from "../shared/capability-ceiling.ts";
 import { readStatus } from "../../shared/utils.ts";
 import { attachRootChildrenToSteps, buildNestedRouteIndex, findNestedRouteForRootId, type NestedRoute, projectNestedEvents } from "../shared/nested-events.ts";
@@ -21,6 +22,10 @@ import { assertWorkflowGraphHostSteps, hostStepReportName, hostStepVerdictLabel,
 import { projectAsyncWorkflowRows } from "../shared/async-status-projection.ts";
 import { validateAsyncStatusLaneMetadata } from "../shared/lane-metadata.ts";
 import { formatWorkflowPreflightPlanSummary, formatWorkflowPreflightWarningSummary } from "../../workflows/workflow-preflight.ts";
+import { workflowGraphStageNodes } from "../shared/workflow-graph.ts";
+import { formatTimeoutRecoveryLines, projectTimeoutRecovery } from "../shared/mutation-evidence.ts";
+import { formatWorkflowChecklistText, projectWorkflowChecklist } from "../../workflows/workflow-checklist.ts";
+import type { RawDrainStatusObserver } from "../shared/readonly-drain-observation.ts";
 
 interface AsyncRunStepSummary {
 	index: number;
@@ -36,6 +41,8 @@ interface AsyncRunStepSummary {
 	lane?: AsyncJobStep["lane"];
 	worktreePath?: string;
 	branch?: string;
+	provider?: "native" | "worktrunk";
+	naming?: WorktreeNaming;
 	runId?: string;
 	outputName?: string;
 	structured?: boolean;
@@ -75,8 +82,9 @@ interface AsyncRunStepSummary {
 	review?: AsyncJobStep["review"];
 	effects?: AsyncJobStep["effects"];
 	processTerminal?: AsyncJobStep["processTerminal"];
-	launchResolvedExtensions?: LaunchResolvedChildExtensionsV1;
-	runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensionsV1;
+	timeoutRecovery?: TimeoutRecoveryProjection;
+	launchResolvedExtensions?: LaunchResolvedChildExtensions;
+	runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensions;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	capabilityAudit?: SubagentCapabilityAudit;
 	children?: NestedRunSummary[];
@@ -115,7 +123,8 @@ export interface AsyncRunSummary {
 	chainStepCount?: number;
 	pendingAppends?: number;
 	parallelGroups?: AsyncParallelGroupStatus[];
-	hostSteps?: HostStepNodeV1[];
+	hostSteps?: HostStepNode[];
+	workflowGraph?: AsyncStatus["workflowGraph"];
 	steps: AsyncRunStepSummary[];
 	sessionDir?: string;
 	outputFile?: string;
@@ -127,8 +136,8 @@ export interface AsyncRunSummary {
 	nestedWarnings?: string[];
 	processTerminal?: AsyncStatus["processTerminal"];
 	runFanoutBudget?: AsyncStatus["runFanoutBudget"];
-	launchResolvedExtensions?: LaunchResolvedChildExtensionsV1;
-	runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensionsV1;
+	launchResolvedExtensions?: LaunchResolvedChildExtensions;
+	runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensions;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	capabilityAudit?: SubagentCapabilityAudit;
 	parentWorkflowRunId?: string;
@@ -136,7 +145,7 @@ export interface AsyncRunSummary {
 	lane?: AsyncStatus["lane"];
 	workflow?: Details["workflow"];
 	workflowChildren?: Details["workflowChildren"];
-	preflight?: WorkflowPreflightV1;
+	preflight?: WorkflowPreflight;
 }
 
 interface AsyncRunListOptions {
@@ -159,6 +168,40 @@ interface AsyncRunListOptions {
 
 function getErrorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+function isAsyncStatusIsolationError(asyncDir: string, error: unknown): boolean {
+	const statusPath = path.join(asyncDir, "status.json");
+	const message = getErrorMessage(error);
+	return /^(?:Failed to (?:inspect|read|parse|validate) async status file|Invalid async status file) '/.test(message)
+		|| message.startsWith(`Invalid async status '${statusPath}'`)
+		|| message.startsWith(`Invalid host step '${statusPath}`)
+		|| /^(workflowChildren|Invalid workflowChildren)/.test(message);
+}
+
+function isolateCorruptActiveRun(asyncDir: string, runId: string, error: unknown, now?: () => number): void {
+	const statusPath = path.join(asyncDir, "status.json");
+	const processTerminal = readProcessTerminal(asyncDir, { runId });
+	let markerAge: number | undefined;
+	try {
+		markerAge = activeRunMarkerAgeMs(asyncDir, now?.());
+	} catch (markerError) {
+		console.error(`Failed to inspect corrupt async active-run marker for '${runId}':`, markerError);
+	}
+	const markerCanBeReleased = processTerminal?.state === "observed"
+		|| (markerAge !== undefined && markerAge > DEFAULT_STALE_TERMINAL_ACTIVE_MARKER_MS);
+	let markerAction = "active marker retained because runner liveness is unknown";
+	if (markerCanBeReleased) {
+		try {
+			releaseActiveRunIndex(asyncDir);
+			markerAction = processTerminal?.state === "observed"
+				? "active marker released after observed process-terminal proof"
+				: "stale active marker released";
+		} catch (releaseError) {
+			markerAction = `failed to release active marker: ${getErrorMessage(releaseError)}`;
+		}
+	}
+	console.error(`[pi-subagents] Skipping corrupt active async run '${runId}' at '${statusPath}': ${getErrorMessage(error)}; ${markerAction}.`);
 }
 
 function isNotFoundError(error: unknown): boolean {
@@ -245,14 +288,16 @@ function deriveAsyncActivityState(asyncDir: string, status: AsyncStatus): { acti
 }
 
 function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string }, nestedWarnings: string[] = [], nestedRoute?: NestedRoute): AsyncRunSummary {
-	validateAsyncStatusLaneMetadata(status, `Invalid async status '${path.join(asyncDir, "status.json")}'`);
+	const statusPath = path.join(asyncDir, "status.json");
+	validateAsyncStatusLaneMetadata(status, `Invalid async status '${statusPath}'`);
 	const workflowChildren = parseWorkflowChildSummary(status.workflowChildren);
-	if (workflowChildren && workflowChildren.workflowRunId !== status.runId) throw new Error(`Invalid async status '${path.join(asyncDir, "status.json")}': workflowChildren.workflowRunId does not match.`);
-	assertWorkflowGraphHostSteps(status.workflowGraph, path.join(asyncDir, "status.json"), status.runId);
+	if (workflowChildren && workflowChildren.workflowRunId !== status.runId) throw new Error(`Invalid async status '${statusPath}': workflowChildren.workflowRunId does not match.`);
+	assertWorkflowGraphHostSteps(status.workflowGraph, statusPath, status.runId);
 	const hostSteps = validHostStepNodes(status.workflowGraph);
 	if (status.sessionId !== undefined && typeof status.sessionId !== "string") {
-		throw new Error(`Invalid async status '${path.join(asyncDir, "status.json")}': sessionId must be a string.`);
+		throw new Error(`Invalid async status '${statusPath}': sessionId must be a string.`);
 	}
+	if (status.outputFile !== undefined && typeof status.outputFile !== "string") throw new Error(`Invalid async status '${statusPath}': outputFile must be a string.`);
 	const { activityState, lastActivityAt } = deriveAsyncActivityState(asyncDir, status);
 	const processTerminal = readProcessTerminal(asyncDir, { runId: status.runId, runnerProcessInstanceId: status.processTerminal?.runnerProcessInstanceId })
 		?? sanitizeProcessTerminal(status.processTerminal, { runId: status.runId, runnerProcessInstanceId: status.processTerminal?.runnerProcessInstanceId }, path.join(asyncDir, "status.json"));
@@ -282,6 +327,7 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 	const summarizedSteps = steps.map((step, index) => {
 		const stepActivityState = step.activityState;
 		const stepLastActivityAt = step.lastActivityAt;
+		const timeoutRecovery = projectTimeoutRecovery(step.timeoutRecovery);
 		return {
 			index,
 			childId: asyncStatusChildIdentity(step, index),
@@ -295,6 +341,8 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 			...(step.lane ? { lane: step.lane } : {}),
 			...(step.worktreePath ? { worktreePath: step.worktreePath } : {}),
 			...(step.branch ? { branch: step.branch } : {}),
+			...(step.provider ? { provider: step.provider } : {}),
+			...(step.naming ? { naming: step.naming } : {}),
 			...(step.runId ? { runId: step.runId } : {}),
 			...(step.outputName ? { outputName: step.outputName } : {}),
 			...(step.structured ? { structured: step.structured } : {}),
@@ -341,6 +389,7 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 			...(step.effects ? { effects: step.effects } : {}),
 			...(step.watchdog ? { watchdog: step.watchdog } : {}),
 			...(step.processTerminal ? { processTerminal: sanitizeProcessTerminal(step.processTerminal, { runId: status.runId, runnerProcessInstanceId: step.processTerminal.runnerProcessInstanceId }, `${path.join(asyncDir, "status.json")} step ${index}`) } : {}),
+			...(timeoutRecovery ? { timeoutRecovery } : {}),
 			...(step.capabilityCeiling ? { capabilityCeiling: step.capabilityCeiling } : {}),
 			...(step.capabilityAudit ? { capabilityAudit: step.capabilityAudit } : {}),
 			...(step.children?.length ? { children: step.children } : {}),
@@ -381,6 +430,7 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 		...(status.pendingAppends !== undefined ? { pendingAppends: status.pendingAppends } : {}),
 		...(parallelGroups.length ? { parallelGroups } : {}),
 		...(hostSteps.length ? { hostSteps } : {}),
+		...(status.mode === "workflow" && status.workflowGraph ? { workflowGraph: status.workflowGraph } : {}),
 		steps: summarizedSteps,
 		...(nestedChildren.length ? { nestedChildren } : {}),
 		...(nestedWarnings.length ? { nestedWarnings } : {}),
@@ -432,7 +482,7 @@ function sortRuns(runs: AsyncRunSummary[]): AsyncRunSummary[] {
 	});
 }
 
-export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions = {}): AsyncRunSummary[] {
+export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions = {}, observeStatus?: RawDrainStatusObserver): AsyncRunSummary[] {
 	let entries: string[];
 	const activeEntries = new Set<string>();
 	const wantsActive = options.states === undefined || options.states.some(isActiveAsyncState);
@@ -459,6 +509,7 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 						indexed.add(entry);
 						activeEntries.add(entry);
 					} else {
+						observeStatus?.(null);
 						updateActiveRunIndex(path.join(asyncDirRoot, entry), "failed");
 					}
 				}
@@ -470,6 +521,7 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 		}
 	} catch (error) {
 		if (isNotFoundError(error)) return [];
+		observeStatus?.(null);
 		throw new Error(`Failed to list async runs in '${asyncDirRoot}': ${getErrorMessage(error)}`, {
 			cause: error instanceof Error ? error : undefined,
 		});
@@ -491,11 +543,21 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 	};
 	for (const entry of entries) {
 		const asyncDir = path.join(asyncDirRoot, entry);
-		const reconciliation = options.reconcile === false
-			? undefined
-			: reconcileAsyncRun(asyncDir, { resultsDir: options.resultsDir, kill: options.kill, now: options.now });
-		const status = (reconciliation?.status ?? readStatus(asyncDir)) as (AsyncStatus & { cwd?: string }) | null;
+		let status: (AsyncStatus & { cwd?: string }) | null;
+		try {
+			const reconciliation = options.reconcile === false
+				? undefined
+				: reconcileAsyncRun(asyncDir, { resultsDir: options.resultsDir, kill: options.kill, now: options.now }, observeStatus);
+			status = (reconciliation?.status ?? readStatus(asyncDir)) as (AsyncStatus & { cwd?: string }) | null;
+			if (options.reconcile === false) observeStatus?.(status);
+		} catch (error) {
+			observeStatus?.(null);
+			if (!activeEntries.has(entry) || !isAsyncStatusIsolationError(asyncDir, error)) throw error;
+			isolateCorruptActiveRun(asyncDir, entry, error, options.now);
+			continue;
+		}
 		if (!status) {
+			observeStatus?.(null);
 			if (activeEntries.has(entry)) updateActiveRunIndex(asyncDir, "failed");
 			continue;
 		}
@@ -517,10 +579,19 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 				nestedRoute = resolveNestedRoute(status.runId || path.basename(asyncDir));
 				if (nestedRoute) reconcileNestedAsyncDescendants(nestedRoute, { resultsDir: options.resultsDir, kill: options.kill, now: options.now });
 			} catch (error) {
+				observeStatus?.(null);
 				nestedWarnings.push(`Nested status unavailable: ${getErrorMessage(error)}`);
 			}
 		}
-		const summary = statusToSummary(asyncDir, status, nestedWarnings, nestedRoute);
+		let summary: AsyncRunSummary;
+		try {
+			summary = statusToSummary(asyncDir, status, nestedWarnings, nestedRoute);
+		} catch (error) {
+			observeStatus?.(null);
+			if (!activeEntries.has(entry) || !isAsyncStatusIsolationError(asyncDir, error)) throw error;
+			isolateCorruptActiveRun(asyncDir, entry, error, options.now);
+			continue;
+		}
 		runs.push(summary);
 	}
 
@@ -556,7 +627,7 @@ function formatStepLine(step: AsyncRunStepSummary): string {
 	if (step.durationMs !== undefined) parts.push(formatDuration(step.durationMs));
 	if (step.tokens) parts.push(`${formatTokens(step.tokens.total)} tok`);
 	if (step.lane) parts.push(`lane ${step.lane.key}`);
-	if (step.worktreePath) parts.push(`worktree ${shortenPath(step.worktreePath)} · branch ${step.branch ?? "unknown"}`);
+	if (step.worktreePath) parts.push(`worktree ${shortenPath(step.worktreePath)} · branch ${step.branch ?? "unknown"}${step.provider ? ` · provider ${step.provider}` : ""}`);
 	return parts.join(" | ");
 }
 
@@ -575,12 +646,41 @@ function formatHostStepLine(row: ReturnType<typeof projectAsyncWorkflowRows>[num
 	return `host ${row.kind}: ${row.name} | ${state}${details.length ? ` | ${details.join(" | ")}` : ""}`;
 }
 
+function workflowStageStateLabel(status: WorkflowGraphSnapshot["nodes"][number]["status"]): string {
+	switch (status) {
+		case "completed":
+			return "complete";
+		case "detached":
+			return "paused";
+		default:
+			return status;
+	}
+}
+
+export function formatWorkflowStageLine(node: WorkflowGraphSnapshot["nodes"][number], index: number, total: number): string {
+	const state = workflowStageStateLabel(node.status);
+	const id = previewDisplayText(node.id, 160);
+	const label = node.label ? previewDisplayText(node.label, 160) : "";
+	const display = label && label !== id ? ` | ${label}` : "";
+	const agent = node.agent ? ` | ${previewDisplayText(node.agent, 80)}` : "";
+	const error = node.error ? ` | ${previewDisplayText(node.error, 240)}` : "";
+	return `stage ${index + 1}/${total}: ${id}${display}${agent} | ${state}${error}`;
+}
+
 export function formatAsyncRunOutputPath(run: Pick<AsyncRunSummary, "asyncDir" | "outputFile">): string | undefined {
 	if (!run.outputFile) return undefined;
 	return path.isAbsolute(run.outputFile) ? run.outputFile : path.join(run.asyncDir, run.outputFile);
 }
 
-export function formatAsyncRunProgressLabel(run: Pick<AsyncRunSummary, "mode" | "state" | "currentStep" | "chainStepCount" | "parallelGroups" | "steps">): string {
+export function formatAsyncRunProgressLabel(run: Pick<AsyncRunSummary, "mode" | "state" | "currentStep" | "chainStepCount" | "parallelGroups" | "steps"> & { workflowGraph?: WorkflowGraphSnapshot }): string {
+	const graphStages = run.mode === "workflow" ? workflowGraphStageNodes(run.workflowGraph) : [];
+	if (graphStages.length > 0) {
+		const currentNode = graphStages.find((node) => node.id === run.workflowGraph?.currentNodeId);
+		if (currentNode && currentNode.status !== "completed") return `stage ${graphStages.indexOf(currentNode) + 1}/${graphStages.length}`;
+		const activeNode = graphStages.find((node) => node.status === "running") ?? graphStages.find((node) => node.status !== "completed");
+		if (activeNode) return `stage ${graphStages.indexOf(activeNode) + 1}/${graphStages.length}`;
+		return `stage ${graphStages.length}/${graphStages.length}`;
+	}
 	const stepCount = run.steps.length || 1;
 	const chainStepCount = run.chainStepCount ?? stepCount;
 	const groups = normalizeParallelGroups(run.parallelGroups, run.steps.length, chainStepCount);
@@ -620,9 +720,26 @@ export function formatAsyncRunList(runs: AsyncRunSummary[], heading = "Active as
 		if (run.preflight) lines.push(formatWorkflowPreflightPlanSummary(run.preflight, { indent: "  " }));
 		const preflightWarning = formatWorkflowPreflightWarningSummary(run.workflow?.preflightWarnings, { indent: "  " });
 		if (preflightWarning) lines.push(preflightWarning);
+		if (run.mode === "workflow") {
+			const checklist = projectWorkflowChecklist({
+				graph: run.workflowGraph,
+				steps: run.steps,
+				hostSteps: run.hostSteps,
+				preflight: run.preflight,
+				trace: run.workflow?.trace,
+				now: run.lastUpdate ?? run.endedAt ?? Date.now(),
+			});
+			lines.push(...formatWorkflowChecklistText(checklist, "  ", { includeItems: false }));
+		}
 		for (const step of run.steps) {
 			lines.push(`  ${formatStepLine(step)}`);
+			lines.push(...formatTimeoutRecoveryLines(step.timeoutRecovery, "    "));
 			lines.push(...formatNestedRunStatusLines(step.children, { indent: "    ", maxLines: 12 }));
+		}
+		const loadedWorkflowKeys = new Set(run.steps.flatMap((step) => step.workflowKey ? [step.workflowKey] : []));
+		const graphStages = run.mode === "workflow" ? workflowGraphStageNodes(run.workflowGraph) : [];
+		for (const [index, node] of graphStages.entries()) {
+			if (!loadedWorkflowKeys.has(node.id)) lines.push(`  ${formatWorkflowStageLine(node, index, graphStages.length)}`);
 		}
 		for (const row of projectAsyncWorkflowRows([], run.hostSteps)) {
 			const line = formatHostStepLine(row);

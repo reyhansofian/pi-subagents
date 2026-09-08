@@ -41,7 +41,7 @@ subagent({
     description: "Project-specific implementation helper",
     systemPrompt: "Your system prompt here.",
     systemPromptMode: "replace",
-    model: "openai-codex/gpt-5.4",
+    model: "provider/model-id",
     tools: "read,grep,find,ls,bash"
   }
 })
@@ -85,7 +85,7 @@ subagent({ action: "reset", agent: "reviewer" })
 Use management actions when the system needs to create or edit subagents on
 demand without dropping into raw file editing.
 
-Management actions create or update user/project agent files. `config.name` is the local frontmatter name; optional `config.package` registers and looks up the runtime name as `{package}.{name}`. Use the dotted runtime name for `get`, `update`, `delete`, slash commands, and scripted workflow steps. For small builtin changes such as a model swap, prefer `subagents.agentOverrides` in settings. Durable `.chain.md` definitions are legacy records, not a current authoring target; use `workflowScript` or `/prompt-workflow` for repeatable orchestration.
+Management actions create or update user/project agent files. `config.name` is the local frontmatter name; optional `config.package` registers and looks up the runtime name as `{package}.{name}`. Use the dotted runtime name for `get`, `update`, `delete`, slash commands, and scripted workflow steps. For small agent changes such as a model swap, prefer `subagents.agentOverrides` in settings. Durable `.chain.md` definitions are legacy records, not a current authoring target; use `workflowScript` or `/prompt-workflow` for repeatable orchestration.
 
 ## Creating and Editing Agents by File
 
@@ -96,8 +96,9 @@ A minimal agent file looks like this:
 name: my-agent
 package: code-analysis
 description: What this agent does
+advertise: true
 aliases: developer, coder
-model: openai-codex/gpt-5.4
+model: provider/model-id
 thinking: high
 tools: read, grep, find, ls, bash
 systemPromptMode: replace
@@ -111,7 +112,7 @@ skillPath: ./skills, ../shared-skills
 Your system prompt here.
 ```
 
-That is only a starting point. Omit `package` for the traditional unqualified runtime name. Common optional fields include:
+That is only a starting point. Omit `package` for the traditional unqualified runtime name. Set `advertise: true` only when the parent should receive this agent's name and description before deciding whether to delegate; advertisement is off by default. Common optional fields include:
 - `defaultProgress`
 - `defaultReads`
 - `output`

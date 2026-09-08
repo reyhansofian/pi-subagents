@@ -1,4 +1,4 @@
-import { splitKnownThinkingSuffix, type ModelInfo as AvailableModelInfo } from "../../shared/model-info.ts";
+import { splitKnownThinkingSuffix as splitThinkingSuffix, type ModelInfo as AvailableModelInfo } from "../../shared/model-info.ts";
 import type { Usage } from "../../shared/types.ts";
 import { filterFallbackCandidates, findModelExclusion, parseModelKey, recordModelFailure } from "./model-exclusions.ts";
 import { checkModelScope, type ModelScopeCheckRule, type ModelScopeViolation, type ModelSource } from "./model-scope.ts";
@@ -14,13 +14,19 @@ interface ModelAttemptSummary {
 	usage?: Usage;
 }
 
-export function splitThinkingSuffix(model: string): { baseModel: string; thinkingSuffix: string } {
-	return splitKnownThinkingSuffix(model);
-}
+export { splitThinkingSuffix };
 
-export function formatSubagentModelVerificationError(expectedModel: string, observedModel: string, availableModels: AvailableModelInfo[] | undefined): string | undefined {
+/** Aliases apply only to the resolved launch candidate (without its thinking suffix) and the exact raw response ID. */
+export function formatSubagentModelVerificationError(
+	expectedModel: string,
+	observedModel: string,
+	availableModels: AvailableModelInfo[] | undefined,
+	modelResponseAliases?: Record<string, string[]>,
+): string | undefined {
 	if (!availableModels || availableModels.length === 0) return undefined;
 	const expectedBase = splitThinkingSuffix(expectedModel).baseModel;
+	if (modelResponseAliases && Object.hasOwn(modelResponseAliases, expectedBase)
+		&& modelResponseAliases[expectedBase]?.includes(observedModel)) return undefined;
 	const observedBase = splitThinkingSuffix(observedModel).baseModel;
 	if (expectedBase === observedBase) return undefined;
 	const expectedEntry = availableModels.find((entry) => entry.fullId === expectedBase);
@@ -30,7 +36,7 @@ export function formatSubagentModelVerificationError(expectedModel: string, obse
 		const expectedFullIdLeaf = expectedEntry.fullId.slice(expectedEntry.fullId.lastIndexOf("/") + 1);
 		if (expectedIdLeaf === observedBase || expectedFullIdLeaf === observedBase) return undefined;
 	}
-	return `model_verification_failed: child reported a different model than the launch candidate. Expected '${expectedModel}' but observed '${observedModel}'.`;
+	return `model_verification_failed: native Pi child reported a different model than the launch candidate. Expected '${expectedModel}' but observed '${observedModel}'. If you have independently verified this response ID identifies the requested model, declare the exact mapping in modelResponseAliases in ~/.pi/agent/extensions/subagent/config.json (see docs/configuration.md#modelresponsealiases). Use the resolved provider/model ID without its thinking suffix as the key. This leaves the outgoing request unchanged. Configuration changes affect new independent native runs; resumed native runs retain their launch-time declaration. External CLI adapters do not use this setting.`;
 }
 
 /** Sentinel model value requesting that a subagent inherit the parent session's model. */
@@ -284,6 +290,49 @@ function enforceModelScopes(
 	for (const violation of violations) (onWarn ?? defaultScopeWarn)(violation);
 }
 
+const MODEL_EXCLUSION_DIAGNOSTIC_MAX_LENGTH = 240;
+const MODEL_EXCLUSION_DIAGNOSTIC_MAX_ENTRIES = 20;
+
+function sanitizeModelExclusionDiagnostic(value: string | undefined, fallback: string): string {
+	const normalized = typeof value === "string"
+		? value.replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, " ").trim()
+		: "";
+	return redactSecretValues(normalized || fallback).slice(0, MODEL_EXCLUSION_DIAGNOSTIC_MAX_LENGTH);
+}
+
+function formatModelExclusionExpiry(expiresAt: number): string {
+	if (!Number.isFinite(expiresAt)) return "unknown";
+	const date = new Date(expiresAt);
+	return Number.isNaN(date.getTime()) ? "unknown" : date.toISOString();
+}
+
+function formatExcludedCandidateEvidence(candidate: string, exclusion: NonNullable<ReturnType<typeof findModelExclusion>>): string {
+	const { provider, modelId } = parseModelKey(candidate);
+	const displayCandidate = sanitizeModelExclusionDiagnostic(candidate, "unknown");
+	const displayModel = sanitizeModelExclusionDiagnostic(modelId, "unknown");
+	const displayProvider = sanitizeModelExclusionDiagnostic(provider ?? exclusion.provider, "unspecified");
+	const reason = sanitizeModelExclusionDiagnostic(exclusion.reason, "runtime-failure");
+	return `${displayCandidate} — model: ${displayModel}; provider: ${displayProvider}; reason: ${reason}; expires: ${formatModelExclusionExpiry(exclusion.expiresAt)}`;
+}
+
+const MODEL_UNAVAILABLE_EXCLUSION_PATTERNS = [
+	/model.*not found/i,
+	/unknown model/i,
+	/model.*unavailable/i,
+	/model.*disabled/i,
+];
+
+function isCurrentRegistryModel(candidate: string, availableModels: AvailableModelInfo[] | undefined): boolean {
+	if (!availableModels || availableModels.length === 0) return false;
+	const { baseModel } = splitThinkingSuffix(candidate);
+	return availableModels.some((entry) => entry.fullId === baseModel);
+}
+
+function ignoreStaleModelUnavailableExclusion(candidate: string, exclusion: NonNullable<ReturnType<typeof findModelExclusion>>, availableModels: AvailableModelInfo[] | undefined): boolean {
+	const reason = exclusion.reason ?? "";
+	return MODEL_UNAVAILABLE_EXCLUSION_PATTERNS.some((pattern) => pattern.test(reason)) && isCurrentRegistryModel(candidate, availableModels);
+}
+
 function throwForExplicitModelExclusion(model: string): void {
 	const exclusion = findModelExclusion(model);
 	if (!exclusion) return;
@@ -321,15 +370,23 @@ export function resolveSubagentModelOverride(
 	const explicit = trimmed && trimmed !== INHERIT_MODEL ? trimmed : undefined;
 	if (!parentModel) throwForUnresolvedEnforcedInheritScope(options?.scope, explicit === undefined || options?.source === "inherited");
 	let resolved: string | undefined;
+	let resolvedFromRegistry = explicit === undefined;
 	if (explicit === undefined) {
 		resolved = parentModel ? `${parentModel.provider}/${parentModel.id}` : undefined;
 	} else {
-		resolved = resolveRequiredSubagentModelCandidate(explicit, availableModels, preferredProvider);
+		const candidate = resolveSubagentModelCandidate(explicit, availableModels, preferredProvider);
+		if (options?.source === "explicit") {
+			resolved = candidate ?? resolveRequiredSubagentModelCandidate(explicit, availableModels, preferredProvider);
+			throwForExplicitModelExclusion(resolved);
+			resolvedFromRegistry = true;
+		} else if (candidate) {
+			resolved = candidate;
+			resolvedFromRegistry = true;
+		} else {
+			resolved = explicit;
+		}
 	}
-	if (resolved && explicit !== undefined && options?.source === "explicit") {
-		throwForExplicitModelExclusion(resolved);
-	}
-	if (resolved && options?.scope) {
+	if (resolved && options?.scope && resolvedFromRegistry) {
 		const source: ModelSource = explicit === undefined ? "inherited" : (options.source ?? "inherited");
 		enforceModelScopes(resolved, options.scope, source, options.onWarn);
 	}
@@ -362,12 +419,33 @@ export function resolveEffectiveSubagentModel(
 	);
 }
 
+export type ModelOrigin = ModelSource | "configured";
+
 export interface BuildModelCandidatesOptions {
 	/** Fallback models warn by default and throw when strict scope enforcement is enabled. */
 	scope?: ModelScopeCheckRule | ModelScopeCheckRule[];
 	onWarn?: (violation: ModelScopeViolation) => void;
 	/** The primary model came from the running parent session, not configuration. */
 	primaryModelFromParent?: boolean;
+	/** How the primary model was selected. Explicit stays strict and does not rotate to fallbacks. */
+	origin?: ModelOrigin;
+}
+
+const ZERO_USABLE_MODEL_CANDIDATES_ERROR =
+	"No usable subagent models remain after registry, scope, and cached-exclusion filtering.";
+
+export function resolveModelOrigin(input: {
+	explicitModel?: string | boolean;
+	agentModel?: string | boolean;
+	parentModel?: ParentModel;
+	fromParent?: boolean;
+	storedOrigin?: ModelOrigin;
+}): ModelOrigin {
+	if (input.storedOrigin) return input.storedOrigin;
+	if (input.fromParent) return "inherited";
+	if (inheritsParentModel(input.explicitModel, input.agentModel, input.parentModel)) return "inherited";
+	const trimmed = typeof input.explicitModel === "string" ? input.explicitModel.trim() : "";
+	return trimmed && trimmed !== INHERIT_MODEL ? "explicit" : "configured";
 }
 
 export function inheritsParentModel(
@@ -388,39 +466,76 @@ export function buildModelCandidates(
 	options?: BuildModelCandidatesOptions,
 ): string[] {
 	if (!primaryModel) throwForUnresolvedEnforcedInheritScope(options?.scope, true);
+	const origin = options?.origin ?? (options?.primaryModelFromParent ? "inherited" : "configured");
+	const scopes = configuredScopes(options?.scope);
+	type ExcludedCandidate = { candidate: string; exclusion: NonNullable<ReturnType<typeof findModelExclusion>> };
+	const excludedCandidates: ExcludedCandidate[] = [];
+	let excludedCandidateCount = 0;
+	const warnCachedExclusion = (candidate: string, exclusion: NonNullable<ReturnType<typeof findModelExclusion>>) => {
+		excludedCandidateCount++;
+		if (excludedCandidates.length < MODEL_EXCLUSION_DIAGNOSTIC_MAX_ENTRIES) excludedCandidates.push({ candidate, exclusion });
+		const displayCandidate = sanitizeModelExclusionDiagnostic(candidate, "unknown");
+		const reason = sanitizeModelExclusionDiagnostic(exclusion.reason, "runtime-failure");
+		console.warn(`[pi-subagents] Skipping model '${displayCandidate}' due to a cached exclusion (reason: ${reason}; expires: ${formatModelExclusionExpiry(exclusion.expiresAt)}).`);
+	};
+	if (origin === "explicit" && primaryModel) {
+		const normalized = resolveRequiredSubagentModelCandidate(primaryModel.trim(), availableModels, preferredProvider);
+		throwForExplicitModelExclusion(normalized);
+		enforceModelScopes(normalized, scopes, "explicit", options?.onWarn);
+		primaryModel = normalized;
+	}
 	const seen = new Set<string>();
 	const candidates: string[] = [];
 	const rawCandidates = [primaryModel, ...(fallbackModels ?? [])];
+	let skippedPrimary: string | undefined;
+	let skippedFallback: string | undefined;
 	for (let index = 0; index < rawCandidates.length; index++) {
 		const raw = rawCandidates[index];
 		if (!raw) continue;
 		const model = raw.trim();
-		const normalized = index === 0
-			? options?.primaryModelFromParent
-				? model
-				: resolveRequiredSubagentModelCandidate(model, availableModels, preferredProvider)
+		const normalized = index === 0 && (origin === "inherited" || origin === "explicit" || options?.primaryModelFromParent)
+			? model
 			: resolveSubagentModelCandidate(model, availableModels, preferredProvider);
 		if (!normalized) {
-			console.warn(`[pi-subagents] Skipping fallback model '${model}' because it is unavailable in this environment.`);
+			if (index === 0) skippedPrimary = model;
+			else {
+				skippedFallback ??= model;
+				console.warn(`[pi-subagents] Skipping fallback model '${model}' because it is unavailable in this environment.`);
+			}
 			continue;
 		}
 		if (seen.has(normalized)) continue;
-		const scopes = configuredScopes(options?.scope);
 		if (index > 0 || scopes.some((scope) => scope.enforce === true && scope.strict === true)) {
 			enforceModelScopes(normalized, scopes, "inherited", options?.onWarn);
 		}
 		seen.add(normalized);
 		candidates.push(normalized);
 	}
-	return filterFallbackCandidates(candidates, {
-		onExcluded(candidate, exclusion) {
-			const reason = redactSecretValues((exclusion.reason ?? "runtime-failure").replace(/[\u0000-\u001f\u007f]+/g, " ")).slice(0, 240);
-			console.warn(`[pi-subagents] Skipping model '${candidate}' due to a cached exclusion (reason: ${reason}; expires: ${new Date(exclusion.expiresAt).toISOString()}).`);
-		},
+	const resolved = filterFallbackCandidates(candidates, {
+		onExcluded: warnCachedExclusion,
+		ignoreExclusion: (candidate, exclusion) => ignoreStaleModelUnavailableExclusion(candidate, exclusion, availableModels),
 	});
+	if (resolved.length === 0) {
+		if (skippedPrimary) resolveRequiredSubagentModelCandidate(skippedPrimary, availableModels, preferredProvider);
+		if (candidates.length === 0 && skippedFallback) resolveRequiredSubagentModelCandidate(skippedFallback, availableModels, preferredProvider);
+		if (candidates.length > 0) {
+			const shownExclusions = excludedCandidates;
+			const omittedExclusions = excludedCandidateCount - shownExclusions.length;
+			const evidence = shownExclusions.length > 0
+				? ` (excluded: ${shownExclusions.map(({ candidate, exclusion }) => formatExcludedCandidateEvidence(candidate, exclusion)).join("; ")}${omittedExclusions > 0 ? `; ... and ${omittedExclusions} more` : ""})`
+				: "";
+			throw new Error(`${ZERO_USABLE_MODEL_CANDIDATES_ERROR}${evidence}`);
+		}
+		return resolved;
+	}
+	if (skippedPrimary) {
+		console.warn(`[pi-subagents] Skipping primary model '${skippedPrimary}' because it is unavailable in this environment.`);
+	}
+	return resolved;
 }
 
 const RETRYABLE_MODEL_FAILURE_PATTERNS = [
+	/^REQUEST_LIMIT_EXCEEDED$/,
 	/rate\s*limit/i,
 	/usage\s*limit/i,
 	/too many requests/i,
@@ -492,8 +607,13 @@ export function isRetryableModelFailureAttempt(input: { error: string | undefine
 	return Boolean(error && input.messages?.some((message) => messageError(message)?.trim() === error));
 }
 
+// Request-shape failures can match broad fallback signals such as "upstream",
+// but do not establish that the model is unhealthy for subsequent requests.
+const REQUEST_SHAPE_FAILURE_PATTERN = /\b(?:bad[ _]request|invalid[ _]argument|invalid_request_error)\b/i;
+
 export function recordRetryableModelFailure(model: string | undefined, error: string | undefined): void {
-	if (!model || !isRetryableModelFailure(error)) return;
+	if (!model || !error || !isRetryableModelFailure(error) || isContextOverflow(error)) return;
+	if (REQUEST_SHAPE_FAILURE_PATTERN.test(error)) return;
 	const { provider, modelId } = parseModelKey(model);
 	recordModelFailure({ modelId, reason: error, ...(provider ? { provider } : {}) });
 }

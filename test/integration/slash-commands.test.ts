@@ -9,7 +9,6 @@ import { registerAgent } from "../../src/api/agents.ts";
 import { clearRuntimeAgentsForPi } from "../../src/agents/runtime-agent-registry.ts";
 import { scheduledRunStorePath } from "../../src/runs/background/scheduled-runs.ts";
 import { updateActiveRunIndex } from "../../src/runs/background/active-run-index.ts";
-import { SUBAGENT_FANOUT_CHILD_ENV } from "../../src/runs/shared/pi-args.ts";
 import { getArtifactPaths, getArtifactsDir } from "../../src/shared/artifacts.ts";
 import { ASYNC_DIR, DIRS } from "../../src/shared/types.ts";
 import type { WatchdogReviewFunction } from "../../src/watchdog/runtime.ts";
@@ -292,6 +291,7 @@ describe("subagents watchdog slash command", { skip: !available ? "watchdog comm
 				assert.match(content, /Subagent watchdog/);
 				assert.match(content, /Main: off \(default off\)/);
 				assert.match(content, /Runtime: idle/);
+				assert.match(content, /Rules: none/);
 				assert.match(content, /Review model call: real model review/);
 				assert.match(content, /Sources:/);
 			});
@@ -1118,6 +1118,51 @@ describe("slash command custom message delivery", { skip: !available ? "slash-co
 			assert.deepEqual(run.params, {
 				workflowScript: "return runs.run(\"run\", {\"agent\":\"runtime-helper\",\"task\":\"Inspect\",\"agentScope\":\"both\"})",
 				async: false,
+			});
+		});
+	});
+
+	it("/subagents-models accepts discovered and runtime agent names", async () => {
+		await withTempProject("pi-slash-models-agent-", async (root) => {
+			fs.writeFileSync(path.join(root, ".pi", "agents", "project-helper.md"), "---\nname: project-helper\ndescription: Project helper\n---\nProject helper.\n", "utf-8");
+			const runtimeRun = await captureSlashCommandParams("subagents-models", "runtime-helper", root, (pi) => {
+				registerAgent({
+					pi: pi as never,
+					name: "runtime-helper",
+					definition: { description: "Runtime helper", systemPrompt: "Help at runtime." },
+				});
+			});
+			assert.deepEqual(runtimeRun.params, { action: "models", agent: "runtime-helper" });
+
+			const projectRun = await captureSlashCommandParams("subagents-models", "project-helper", root);
+			assert.deepEqual(projectRun.params, { action: "models", agent: "project-helper" });
+
+			await withIsolatedHome(async () => {
+				const commands = new Map<string, RegisteredSlashCommand>();
+				const pi = {
+					events: createEventBus(),
+					on() { return () => {}; },
+					registerTool() {},
+					registerCommand(name: string, spec: RegisteredSlashCommand) { commands.set(name, spec); },
+					registerShortcut() {},
+					sendMessage() {},
+				};
+				const registration = registerAgent({
+					pi: pi as never,
+					name: "runtime-helper",
+					definition: { description: "Runtime helper", systemPrompt: "Help at runtime." },
+				});
+				try {
+					const disposer = registerSlashCommands!(pi, createState(root));
+					try {
+						const completions = commands.get("subagents-models")!.getArgumentCompletions!("runtime-") as Array<{ value: string }>;
+						assert.deepEqual(completions.map(({ value }) => value), ["runtime-helper"]);
+					} finally {
+						disposer.dispose();
+					}
+				} finally {
+					registration.dispose();
+				}
 			});
 		});
 	});

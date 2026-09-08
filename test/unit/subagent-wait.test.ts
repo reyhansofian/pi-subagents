@@ -84,7 +84,7 @@ function baseDeps(root: string, state: SubagentState, overrides: Partial<Subagen
 	};
 }
 
-describe("subagent_wait tool", () => {
+describe("bg_wait tool", () => {
 	it("resolves waitTool config and environment overrides strictly", () => {
 		assert.deepEqual(resolveWaitToolConfig(undefined, {}), { enabled: true });
 		assert.deepEqual(resolveWaitToolConfig(false, {}), { enabled: false });
@@ -112,7 +112,7 @@ describe("subagent_wait tool", () => {
 				enabled: false,
 				sleep: async () => {
 					slept = true;
-					throw new Error("disabled subagent_wait should not sleep");
+					throw new Error("disabled bg_wait should not sleep");
 				},
 			}));
 
@@ -308,7 +308,7 @@ describe("subagent_wait tool", () => {
 
 			const text = textOf(result);
 			assert.match(text, /Reply to the supervisor request first/);
-			assert.match(text, /wait with subagent_wait/);
+			assert.match(text, /wait with bg_wait/);
 			assert.match(text, /do not resume or launch a replacement/);
 			assert.doesNotMatch(text, /Resume-first/);
 		} finally {
@@ -365,6 +365,60 @@ describe("subagent_wait tool", () => {
 			assert.equal("output" in (child ?? {}), false);
 			// The result file is the watcher's to consume; the wait must not delete it.
 			assert.equal(fs.existsSync(path.join(resultsDir, "run-a.json")), true);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("surfaces bounded recovery guidance for a failed completion", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-recovery-completion-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const resultsDir = path.join(root, "results");
+			fs.mkdirSync(resultsDir, { recursive: true });
+			const state = makeState("sess-1");
+			writeStatus(asyncRoot, "run-recovery", "running", { sessionId: "sess-1", pid: 999999 });
+			const result = await waitForSubagents({ all: true }, undefined, baseDeps(root, state, {
+				sleep: async () => {
+					const recovery = {
+						termination: "timed-out",
+						changedFiles: ["input.md"],
+						recoveryNeeded: true,
+						reason: "timed-out-with-dirty-worktree",
+						reportStatus: "missing",
+						message: "raw recovery message must not cross the wait boundary",
+						effects: { settlementDiagnostic: { finalTextPresent: true } },
+					};
+					writeStatus(asyncRoot, "run-recovery", "failed", {
+						sessionId: "sess-1",
+						steps: [{ agent: "worker", status: "failed", timedOut: true, timeoutRecovery: recovery }],
+					});
+					fs.writeFileSync(path.join(resultsDir, "run-recovery.json"), JSON.stringify({
+						id: "run-recovery",
+						runId: "run-recovery",
+						mode: "single",
+						state: "failed",
+						success: false,
+						results: [{ agent: "worker", success: false, error: "Subagent timed out.", output: "raw output must not be copied", timeoutRecovery: recovery }],
+					}), "utf-8");
+				},
+			}));
+
+			assert.equal(result.isError, undefined);
+			const text = textOf(result);
+			assert.match(text, /Recovery needed: review the diff and artifacts before resuming or launching dependent stages\./);
+			assert.match(text, /requested report: missing/);
+			assert.match(text, /changed tracked files: input\.md/);
+			assert.doesNotMatch(text, /raw recovery message|settlementDiagnostic|raw output/);
+			const completion = result.details.completions?.[0];
+			assert.equal(completion?.success, false);
+			assert.deepEqual(completion?.results?.[0]?.timeoutRecovery, {
+				termination: "timed-out",
+				changedFiles: ["input.md"],
+				recoveryNeeded: true,
+				reason: "timed-out-with-dirty-worktree",
+				reportStatus: "missing",
+			});
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -1280,7 +1334,7 @@ describe("subagent_wait tool", () => {
 
 			const result = await Promise.race([
 				p,
-				new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("event wake did not resolve subagent_wait")), 1_000)),
+				new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("event wake did not resolve bg_wait")), 1_000)),
 			]);
 			assert.equal(result.isError, undefined);
 			assert.match(textOf(result), /done/i);

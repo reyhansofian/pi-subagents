@@ -42,7 +42,7 @@ export const DEFAULT_FLEET_KEYBINDINGS: Record<FleetKeybindingAction, string[]> 
 	pageDown: ["pageDown"],
 	refresh: ["r", "R"],
 	steer: ["s"],
-	inspect: ["H"],
+	inspect: ["return", "H"],
 	stop: ["D"],
 	toggleTools: ["x", "X", "ctrl+o"],
 };
@@ -179,10 +179,16 @@ function asyncItems(run: AsyncRunSummary, description?: string): FleetItem[] {
 	}));
 }
 
-function orderFleetAsyncRuns(runs: AsyncRunSummary[], terminalLimit: number): AsyncRunSummary[] {
+function orderFleetAsyncRuns(runs: AsyncRunSummary[], terminalLimit: number, trackedJobs: Map<string, AsyncJobState>): AsyncRunSummary[] {
 	const updatedAt = (run: AsyncRunSummary) => run.lastUpdate ?? run.endedAt ?? run.startedAt;
 	const byNewest = (left: AsyncRunSummary, right: AsyncRunSummary) => updatedAt(right) - updatedAt(left);
-	const active = runs.filter((run) => run.state === "queued" || run.state === "running").sort(byNewest);
+	// Missing tracked starts must not inherit the summary's heartbeat-based display fallback.
+	const startedAt = (run: AsyncRunSummary) => {
+		const job = trackedJobs.get(run.id);
+		return job ? job.startedAt ?? 0 : run.startedAt;
+	};
+	const byStartedAt = (left: AsyncRunSummary, right: AsyncRunSummary) => startedAt(left) - startedAt(right) || left.id.localeCompare(right.id);
+	const active = runs.filter((run) => run.state === "queued" || run.state === "running").sort(byStartedAt);
 	const terminal = runs.filter((run) => run.state !== "queued" && run.state !== "running").sort(byNewest);
 	return [...active, ...terminal.slice(0, terminalLimit)];
 }
@@ -204,12 +210,11 @@ export function collectFleetSnapshot(
 		if (!control.parentWorkflowRunId
 			|| !workflowParentIds.has(control.parentWorkflowRunId)
 			|| !belongsToCurrentSession(control.sessionId, state.currentSessionId)
-			|| !control.workflowSteeringDir
 			|| activeChildCount === 0) continue;
 		liveWorkflowForegroundControls.add(control);
 		workflowForegroundChildCounts.set(control.parentWorkflowRunId, (workflowForegroundChildCounts.get(control.parentWorkflowRunId) ?? 0) + activeChildCount);
 	}
-	for (const control of [...state.foregroundControls.values()].sort((left, right) => right.updatedAt - left.updatedAt)) {
+	for (const control of [...state.foregroundControls.values()].sort((left, right) => left.startedAt - right.startedAt || left.runId.localeCompare(right.runId))) {
 		activeForegroundIds.add(control.runId);
 		if (control.parentWorkflowRunId && workflowParentIds.has(control.parentWorkflowRunId)
 			&& ((workflowForegroundChildCounts.get(control.parentWorkflowRunId) ?? 0) <= 1 || !liveWorkflowForegroundControls.has(control))) continue;
@@ -250,7 +255,7 @@ export function collectFleetSnapshot(
 		const tracked = [...trackedJobs.values()]
 			.filter((job) => belongsToCurrentSession(job.sessionId, state.currentSessionId));
 		const byUpdate = (left: AsyncJobState, right: AsyncJobState) => (right.updatedAt ?? right.startedAt ?? 0) - (left.updatedAt ?? left.startedAt ?? 0);
-		const active = tracked.filter((job) => job.status === "queued" || job.status === "running").sort(byUpdate);
+		const active = tracked.filter((job) => job.status === "queued" || job.status === "running");
 		const recent = tracked.filter((job) => job.status !== "queued" && job.status !== "running").sort(byUpdate).slice(0, options.limit ?? MAX_RECENT_ASYNC_RUNS);
 		const trackedRuns: AsyncRunSummary[] = [];
 		for (const job of [...active, ...recent]) {
@@ -273,7 +278,7 @@ export function collectFleetSnapshot(
 		} else {
 			runs = trackedRuns;
 		}
-		for (const run of orderFleetAsyncRuns(runs, options.limit ?? MAX_RECENT_ASYNC_RUNS)) {
+		for (const run of orderFleetAsyncRuns(runs, options.limit ?? MAX_RECENT_ASYNC_RUNS, trackedJobs)) {
 			items.push(...asyncItems(run, descriptions.get(run.id)));
 		}
 	} catch (cause) {
@@ -952,6 +957,12 @@ export class SubagentFleetComponent implements Component {
 		return { runId: parent.asyncId, asyncDir: parent.asyncDir };
 	}
 
+	private inspectSelectedHerdr(): void {
+		const target = this.selectedHerdrInspectAction();
+		if ("reason" in target || !this.options.actions?.inspect) this.setActionNotice({ text: "reason" in target ? target.reason : "Herdr inspector controls are unavailable in this context.", isError: true });
+		else this.runAction(() => this.options.actions!.inspect!(target));
+	}
+
 	private actionLines(): string[] {
 		const lines: string[] = [];
 		if (this.actionBusy) lines.push(this.theme.fg("accent", "Action pending..."));
@@ -1179,12 +1190,6 @@ export class SubagentFleetComponent implements Component {
 			}
 			return;
 		}
-		if (matchesFleetAction(data, this.keybindings, "inspect")) {
-			const target = this.selectedHerdrInspectAction();
-			if ("reason" in target || !this.options.actions?.inspect) this.setActionNotice({ text: "reason" in target ? target.reason : "Herdr inspector controls are unavailable in this context.", isError: true });
-			else this.runAction(() => this.options.actions!.inspect!(target));
-			return;
-		}
 		if (matchesFleetAction(data, this.keybindings, "stop")) {
 			const target = this.selectedAsyncAction();
 			if ("reason" in target || !this.options.actions) this.setActionNotice({ text: "reason" in target ? target.reason : "Fleet controls are unavailable in this context.", isError: true });
@@ -1201,6 +1206,11 @@ export class SubagentFleetComponent implements Component {
 			this.expandedTools = !this.expandedTools;
 			this.transcriptCache = undefined;
 			this.tui.requestRender();
+			return;
+		}
+		if (matchesFleetAction(data, this.keybindings, "inspect")) {
+			this.inspectSelectedHerdr();
+			return;
 		}
 	}
 

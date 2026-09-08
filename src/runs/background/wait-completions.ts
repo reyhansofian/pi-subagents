@@ -4,6 +4,7 @@ import type { AsyncRunSummary } from "./async-status.ts";
 import { readCompletionReplay, writeCompletionReplay } from "./completion-replay.ts";
 import { fallbackResultPayloadPathForSessionRun, resultFilePath, resultPayloadPathForSessionRun } from "./result-files.ts";
 import { parseWorkflowChildSummary } from "../../workflows/workflow-child-summary.ts";
+import { projectTimeoutRecovery } from "../shared/mutation-evidence.ts";
 
 function asNonEmptyString(value: unknown): string | undefined {
 	return typeof value === "string" && value ? value : undefined;
@@ -41,6 +42,15 @@ function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+const STRUCTURED_OUTPUT_INLINE_LIMIT_BYTES = 4 * 1024;
+
+export function projectStructuredOutput(value: unknown): unknown {
+	if (value === undefined) return undefined;
+	const serialized = JSON.stringify(value);
+	if (typeof serialized !== "string") throw new Error("Structured output must be JSON-serializable");
+	return Buffer.byteLength(serialized, "utf8") <= STRUCTURED_OUTPUT_INLINE_LIMIT_BYTES ? JSON.parse(serialized) : undefined;
+}
+
 /**
  * Project a terminal result payload into the slim shape that is safe to surface in
  * tool_result details: run identity, per-child outcome, and the artifact trail.
@@ -64,7 +74,10 @@ export function toWaitCompletion(data: Record<string, unknown>, runId: string): 
 			const sessionFile = asNonEmptyString(child.sessionFile);
 			const error = asNonEmptyString(child.error);
 			const model = asNonEmptyString(child.model);
+			const structuredOutput = projectStructuredOutput(child.structuredOutput);
+			const structuredOutputPath = asNonEmptyString(child.structuredOutputPath);
 			const contextOverflow = child.contextOverflow === true;
+			const timeoutRecovery = projectTimeoutRecovery(child.timeoutRecovery);
 			return [{
 				...(agent ? { agent } : {}),
 				...(childRunId ? { runId: childRunId } : {}),
@@ -72,14 +85,20 @@ export function toWaitCompletion(data: Record<string, unknown>, runId: string): 
 				...(sessionFile ? { sessionFile } : {}),
 				...(typeof child.success === "boolean" ? { success: child.success } : {}),
 				...(outputState ? { outputState } : {}),
+				...(structuredOutput !== undefined ? { structuredOutput } : {}),
+				...(structuredOutputPath ? { structuredOutputPath } : {}),
 				...(error ? { error } : {}),
 				...(model ? { model } : {}),
 				...(contextOverflow ? { contextOverflow: true } : {}),
 				...(artifactPaths ? { artifactPaths } : {}),
+				...(timeoutRecovery ? { timeoutRecovery } : {}),
 			}];
 		})
 		: undefined;
 	const agent = asNonEmptyString(data.agent);
+	const receipt = data.workflowReceipt;
+	const workflowReceiptPath = receipt && typeof receipt === "object" && !Array.isArray(receipt)
+		? asNonEmptyString((receipt as Record<string, unknown>).path) : undefined;
 	const mode = asNonEmptyString(data.mode);
 	const state = asNonEmptyString(data.state);
 	const workflowChildren = parseWorkflowChildSummary(data.workflowChildren);
@@ -88,6 +107,7 @@ export function toWaitCompletion(data: Record<string, unknown>, runId: string): 
 		runId,
 		...(agent ? { agent } : {}),
 		...(mode ? { mode } : {}),
+		...(workflowReceiptPath ? { workflowReceiptPath } : {}),
 		...(state ? { state } : {}),
 		...(typeof data.success === "boolean" ? { success: data.success } : {}),
 		...(results && results.length > 0 ? { results } : {}),
@@ -96,7 +116,7 @@ export function toWaitCompletion(data: Record<string, unknown>, runId: string): 
 }
 
 /**
- * Record a consumed terminal payload for later surfacing by subagent_wait, pruning
+ * Record a consumed terminal payload for later surfacing by bg_wait, pruning
  * stale entries with the same TTL that dedupes completion notifications. The result
  * file is deleted after delivery, so this record is the only in-process source once
  * the watcher has consumed it.

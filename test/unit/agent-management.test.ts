@@ -8,6 +8,7 @@ import { EXTRA_AGENT_DIRS_ENV } from "../../src/agents/agents.ts";
 import { EXTERNAL_JOB_PROVIDER_REGISTRY_KEY, registerExternalJobProvider } from "../../src/api/external-job-provider.ts";
 import { clearSkillCache } from "../../src/agents/skills.ts";
 import { PI_CODING_AGENT_PACKAGE_ROOT_ENV } from "../../src/shared/utils.ts";
+import { openSubagentsAdmin } from "../../src/slash/subagents-admin.ts";
 
 let tempDir = "";
 let oldAgentDir: string | undefined;
@@ -58,6 +59,127 @@ describe("agent management config parsing", () => {
 		assert.equal(result.isError, false);
 		assert.match(readText(result), /- scout \(project\): Project scout override/);
 		assert.doesNotMatch(readText(result), /- scout \(builtin/);
+	});
+
+	it("lists compact declared capabilities without exposing system prompts", () => {
+		const agentsDir = path.join(tempDir, ".pi", "agents");
+		fs.mkdirSync(agentsDir, { recursive: true });
+		fs.writeFileSync(path.join(agentsDir, "capability-worker.md"), [
+			"---",
+			"name: capability-worker",
+			"description: Capability worker",
+			"aliases: capability",
+			"tools: read, grep, mcp:github/search",
+			"model: openai/gpt-5-mini",
+			"fallbackModels: openai/gpt-5-mini-fallback",
+			"async: true",
+			"timeoutMs: 123",
+			"thinking: high",
+			"skills: typescript-code",
+			"extensions: github",
+			"subagentOnlyExtensions: surf",
+			"mutationTools: edit, write",
+			"output: report.md",
+			"outputMode: file-only",
+			"---",
+			"SYSTEM_PROMPT_SENTINEL",
+			"---",
+		].join("\n"));
+
+		const capabilityRequest = { agentScope: "project", capabilities: true };
+		const listed = handleManagementAction("list", capabilityRequest, {
+			cwd: tempDir,
+			modelRegistry: { getAvailable: () => [] },
+		});
+		assert.equal(listed.isError, false);
+		const text = readText(listed);
+		assert.match(text, /^Executable agents \(capabilities\):/);
+		assert.match(text, /- capability-worker \(project, aliases: capability\): Description: Capability worker; Tools: read, grep, mcp:github\/search; Model: openai\/gpt-5-mini; Thinking: high/);
+		assert.doesNotMatch(text, /System Prompt:|SYSTEM_PROMPT_SENTINEL/);
+		const capabilities = listed.details?.agentCapabilities;
+		assert.ok(capabilities);
+		const row = capabilities.agents.find((agent) => agent.name === "capability-worker");
+		assert.ok(row);
+		assert.equal(row.executable, true);
+		assert.deepEqual(row.tools, { ambient: false, names: ["read", "grep"], mcpDirectTools: ["github/search"], mutationTools: ["edit", "write"] });
+		assert.deepEqual(row.model, { value: "openai/gpt-5-mini", fallbackModels: ["openai/gpt-5-mini-fallback"], thinking: "high" });
+		assert.deepEqual(row.execution, { defaultAsync: true, timeoutMs: 123 });
+		assert.deepEqual(row.output, { path: "report.md", mode: "file-only" });
+		assert.deepEqual(row.extensions, { names: ["github"], subagentOnly: ["surf"], skills: ["typescript-code"] });
+		assert.equal(JSON.stringify(capabilities).includes("SYSTEM_PROMPT_SENTINEL"), false);
+	});
+
+	it("reports bundled reviewer supervisor contact without mutation tools in capabilities", () => {
+		const listed = handleManagementAction("list", { agentScope: "project", capabilities: true }, {
+			cwd: tempDir,
+			modelRegistry: { getAvailable: () => [] },
+		});
+
+		assert.equal(listed.isError, false);
+		const capabilities = listed.details?.agentCapabilities;
+		assert.ok(capabilities);
+		const reviewer = capabilities.agents.find((agent) => agent.name === "reviewer");
+		assert.ok(reviewer, "reviewer builtin should be present in capability output");
+		assert.deepEqual(reviewer.tools.names, ["read", "grep", "find", "ls", "contact_supervisor"]);
+		assert.match(readText(listed), /Tools: read, grep, find, ls, contact_supervisor/);
+	});
+
+	it("reports passive external CLI availability for present and absent commands", () => {
+		const agentsDir = path.join(tempDir, ".pi", "agents");
+		fs.mkdirSync(agentsDir, { recursive: true });
+		const presentCommand = path.basename(process.execPath, path.extname(process.execPath));
+		fs.writeFileSync(path.join(agentsDir, "present-external.md"), `---
+name: present-external
+description: Present external CLI
+runner:
+  type: external-cli
+  command: ${presentCommand}
+---
+Present.
+`);
+		fs.writeFileSync(path.join(agentsDir, "missing-external.md"), `---
+name: missing-external
+description: Missing external CLI
+runner:
+  type: external-cli
+  command: missing-external-cli
+---
+Missing.
+`);
+		const previousPath = process.env.PATH;
+		try {
+			process.env.PATH = path.dirname(process.execPath);
+			const listed = handleManagementAction("list", { agentScope: "project", capabilities: true }, {
+				cwd: tempDir,
+				modelRegistry: { getAvailable: () => [] },
+			});
+			assert.equal(listed.isError, false);
+			const text = readText(listed);
+			assert.match(text, new RegExp(`external-cli:${presentCommand} ✓`));
+			assert.match(text, /external-cli:missing-external-cli missing/);
+
+			const rows = listed.details?.agentCapabilities?.agents;
+			assert.ok(rows);
+			const present = rows.find((agent) => agent.name === "present-external");
+			const missing = rows.find((agent) => agent.name === "missing-external");
+			assert.ok(present);
+			assert.ok(missing);
+			assert.equal(present.executable, true);
+			assert.equal(missing.executable, true);
+			assert.equal(present.runner.type, "external-cli");
+			assert.equal(missing.runner.type, "external-cli");
+			if (present.runner.type !== "external-cli" || missing.runner.type !== "external-cli") return;
+			assert.equal(present.runner.command, presentCommand);
+			assert.equal(present.runner.available, true);
+			assert.equal("unavailableReason" in present.runner, false);
+			assert.equal(missing.runner.command, "missing-external-cli");
+			assert.equal(missing.runner.available, false);
+			assert.match(missing.runner.unavailableReason ?? "", /External CLI binary 'missing-external-cli' was not found on PATH\./);
+			assert.ok((missing.runner.unavailableReason ?? "").length <= 256);
+		} finally {
+			if (previousPath === undefined) delete process.env.PATH;
+			else process.env.PATH = previousPath;
+		}
 	});
 
 	it("rejects management attempts to widen the reserved read-only Claude profile", () => {
@@ -892,7 +1014,219 @@ Drive the failing test first.
 		assert.match(afterText, /Inherit skills: true/);
 	});
 
-	it("preserves blank output and defaultReads frontmatter that blocks settings overrides during updates", () => {
+	it("does not serialize settings descriptions, fast, or defaults into custom agent frontmatter during updates", () => {
+		const ctx = { cwd: tempDir, modelRegistry: { getAvailable: () => [] } };
+		const settingsPath = path.join(tempDir, ".pi", "settings.json");
+		const agentPath = path.join(tempDir, ".pi", "agents", "implementer.md");
+		fs.mkdirSync(path.dirname(agentPath), { recursive: true });
+		fs.writeFileSync(settingsPath, JSON.stringify({
+			subagents: {
+				defaultModel: "openai/gpt-default",
+				defaultThinking: "high",
+				agentOverrides: {
+					implementer: { description: "Settings description", output: "settings.md", fast: true },
+				},
+			},
+		}, null, 2), "utf-8");
+		fs.writeFileSync(agentPath, `---
+name: implementer
+description: Frontmatter description
+---
+
+Drive the failing test first.
+`, "utf-8");
+
+		const beforeText = readText(handleManagementAction("get", { agent: "implementer" }, ctx));
+		assert.match(beforeText, /Description: Settings description/);
+		assert.match(beforeText, /Model: openai\/gpt-default/);
+		assert.match(beforeText, /Thinking: high/);
+
+		const updated = handleUpdate({ agent: "implementer", config: { output: "local.md" } }, ctx);
+		assert.equal(updated.isError, false);
+
+		const content = fs.readFileSync(agentPath, "utf-8");
+		assert.match(content, /^description: Frontmatter description$/m);
+		assert.match(content, /^output: local\.md$/m);
+		assert.doesNotMatch(content, /^fast:/m);
+		assert.doesNotMatch(content, /^model:/m);
+		assert.doesNotMatch(content, /^thinking:/m);
+	});
+
+	it("keeps same-value custom override ownership for interactive admin edits", async () => {
+		const settingsPath = path.join(tempDir, ".pi", "settings.json");
+		const agentPath = path.join(tempDir, ".pi", "agents", "implementer.md");
+		fs.mkdirSync(path.dirname(agentPath), { recursive: true });
+		fs.writeFileSync(settingsPath, JSON.stringify({
+			subagents: {
+				agentOverrides: { implementer: { model: "anthropic/claude-old" } },
+			},
+		}, null, 2), "utf-8");
+		fs.writeFileSync(agentPath, `---
+name: implementer
+description: Frontmatter description
+model: anthropic/claude-old
+---
+
+Drive the failing test first.
+`, "utf-8");
+		const sent: unknown[] = [];
+		const notified: string[] = [];
+
+		await openSubagentsAdmin(
+			{ sendMessage: (message: unknown) => sent.push(message) } as never,
+			{
+				cwd: tempDir,
+				hasUI: true,
+				modelRegistry: {
+					getAvailable: () => [
+						{ provider: "anthropic", id: "claude-old" },
+						{ provider: "anthropic", id: "claude-new" },
+					],
+				},
+				ui: {
+					select: async () => "anthropic/claude-new",
+					notify: (message: string) => notified.push(message),
+				},
+			} as never,
+			"implementer model",
+		);
+
+		assert.match(notified[0] ?? "", /Saved project settings override/);
+		assert.match(JSON.stringify(sent), /Saved project settings override/);
+		assert.match(fs.readFileSync(agentPath, "utf-8"), /^model: anthropic\/claude-old$/m);
+		assert.equal(JSON.parse(fs.readFileSync(settingsPath, "utf-8")).subagents.agentOverrides.implementer.model, "anthropic/claude-new");
+		const after = readText(handleManagementAction("get", { agent: "implementer" }, { cwd: tempDir, modelRegistry: { getAvailable: () => [] } }));
+		assert.match(after, /Model: anthropic\/claude-new/);
+	});
+
+	it("promotes cross-scope custom override edits to project settings", async () => {
+		const userSettingsPath = path.join(tempDir, "agent-home", "settings.json");
+		const projectSettingsPath = path.join(tempDir, ".pi", "settings.json");
+		const agentPath = path.join(tempDir, ".pi", "agents", "implementer.md");
+		fs.mkdirSync(path.dirname(userSettingsPath), { recursive: true });
+		fs.mkdirSync(path.dirname(agentPath), { recursive: true });
+		fs.writeFileSync(userSettingsPath, JSON.stringify({
+			subagents: {
+				agentOverrides: {
+					implementer: { model: "anthropic/claude-old" },
+					critic: { thinking: "high" },
+					speaker: { systemPrompt: "Shared prompt" },
+				},
+			},
+		}, null, 2), "utf-8");
+		fs.writeFileSync(projectSettingsPath, JSON.stringify({
+			subagents: { defaultModel: "openai/gpt-default" },
+		}, null, 2), "utf-8");
+		fs.writeFileSync(agentPath, `---
+name: implementer
+description: Frontmatter description
+---
+
+Drive the failing test first.
+`, "utf-8");
+		fs.writeFileSync(path.join(path.dirname(agentPath), "critic.md"), `---
+name: critic
+description: Thinking critic
+thinking: false
+---
+
+Keep thinking off.
+`, "utf-8");
+		fs.writeFileSync(path.join(path.dirname(agentPath), "speaker.md"), `---
+name: speaker
+description: Prompt speaker
+---
+
+Base prompt.
+`, "utf-8");
+		const sent: unknown[] = [];
+		const notified: string[] = [];
+
+		await openSubagentsAdmin(
+			{ sendMessage: (message: unknown) => sent.push(message) } as never,
+			{
+				cwd: tempDir,
+				hasUI: true,
+				modelRegistry: {
+					getAvailable: () => [
+						{ provider: "anthropic", id: "claude-old" },
+						{ provider: "anthropic", id: "claude-new" },
+					],
+				},
+				ui: {
+					select: async () => "anthropic/claude-new",
+					notify: (message: string) => notified.push(message),
+				},
+			} as never,
+			"implementer model",
+		);
+
+		assert.match(notified[0] ?? "", /Saved project settings override/);
+		assert.match(JSON.stringify(sent), /Saved project settings override/);
+		assert.doesNotMatch(fs.readFileSync(agentPath, "utf-8"), /^model:/m);
+		assert.equal(JSON.parse(fs.readFileSync(userSettingsPath, "utf-8")).subagents.agentOverrides.implementer.model, "anthropic/claude-old");
+		assert.equal(JSON.parse(fs.readFileSync(projectSettingsPath, "utf-8")).subagents.agentOverrides.implementer.model, "anthropic/claude-new");
+		const after = readText(handleManagementAction("get", { agent: "implementer" }, { cwd: tempDir, modelRegistry: { getAvailable: () => [] } }));
+		assert.match(after, /Model: anthropic\/claude-new/);
+
+		await openSubagentsAdmin(
+			{ sendMessage: (message: unknown) => sent.push(message) } as never,
+			{
+				cwd: tempDir,
+				hasUI: true,
+				modelRegistry: { getAvailable: () => [{ provider: "anthropic", id: "claude-new" }] },
+				ui: {
+					select: async () => "Default / inherit session model",
+					notify: (message: string) => notified.push(message),
+				},
+			} as never,
+			"implementer model",
+		);
+
+		assert.equal(JSON.parse(fs.readFileSync(userSettingsPath, "utf-8")).subagents.agentOverrides.implementer.model, "anthropic/claude-old");
+		assert.equal(JSON.parse(fs.readFileSync(projectSettingsPath, "utf-8")).subagents.agentOverrides.implementer.model, "openai/gpt-default");
+		const cleared = readText(handleManagementAction("get", { agent: "implementer" }, { cwd: tempDir, modelRegistry: { getAvailable: () => [] } }));
+		assert.match(cleared, /Model: openai\/gpt-default/);
+		assert.doesNotMatch(cleared, /Model: anthropic\/claude-old|Model: anthropic\/claude-new/);
+
+		await openSubagentsAdmin(
+			{ sendMessage: (message: unknown) => sent.push(message) } as never,
+			{
+				cwd: tempDir,
+				hasUI: true,
+				modelRegistry: { getAvailable: () => [] },
+				ui: {
+					select: async () => "Default / inherit session thinking",
+					notify: (message: string) => notified.push(message),
+				},
+			} as never,
+			"critic thinking",
+		);
+
+		assert.equal(JSON.parse(fs.readFileSync(userSettingsPath, "utf-8")).subagents.agentOverrides.critic.thinking, "high");
+		assert.equal(JSON.parse(fs.readFileSync(projectSettingsPath, "utf-8")).subagents.agentOverrides.critic.thinking, "off");
+		const thinkingCleared = readText(handleManagementAction("get", { agent: "critic" }, { cwd: tempDir, modelRegistry: { getAvailable: () => [] } }));
+		assert.match(thinkingCleared, /Thinking: off/);
+
+		await openSubagentsAdmin(
+			{ sendMessage: (message: unknown) => sent.push(message) } as never,
+			{
+				cwd: tempDir,
+				hasUI: true,
+				modelRegistry: { getAvailable: () => [] },
+				ui: {
+					editor: async () => "Shared prompt",
+					notify: (message: string) => notified.push(message),
+				},
+			} as never,
+			"speaker system-prompt",
+		);
+
+		assert.equal(JSON.parse(fs.readFileSync(userSettingsPath, "utf-8")).subagents.agentOverrides.speaker.systemPrompt, "Shared prompt");
+		assert.equal(JSON.parse(fs.readFileSync(projectSettingsPath, "utf-8")).subagents.agentOverrides.speaker.systemPrompt, "Shared prompt");
+	});
+
+	it("preserves blank output and defaultReads frontmatter while settings overrides replace them", () => {
 		const ctx = { cwd: tempDir, modelRegistry: { getAvailable: () => [] } };
 		const settingsPath = path.join(tempDir, ".pi", "settings.json");
 		const agentPath = path.join(tempDir, ".pi", "agents", "implementer.md");
@@ -917,11 +1251,11 @@ Drive the failing test first.
 		assert.match(content, /^output: ?$/m);
 		assert.match(content, /^defaultReads: ?$/m);
 		const after = readText(handleManagementAction("get", { agent: "implementer" }, ctx));
-		assert.doesNotMatch(after, /Output: settings\.md/);
-		assert.doesNotMatch(after, /Reads: settings\.md/);
+		assert.match(after, /Output: settings\.md/);
+		assert.match(after, /Reads: settings\.md/);
 	});
 
-	it("preserves explicit default-like frontmatter that blocks settings overrides during updates", () => {
+	it("preserves explicit default-like frontmatter while settings overrides replace it", () => {
 		const ctx = { cwd: tempDir, modelRegistry: { getAvailable: () => [] } };
 		const settingsPath = path.join(tempDir, ".pi", "settings.json");
 		const agentPath = path.join(tempDir, ".pi", "agents", "implementer.md");
@@ -959,8 +1293,8 @@ Drive the failing test first.
 		const got = handleManagementAction("get", { agent: "implementer" }, ctx);
 		assert.equal(got.isError, false);
 		const beforeText = readText(got);
-		assert.match(beforeText, /Thinking: off/);
-		assert.doesNotMatch(beforeText, /Thinking: high/);
+		assert.match(beforeText, /Thinking: high/);
+		assert.doesNotMatch(beforeText, /Thinking: off/);
 
 		const updated = handleUpdate(
 			{ agent: "implementer", config: { description: "Updated implementer" } },
@@ -981,8 +1315,8 @@ Drive the failing test first.
 		const gotAfter = handleManagementAction("get", { agent: "implementer" }, ctx);
 		assert.equal(gotAfter.isError, false);
 		const afterText = readText(gotAfter);
-		assert.match(afterText, /Thinking: off/);
-		assert.doesNotMatch(afterText, /Thinking: high/);
+		assert.match(afterText, /Thinking: high/);
+		assert.doesNotMatch(afterText, /Thinking: off/);
 	});
 
 	it("reports builtin runtime-loaded model mappings from current session state", () => {
@@ -1000,7 +1334,7 @@ Drive the failing test first.
 		const result = handleManagementAction("models", {}, ctx);
 		const text = readText(result);
 		assert.equal(result.isError, false);
-		assert.match(text, /^Builtin subagent models/m);
+		assert.match(text, /^Subagent models/m);
 		assert.match(text, /Current session model:\n  openai\/gpt-5-mini/);
 		assert.match(text, /(?:^|\n)scout\n  model:\n    openai\/gpt-5-mini\n  source: inherits current session model(?:\n|$)/);
 		assert.match(text, /(?:^|\n)advisor\n  model:\n    openai\/gpt-5-mini\n  source: inherits current session model(?:\n|$)/);
@@ -1021,6 +1355,66 @@ Drive the failing test first.
 		assert.match(text, /Agent: advisor/);
 		assert.match(text, /Effective model:\n  openai\/gpt-5-mini/);
 		assert.doesNotMatch(text, /Builtin agent 'advisor' not found|source: missing/);
+	});
+
+	it("reports effective model mappings for discovered package, user, and project agents", () => {
+		const projectAgentsDir = path.join(tempDir, ".pi", "agents");
+		const userAgentsDir = path.join(tempDir, "agent-home", "agents");
+		const packageDir = path.join(tempDir, ".pi", "npm", "node_modules", "model-agents");
+		fs.mkdirSync(projectAgentsDir, { recursive: true });
+		fs.mkdirSync(userAgentsDir, { recursive: true });
+		fs.mkdirSync(path.join(packageDir, "agents"), { recursive: true });
+		fs.writeFileSync(path.join(packageDir, "package.json"), JSON.stringify({
+			name: "model-agents",
+			version: "1.2.3",
+			pi: { subagents: { agents: ["agents"] } },
+		}));
+		const writeAgent = (dir: string, name: string, model: string, thinking: string, fallback: string) => fs.writeFileSync(path.join(dir, `${name}.md`), [
+			"---",
+			`name: ${name}`,
+			`description: ${name} model mapping`,
+			`model: ${model}`,
+			`thinking: ${thinking}`,
+			`fallbackModels: ${fallback}`,
+			"---",
+			"Model mapping test agent.",
+		].join("\n"));
+		writeAgent(path.join(packageDir, "agents"), "package-worker", "anthropic/claude-sonnet-4", "low", "openai/gpt-5-mini");
+		writeAgent(userAgentsDir, "user-worker", "gpt-5-mini", "medium", "claude-sonnet-4");
+		writeAgent(userAgentsDir, "shadowed", "openai/gpt-5-mini", "low", "anthropic/claude-sonnet-4");
+		writeAgent(projectAgentsDir, "project-worker", "anthropic/claude-sonnet-4", "high", "openai/gpt-5-mini");
+		writeAgent(projectAgentsDir, "shadowed", "openai/gpt-5-mini", "high", "anthropic/claude-sonnet-4");
+		fs.writeFileSync(path.join(projectAgentsDir, "off-worker.md"), [
+			"---",
+			"name: off-worker",
+			"description: off-worker model mapping",
+			"model: openai/gpt-5-mini",
+			"thinking: false",
+			"---",
+			"Explicitly disable thinking.",
+		].join("\n"));
+		const settingsPath = path.join(tempDir, ".pi", "settings.json");
+		fs.writeFileSync(settingsPath, JSON.stringify({ subagents: { agentOverrides: { reviewer: { disabled: true } } } }));
+
+		const ctx = {
+			cwd: tempDir,
+			modelRegistry: { getAvailable: () => [
+				{ provider: "openai", id: "gpt-5-mini" },
+				{ provider: "anthropic", id: "claude-sonnet-4" },
+			] },
+			model: { provider: "openai", id: "gpt-5-mini" },
+		};
+		const result = handleManagementAction("models", {}, ctx);
+		const text = readText(result);
+		assert.equal(result.isError, false);
+		assert.match(text, /package-worker\n  model:\n    anthropic\/claude-sonnet-4\n  source: package agent config\n  thinking: low\n  fallback models:\n    openai\/gpt-5-mini/);
+		assert.match(text, /user-worker\n  model:\n    openai\/gpt-5-mini\n  source: user agent config\n  thinking: medium/);
+		assert.match(text, /project-worker\n  model:\n    anthropic\/claude-sonnet-4\n  source: project agent config\n  thinking: high/);
+		assert.match(text, /off-worker\n  model:\n    openai\/gpt-5-mini\n  source: project agent config\n  thinking: off/);
+		assert.match(text, /shadowed\n  model:\n    openai\/gpt-5-mini\n  source: project agent config/);
+		assert.doesNotMatch(text, /shadowed\n  model:\n    openai\/gpt-5-mini\n  source: user agent config/);
+		assert.match(text, /reviewer\n  model:\n    openai\/gpt-5-mini\n  source: inherits current session model; disabled/);
+		assert.doesNotMatch(text, /api[_-]?key|token|secret/i);
 	});
 
 	it("reports override source and disabled builtin state in runtime model mappings", () => {
@@ -1048,7 +1442,7 @@ Drive the failing test first.
 		const result = handleManagementAction("models", { agent: "reviewer" }, ctx);
 		const text = readText(result);
 		assert.equal(result.isError, false);
-		assert.match(text, /^Builtin subagent model/m);
+		assert.match(text, /^Subagent model/m);
 		assert.match(text, /Agent: reviewer/);
 		assert.match(text, /Effective model:\n  anthropic\/claude-sonnet-4/);
 		assert.match(text, /Source: project override/);
@@ -1057,14 +1451,14 @@ Drive the failing test first.
 		assert.match(text.replaceAll("\\", "/"), /Override file:\n  .*\.pi\/settings\.json/);
 	});
 
-	it("rejects unknown builtin filters for runtime model mappings", () => {
+	it("rejects unknown agents for runtime model mappings", () => {
 		const result = handleManagementAction("models", { agent: "not-a-builtin" }, {
 			cwd: tempDir,
 			modelRegistry: { getAvailable: () => [] },
 		});
 
 		assert.equal(result.isError, true);
-		assert.match(readText(result), /Builtin agent 'not-a-builtin' not found/);
+		assert.match(readText(result), /Agent 'not-a-builtin' not found/);
 	});
 
 	it("creates delegate with its builtin prompt defaults", () => {

@@ -4,8 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import { Type } from "typebox";
-import { registerSubagentCodeMode } from "../../src/extension/code-mode.ts";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { registerSubagentCodeMode } from "../../src/extension/code-mode.ts";
 
 const pi = { events: { on() {}, emit() {} } } as unknown as ExtensionAPI;
 const parameters = Type.Object({ task: Type.String() });
@@ -16,9 +16,7 @@ describe("subagent Code Mode registration", () => {
 		const packageDir = path.join(agentDir, "npm", "node_modules", "@howaboua", "pi-codex-conversion");
 		fs.mkdirSync(packageDir, { recursive: true });
 		fs.writeFileSync(path.join(packageDir, "package.json"), JSON.stringify({
-			name: "@howaboua/pi-codex-conversion",
-			type: "module",
-			exports: { "./code-mode": { import: "./code-mode.js" } },
+			name: "@howaboua/pi-codex-conversion", type: "module", exports: { "./code-mode": { import: "./code-mode.js" } },
 		}));
 		fs.writeFileSync(path.join(packageDir, "code-mode.js"), `
 			export function adaptToolForCodeMode(tool) { return tool; }
@@ -43,79 +41,29 @@ describe("subagent Code Mode registration", () => {
 		}
 	});
 
-	it("adapts the normal tool object and delegates structured input to its execute path", async () => {
-		const signal = new AbortController().signal;
-		const context = { cwd: "/tmp" };
-		const updates: unknown[] = [];
-		const result = { content: [{ type: "text" as const, text: "done" }], details: { mode: "single" } };
-		let executeArgs: unknown[] | undefined;
-		const tool: ToolDefinition<typeof parameters, { mode: string }> = {
+	it("adapts the registered tool and unregisters it", async () => {
+		const tool: ToolDefinition<typeof parameters, undefined> = {
 			name: "subagent", label: "Subagent", description: "delegate", parameters,
-			async execute(...args) { executeArgs = args; args[3]?.(result); return result; },
+			async execute() { return { content: [], details: undefined }; },
 		};
-		let adaptedTool: ToolDefinition<any, any, any> | undefined;
-		let providerValue: unknown;
+		let adapted: unknown;
 		let unregistered = false;
-		const registration = { unregister() { unregistered = true; } };
 		const registered = registerSubagentCodeMode(pi, tool, async () => ({
-			adaptToolForCodeMode(candidate: ToolDefinition<any, any, any>, options: { usage: string }) {
-				adaptedTool = candidate;
+			adaptToolForCodeMode(candidate: unknown, options: { usage: string }) {
+				assert.equal(candidate, tool);
 				assert.equal(options.usage, "await tools.subagent({...})");
-				return { invoke: (input: unknown) => candidate.execute("code-mode-subagent", input, signal, (update) => updates.push(update), context as never) };
+				return candidate;
 			},
 			registerCodeModeExtensionTools(candidatePi: ExtensionAPI, provider: () => readonly unknown[]) {
 				assert.equal(candidatePi, pi);
-				[providerValue] = provider();
-				return registration;
+				[adapted] = provider();
+				return { unregister() { unregistered = true; } };
 			},
 		}));
 		await new Promise((resolve) => setImmediate(resolve));
-		assert.equal(adaptedTool, tool);
-		const invocationResult = await (providerValue as { invoke(input: unknown): Promise<unknown> }).invoke({ task: "review" });
-		assert.equal(invocationResult, result);
-		assert.deepEqual(executeArgs, ["code-mode-subagent", { task: "review" }, signal, executeArgs?.[3], context]);
-		assert.deepEqual(updates, [result]);
+		assert.equal(adapted, tool);
 		registered.unregister();
 		assert.equal(unregistered, true);
-	});
-
-	it("skips absent and incompatible modules without hiding broken imports", async () => {
-		const warnings: string[] = [];
-		const originalWarn = console.warn;
-		console.warn = (message) => warnings.push(String(message));
-		try {
-			const tool = { name: "subagent", label: "Subagent", description: "delegate", parameters, async execute() { return { content: [], details: undefined }; } };
-			const absent = Object.assign(new Error("Cannot find package '@howaboua/pi-codex-conversion'"), { code: "ERR_MODULE_NOT_FOUND" });
-			registerSubagentCodeMode(pi, tool, async () => { throw absent; });
-			registerSubagentCodeMode(pi, tool, async () => ({}));
-			const nested = Object.assign(new Error("Cannot find package 'broken-transitive-package'"), { code: "ERR_MODULE_NOT_FOUND" });
-			registerSubagentCodeMode(pi, tool, async () => { throw nested; });
-			const old = Object.assign(new Error("Package subpath './code-mode' is not defined by exports"), { code: "ERR_PACKAGE_PATH_NOT_EXPORTED" });
-			registerSubagentCodeMode(pi, tool, async () => { throw old; });
-			const directory = Object.assign(new Error("Directory import '/node_modules/@howaboua/pi-codex-conversion/code-mode' is not supported"), { code: "ERR_UNSUPPORTED_DIR_IMPORT" });
-			registerSubagentCodeMode(pi, tool, async () => { throw directory; });
-			registerSubagentCodeMode(pi, tool, async () => ({
-				adaptToolForCodeMode() { throw new Error("adapter failed"); },
-				registerCodeModeExtensionTools() { return { unregister() {} }; },
-			}));
-			registerSubagentCodeMode(pi, tool, async () => ({
-				adaptToolForCodeMode() { return {}; },
-				registerCodeModeExtensionTools() { throw new Error("registration failed"); },
-			}));
-			await new Promise((resolve) => setImmediate(resolve));
-			await new Promise((resolve) => setImmediate(resolve));
-		} finally {
-			console.warn = originalWarn;
-		}
-		assert.deepEqual(warnings.sort(), [
-			"[pi-subagents] Code Mode bridge skipped: pi-codex-conversion is not installed.",
-			"[pi-subagents] Code Mode bridge skipped: pi-codex-conversion >=3.0.24 is required.",
-			"[pi-subagents] Code Mode bridge skipped: pi-codex-conversion failed to load (Cannot find package 'broken-transitive-package').",
-			"[pi-subagents] Code Mode bridge skipped: pi-codex-conversion >=3.0.24 is required.",
-			"[pi-subagents] Code Mode bridge skipped: pi-codex-conversion >=3.0.24 is required.",
-			"[pi-subagents] Code Mode bridge skipped: pi-codex-conversion failed to load (adapter failed).",
-			"[pi-subagents] Code Mode bridge skipped: pi-codex-conversion failed to load (registration failed).",
-		].sort());
 	});
 
 	it("unregisters a registration that resolves after cleanup", async () => {

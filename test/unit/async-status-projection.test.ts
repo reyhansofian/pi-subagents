@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import type { AsyncJobState, HostStepNodeV1 } from "../../src/shared/types.ts";
+import type { AsyncJobState, HostStepNode, WorkflowGraphSnapshot, WorkflowNodeStatus } from "../../src/shared/types.ts";
 import {
 	ASYNC_STATUS_SNAPSHOT_KIND,
 	ASYNC_STATUS_SNAPSHOT_VERSION,
@@ -15,7 +15,7 @@ function job(input: Partial<AsyncJobState> & Pick<AsyncJobState, "asyncId" | "st
 	} as AsyncJobState;
 }
 
-function hostStep(overrides: Partial<HostStepNodeV1> = {}): HostStepNodeV1 {
+function hostStep(overrides: Partial<HostStepNode> = {}): HostStepNode {
 	return {
 		version: 1,
 		kind: "host-step",
@@ -27,6 +27,27 @@ function hostStep(overrides: Partial<HostStepNodeV1> = {}): HostStepNodeV1 {
 		verdict: "pass",
 		updatedAt: 20,
 		...overrides,
+	};
+}
+
+const stagedLaneKeys = ["scope-scout", "red-tests", "label-helpers", "summary-title", "detail-row", "tiers-noise", "validation", "minimality-challenge", "fresh-review"];
+
+function stagedLaneGraph(statuses: WorkflowNodeStatus[] = stagedLaneKeys.map((_, index) => index === 0 ? "running" : "pending")): WorkflowGraphSnapshot {
+	const nodeIds = stagedLaneKeys.map((key) => `issue-1695.${key}`);
+	return {
+		runId: "workflow-1695",
+		mode: "workflow",
+		phases: [{ title: "issue-1695", nodeIds }],
+		nodes: stagedLaneKeys.map((key, index) => ({
+			id: nodeIds[index]!,
+			kind: "step",
+			agent: index === 0 ? "scout" : index === 7 ? "simplifier" : "worker",
+			label: key,
+			status: statuses[index] ?? "pending",
+			flatIndex: index,
+			stepIndex: index,
+		})),
+		currentNodeId: nodeIds[statuses.findIndex((status) => status === "running")],
 	};
 }
 
@@ -77,6 +98,18 @@ describe("async status projection", () => {
 		assert.doesNotMatch(serialized, /private\/report|fileMutation|Required file-only output/);
 	});
 
+	it("maps malformed persisted states to partial instead of widening the public state union", () => {
+		const snapshot = projectAsyncStatusSnapshot([{
+			asyncId: "bad-state",
+			asyncDir: "/tmp/bad-state",
+			status: "mystery",
+			steps: [{ agent: "worker", status: "also-mystery" }],
+		} as unknown as AsyncJobState]);
+
+		assert.equal(snapshot.runs[0]?.state, "partial");
+		assert.equal(snapshot.runs[0]?.children?.[0]?.state, "partial");
+	});
+
 	it("projects compact Fleet workflow rows without applying UI bounds", () => {
 		const rows = projectAsyncWorkflowRows([{
 			agent: "reviewer",
@@ -84,6 +117,7 @@ describe("async status projection", () => {
 			label: "Fresh review",
 			phase: "quality",
 			status: "partial",
+			context: "fresh",
 			activityState: "needs_attention",
 			startedAt: 10,
 			tokens: { input: 20, output: 5, total: 25, window: 18 },
@@ -92,6 +126,7 @@ describe("async status projection", () => {
 		assert.deepEqual(rows, [{
 			name: "quality: review · Fresh review (reviewer)",
 			state: "partial",
+			context: "fresh",
 			activity: "needs attention",
 			startedAt: 10,
 			tokens: 25,
@@ -154,9 +189,9 @@ describe("async status projection", () => {
 		assert.deepEqual(rows, []);
 	});
 
-	it("projects stored preflight lanes as planned rows and merges launched facts", () => {
+	it("annotates authoritative children without projecting unmatched preflight lanes", () => {
 		const rows = projectAsyncWorkflowRows([
-			{ agent: "worker", workflowKey: "writer", label: "Writer", status: "running" },
+			{ agent: "worker", workflowKey: "writer.implementation", label: "Writer", status: "running" },
 		], {
 			version: 1,
 			coverage: "complete",
@@ -167,9 +202,44 @@ describe("async status projection", () => {
 		});
 
 		assert.deepEqual(rows.map((row) => ({ name: row.name, state: row.state, mode: row.preflight?.mode })), [
-			{ name: "writer · Writer (worker)", state: "running", mode: "mutation" },
-			{ name: "review", state: "planned", mode: "review" },
+			{ name: "writer.implementation · Writer (worker)", state: "running", mode: "mutation" },
 		]);
+	});
+
+	it("prefers a specific preflight lane over an earlier broad phase alias", () => {
+		const rows = projectAsyncWorkflowRows([
+			{ agent: "reviewer", workflowKey: "writer.quality.deep", phase: "writer", status: "running" },
+		], {
+			version: 1,
+			coverage: "partial",
+			lanes: [
+				{ key: "writer", mode: "mutation" },
+				{ key: "writer.quality", mode: "review" },
+			],
+		});
+
+		assert.equal(rows[0]?.preflight?.mode, "review");
+	});
+
+	it("projects known runs.lanes stages from the workflow graph, including pending stages", () => {
+		const rows = projectAsyncWorkflowRows([{
+			agent: "scout",
+			workflowKey: "issue-1695.scope-scout",
+			label: "scope-scout",
+			status: "running",
+		}], stagedLaneGraph(), {
+			version: 1,
+			coverage: "complete",
+			lanes: [{ key: "issue-1695", mode: "scout" }],
+		});
+
+		for (const [index, key] of stagedLaneKeys.entries()) {
+			const row = rows.find((candidate) => candidate.name.includes(key));
+			assert.ok(row, `stage ${key} should remain discoverable`);
+			assert.equal(row?.state, index === 0 ? "running" : "planned", `stage ${key} state`);
+		}
+		assert.equal(rows.filter((row) => row.state === "planned").length, stagedLaneKeys.length - 1);
+		assert.equal(rows.every((row) => row.preflight?.mode === "scout"), true);
 	});
 
 	it("preserves duplicate loaded rows when a declared lane key is reused", () => {

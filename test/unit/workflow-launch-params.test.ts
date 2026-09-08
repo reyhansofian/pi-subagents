@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { prepareWorkflowLaunchParams, promptAuditRedoParams, sanitizeRunPathSegment } from "../../src/runs/foreground/subagent-executor.ts";
+import { prepareWorkflowLaunchParams, promptAuditRedoParams, resolveRevivalControlConfig, sanitizeRunPathSegment } from "../../src/runs/foreground/subagent-executor.ts";
+import { resolveControlConfig } from "../../src/runs/shared/subagent-control.ts";
 
 describe("workflow launch params", () => {
-	it("keeps omitted workflow child async foreground", () => {
+	it("preserves omitted workflow child async defaults and awaits background resolution", () => {
 		assert.deepEqual(
 			prepareWorkflowLaunchParams(
 				{},
@@ -14,11 +15,75 @@ describe("workflow launch params", () => {
 			{
 				agent: "worker",
 				task: "Run",
-				async: false,
+				workflowAwaitAsync: true,
 				workflowParentRunId: "workflow-run",
 				workflowKey: "run",
 			},
 		);
+	});
+
+	it("forwards workflow baseRef only to launches where it can affect allocation", () => {
+		assert.equal(
+			prepareWorkflowLaunchParams(
+				{ baseRef: "refs/heads/release" },
+				{ agent: "worker", task: "Run" },
+				"workflow-run",
+				"run",
+			).baseRef,
+			"refs/heads/release",
+		);
+		assert.equal(
+			prepareWorkflowLaunchParams(
+				{ baseRef: "refs/heads/release" },
+				{ resume: "retained-run", task: "Continue" },
+				"workflow-run",
+				"resume",
+			).baseRef,
+			undefined,
+		);
+		assert.equal(
+			prepareWorkflowLaunchParams(
+				{ baseRef: "refs/heads/release" },
+				{ resume: "retained-run", task: "Continue", baseRef: "refs/heads/topic" },
+				"workflow-run",
+				"resume-explicit",
+			).baseRef,
+			"refs/heads/topic",
+		);
+		assert.equal(
+			prepareWorkflowLaunchParams(
+				{ baseRef: "refs/heads/release" },
+				{ agent: "worker", task: "Run", baseRef: "refs/heads/topic" },
+				"workflow-run",
+				"override",
+			).baseRef,
+			"refs/heads/topic",
+		);
+	});
+
+	it("does not forward workflow capacity overrides to children", () => {
+		const params = prepareWorkflowLaunchParams(
+			{ globalConcurrencyLimit: 2, maxSubagentSpawnsPerRun: 3 },
+			{ agent: "worker", task: "Run", globalConcurrencyLimit: 4, maxSubagentSpawnsPerRun: 5 },
+			"workflow-run",
+			"run",
+		);
+		assert.equal(params.globalConcurrencyLimit, undefined);
+		assert.equal(params.maxSubagentSpawnsPerRun, undefined);
+	});
+
+	it("merges partial control overrides into workflow child defaults", () => {
+		const params = prepareWorkflowLaunchParams(
+			{ control: { needsAttentionAfterMs: 111, activeNoticeAfterMs: 222 } },
+			{ agent: "worker", task: "Run", control: { activeNoticeAfterMs: 333 } },
+			"workflow-run",
+			"run",
+		);
+
+		assert.deepEqual(params.control, {
+			needsAttentionAfterMs: 111,
+			activeNoticeAfterMs: 333,
+		});
 	});
 
 	it("marks only new async workflow children to preserve live supervisor-detach awaits", () => {
@@ -66,7 +131,8 @@ describe("workflow launch params", () => {
 			"run",
 			{ parentDeadlineAt },
 		);
-		assert.equal(params.async, false);
+		assert.equal(params.async, undefined);
+		assert.equal(params.workflowAwaitAsync, true);
 		assert.equal(params.timeoutMs, undefined);
 		assert.equal(params.workflowParentDeadlineAt, parentDeadlineAt);
 	});
@@ -173,7 +239,7 @@ describe("workflow launch params", () => {
 				agent: "worker",
 				task: "Run",
 				intercomBridge: { mode: "off" },
-				async: false,
+				workflowAwaitAsync: true,
 				workflowParentRunId: "workflow-run",
 				workflowKey: "isolated",
 			},
@@ -200,7 +266,7 @@ describe("workflow launch params", () => {
 				agent: "worker",
 				task: "Implement",
 				worktree: true,
-				async: false,
+				workflowAwaitAsync: true,
 				workflowParentRunId: "workflow-run",
 				workflowKey: "gated",
 				acceptance: { level: "verified", verify: [{ id: "gate", command: "npm test" }] },
@@ -225,6 +291,40 @@ describe("workflow launch params", () => {
 				intercomBridge: { mode: "off" },
 			},
 		);
+	});
+
+	it("forwards control defaults and overrides to retained workflow children", () => {
+		assert.deepEqual(
+			prepareWorkflowLaunchParams(
+				{ control: { needsAttentionAfterMs: 111, activeNoticeAfterMs: 222 } },
+				{ resume: "retained-run", task: "Continue", control: { activeNoticeAfterMs: 333 } },
+				"workflow-run",
+				"continue",
+			),
+			{
+				action: "resume",
+				id: "retained-run",
+				message: "Continue",
+				workflowParentRunId: "workflow-run",
+				workflowKey: "continue",
+				control: {
+					needsAttentionAfterMs: 111,
+					activeNoticeAfterMs: 333,
+				},
+			},
+		);
+	});
+
+	it("lets retained workflow child control overrides amend recovered control configs", () => {
+		const recovered = resolveControlConfig(undefined, { needsAttentionAfterMs: 111, activeNoticeAfterMs: 222 });
+		const control = resolveRevivalControlConfig({
+			recoveryControlConfig: recovered,
+			requestedControl: { activeNoticeAfterMs: 333, notifyChannels: [] },
+		});
+
+		assert.equal(control.needsAttentionAfterMs, 111);
+		assert.equal(control.activeNoticeAfterMs, 333);
+		assert.deepEqual(control.notifyChannels, []);
 	});
 
 	it("does not inherit parent deadlines for retained workflow children", () => {
