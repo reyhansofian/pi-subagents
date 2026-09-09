@@ -155,6 +155,21 @@ export function isMutatingTool(toolName: string | undefined, args: Record<string
 	return isMutatingBashCommand(command);
 }
 
+export function hasCodeModeMutationAttempt(details: unknown, mutationTools?: readonly string[]): boolean {
+	if (typeof details !== "object" || details === null || Array.isArray(details)) return false;
+	const record = details as { codeMode?: unknown; traces?: unknown };
+	if (record.codeMode !== true || !Array.isArray(record.traces)) return false;
+	return record.traces.some((trace) => {
+		if (typeof trace !== "object" || trace === null || Array.isArray(trace)) return false;
+		const entry = trace as { name?: unknown; input?: unknown };
+		if (typeof entry.name !== "string") return false;
+		const args = typeof entry.input === "object" && entry.input !== null && !Array.isArray(entry.input)
+			? entry.input as Record<string, unknown>
+			: {};
+		return isMutatingTool(entry.name, args, mutationTools);
+	});
+}
+
 export function didMutatingToolFail(text: string): boolean {
 	const lowered = text.toLowerCase();
 	return MUTATING_FAILURE_HINTS.some((hint) => lowered.includes(hint));
