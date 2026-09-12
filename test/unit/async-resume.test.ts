@@ -12,6 +12,121 @@ function writeJson(filePath: string, value: object): void {
 }
 
 describe("async resume lookup", () => {
+	it("projects retained mutation provenance only for the exact selected child identity", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-resume-retained-mutation-"));
+		try {
+			const resultsDir = path.join(root, "results");
+			const sessionFile = path.join(root, "session.jsonl");
+			fs.writeFileSync(sessionFile, "", "utf-8");
+			const provenance = {
+				version: 1,
+				runId: "run-retained",
+				index: 1,
+				agent: "worker",
+				sessionFile: fs.realpathSync.native(sessionFile),
+				cwd: fs.realpathSync.native(root),
+				managedWorktree: null,
+			};
+			const writeResult = (runId: string, currentRunProvenance: object) => writeJson(path.join(resultsDir, `${runId}.json`), {
+				runId,
+				mode: "parallel",
+				state: "complete",
+				success: true,
+				cwd: root,
+				results: [
+					{ agent: "reviewer", success: true },
+					{ agent: "worker", success: true, sessionFile, effects: { fileMutation: { status: "observed", expected: true, attempted: true, currentRunProvenance } } },
+				],
+			});
+
+			writeResult("run-retained", provenance);
+			assert.deepEqual(resolveAsyncResumeTarget(
+				{ id: "run-retained", index: 1 },
+				{ asyncDirRoot: path.join(root, "runs"), resultsDir },
+			).retainedMutation, provenance);
+
+			const mismatches = [
+				{ ...provenance, runId: "older-run" },
+				{ ...provenance, index: 0 },
+				{ ...provenance, agent: "reviewer" },
+				{ ...provenance, sessionFile: path.join(root, "other.jsonl") },
+				{ ...provenance, cwd: path.dirname(root) },
+			];
+			for (const [index, mismatch] of mismatches.entries()) {
+				const runId = `run-mismatch-${index}`;
+				writeResult(runId, { ...mismatch, runId: mismatch.runId === provenance.runId ? runId : mismatch.runId });
+				assert.equal(resolveAsyncResumeTarget(
+					{ id: runId, index: 1 },
+					{ asyncDirRoot: path.join(root, "runs"), resultsDir },
+				).retainedMutation, undefined);
+			}
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("preserves the original managed allocator tuple across a mutating retained continuation", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-resume-retained-managed-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const resultsDir = path.join(root, "results");
+			const allocatorDir = path.join(asyncRoot, "allocator-run");
+			const managedCwd = path.join(root, "managed-worktree");
+			const sessionFile = path.join(root, "session.jsonl");
+			fs.mkdirSync(managedCwd);
+			fs.writeFileSync(sessionFile, "", "utf-8");
+			writeJson(path.join(allocatorDir, "handoff.json"), {
+				version: 1, runId: "allocator-run", mode: "single", source: "async", cwd: root, createdAt: 100, updatedAt: 200,
+				groups: [{
+					stepIndex: 0, baseCommit: "deadbeef", repoRoot: root,
+					children: [{ index: 0, taskIndex: 0, agent: "worker", status: "completed", summary: "done", patch: { path: path.join(root, "patch"), branch: "branch", changed: true, diffStat: "1 file changed", filesChanged: 1, insertions: 1, deletions: 0 } }],
+					cleanup: { state: "partial", pruned: true, tasks: [{ index: 0, path: managedCwd, branch: "branch", worktreeRemoved: false, branchRemoved: false, preserved: true }] },
+				}],
+			});
+			const provenance = {
+				version: 1, runId: "continuation-run", index: 0, agent: "worker",
+				sessionFile: fs.realpathSync.native(sessionFile), cwd: fs.realpathSync.native(managedCwd),
+				managedWorktree: { runId: "allocator-run", index: 0, cwd: fs.realpathSync.native(managedCwd) },
+			};
+			writeJson(path.join(resultsDir, "continuation-run.json"), {
+				runId: "continuation-run", mode: "single", state: "complete", success: true, cwd: managedCwd,
+				results: [{ agent: "worker", success: true, sessionFile, effects: { fileMutation: { currentRunProvenance: provenance } } }],
+			});
+
+			const target = resolveAsyncResumeTarget({ id: "continuation-run" }, { asyncDirRoot: asyncRoot, resultsDir });
+			assert.equal(target.managedWorktree, true);
+			assert.deepEqual(target.retainedMutation, provenance);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects managed provenance when no allocator handoff independently confirms it", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-resume-unconfirmed-managed-"));
+		try {
+			const resultsDir = path.join(root, "results");
+			const sessionFile = path.join(root, "session.jsonl");
+			fs.writeFileSync(sessionFile, "", "utf-8");
+			writeJson(path.join(resultsDir, "unconfirmed-run.json"), {
+				runId: "unconfirmed-run", mode: "single", state: "complete", success: true, cwd: root,
+				results: [{ agent: "worker", success: true, sessionFile, effects: { fileMutation: { currentRunProvenance: {
+					version: 1, runId: "unconfirmed-run", index: 0, agent: "worker",
+					sessionFile: fs.realpathSync.native(sessionFile), cwd: fs.realpathSync.native(root),
+					managedWorktree: { runId: "missing-allocator", index: 0, cwd: fs.realpathSync.native(root) },
+				} } } }],
+			});
+
+			const target = resolveAsyncResumeTarget(
+				{ id: "unconfirmed-run" },
+				{ asyncDirRoot: path.join(root, "runs"), resultsDir },
+			);
+			assert.equal(target.managedWorktree, undefined);
+			assert.equal(target.retainedMutation, undefined);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("resolves a completed single-child run from persisted status", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-resume-"));
 		try {

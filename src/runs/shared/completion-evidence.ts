@@ -1,5 +1,6 @@
 import type {
 	FileMutationEffect,
+	RetainedMutationProvenance,
 	SettlementDiagnostic,
 	TrackedMutationEvidence,
 } from "../../shared/types.ts";
@@ -25,6 +26,7 @@ export function planCompletionEvidence(input: {
 	implementationMutationExpected: boolean;
 	mutationAttemptObserved: boolean;
 	mutationEvidence?: TrackedMutationEvidence;
+	retainedMutation?: RetainedMutationProvenance;
 	arbiterRescued?: boolean;
 	agentContractEnabled: boolean;
 }): CompletionEvidencePlan {
@@ -51,6 +53,9 @@ export function planCompletionEvidence(input: {
 			...(guardBlocked && input.guard.message ? { message: input.guard.message } : {}),
 			...(guardTriggered ? { message: MISSING_IMPLEMENTATION_MUTATION_MESSAGE } : {}),
 			...(input.arbiterRescued ? { resolvedBy: "llm-intent-arbiter" as const } : {}),
+			...(input.retainedMutation && !guardBlocked && input.guard?.expectedMutation
+				? { resolvedBy: "retained-predecessor" as const, predecessorRunId: input.retainedMutation.runId }
+				: {}),
 		}
 		: undefined;
 	return {

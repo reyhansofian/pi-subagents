@@ -53,6 +53,7 @@ import {
 	type NestedRouteInfo,
 	type ResolvedControlConfig,
 	type ResolvedToolBudget,
+	type RetainedMutationProvenance,
 	type RunFanoutBudgetDescriptor,
 	type ToolBudgetConfig,
 	type SubagentRunMode,
@@ -235,6 +236,7 @@ interface AsyncSingleParams {
 	sessionDir?: string;
 	sessionFile?: string;
 	revivalLease?: SessionLeaseRequest;
+	retainedMutation?: RetainedMutationProvenance;
 	context?: ContextMode;
 	skills?: string[];
 	output?: string | boolean;
@@ -1992,6 +1994,7 @@ export function executeAsyncSingle(
 				...(params.workflowKey ? { workflowKey: params.workflowKey } : {}),
 				...(lane ? { lane } : {}),
 				...(params.revivalLease ? { revivalLease: params.revivalLease } : {}),
+				...(params.retainedMutation ? { retainedMutation: params.retainedMutation } : {}),
 				nestedRoute: nestedRoute ?? inheritedNestedRoute,
 				nestedSelf: inheritedNestedRoute && nestedAddress ? {
 					parentRunId: nestedAddress.parentRunId,

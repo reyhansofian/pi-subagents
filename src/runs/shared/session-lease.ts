@@ -2,8 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { createAtomicJsonWriter } from "../../shared/atomic-json.ts";
-import { TEMP_ROOT_DIR } from "../../shared/types.ts";
+import { createAtomicJsonWriter, writePrivateAtomicJson } from "../../shared/atomic-json.ts";
+import { TEMP_ROOT_DIR, type RetainedMutationIdentity, type RetainedMutationProvenance } from "../../shared/types.ts";
 
 export const SESSION_LEASES_DIR = path.join(TEMP_ROOT_DIR, "session-leases");
 
@@ -105,6 +105,129 @@ export function canonicalSessionId(sessionFile: string): string {
 
 export function sessionLeaseDir(sessionFile: string, rootDir = SESSION_LEASES_DIR): string {
 	return path.join(rootDir, canonicalSessionId(sessionFile));
+}
+
+export function retainedMutationHeadPath(sessionFile: string): string {
+	return `${canonicalSessionFilePath(sessionFile)}.mutation-head.json`;
+}
+
+function canonicalIdentityPath(value: unknown): string | undefined {
+	if (typeof value !== "string" || !value || !path.isAbsolute(value)) return undefined;
+	try {
+		const canonical = fs.realpathSync.native(value);
+		return canonical === value ? canonical : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function parseManagedWorktree(value: unknown): RetainedMutationIdentity["managedWorktree"] | undefined {
+	if (value === null) return null;
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const record = value as Record<string, unknown>;
+	if (Object.keys(record).some((key) => !["runId", "index", "cwd"].includes(key))
+		|| typeof record.runId !== "string" || !record.runId.trim()
+		|| !Number.isInteger(record.index) || (record.index as number) < 0) return undefined;
+	const cwd = canonicalIdentityPath(record.cwd);
+	return cwd ? { runId: record.runId, index: record.index as number, cwd } : undefined;
+}
+
+export function parseRetainedMutationProvenance(value: unknown): RetainedMutationProvenance | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const record = value as Record<string, unknown>;
+	if (Object.keys(record).some((key) => !["version", "runId", "index", "agent", "sessionFile", "cwd", "managedWorktree"].includes(key))
+		|| record.version !== 1
+		|| typeof record.runId !== "string" || !record.runId.trim()
+		|| !Number.isInteger(record.index) || (record.index as number) < 0
+		|| typeof record.agent !== "string" || !record.agent.trim()) return undefined;
+	const sessionFile = canonicalIdentityPath(record.sessionFile);
+	const cwd = canonicalIdentityPath(record.cwd);
+	const managedWorktree = parseManagedWorktree(record.managedWorktree);
+	if (!sessionFile || !cwd || managedWorktree === undefined) return undefined;
+	return {
+		version: 1,
+		runId: record.runId,
+		index: record.index as number,
+		agent: record.agent,
+		sessionFile,
+		cwd,
+		managedWorktree,
+	};
+}
+
+function sameRetainedMutationIdentity(left: RetainedMutationIdentity, right: RetainedMutationIdentity): boolean {
+	return left.runId === right.runId
+		&& left.index === right.index
+		&& left.agent === right.agent
+		&& left.sessionFile === right.sessionFile
+		&& left.cwd === right.cwd
+		&& (left.managedWorktree === null
+			? right.managedWorktree === null
+			: right.managedWorktree !== null
+				&& left.managedWorktree.runId === right.managedWorktree.runId
+				&& left.managedWorktree.index === right.managedWorktree.index
+				&& left.managedWorktree.cwd === right.managedWorktree.cwd);
+}
+
+export function readRetainedMutationHead(sessionFile: string): RetainedMutationIdentity | undefined {
+	try {
+		const value = JSON.parse(fs.readFileSync(retainedMutationHeadPath(sessionFile), "utf-8")) as { version?: unknown; identity?: unknown };
+		if (!value || typeof value !== "object" || Array.isArray(value)
+			|| Object.keys(value).some((key) => key !== "version" && key !== "identity")
+			|| value.version !== 1
+			|| !value.identity || typeof value.identity !== "object" || Array.isArray(value.identity)) return undefined;
+		const parsed = parseRetainedMutationProvenance({ version: 1, ...(value.identity as object) });
+		if (!parsed) return undefined;
+		const { version: _version, ...identity } = parsed;
+		return identity;
+	} catch {
+		return undefined;
+	}
+}
+
+export function initializeRetainedMutationHead(provenance: RetainedMutationProvenance): boolean {
+	const parsed = parseRetainedMutationProvenance(provenance);
+	if (!parsed) return false;
+	const headPath = retainedMutationHeadPath(parsed.sessionFile);
+	const { version: _version, ...identity } = parsed;
+	try {
+		fs.writeFileSync(headPath, JSON.stringify({ version: 1, identity }, null, 2), { encoding: "utf-8", mode: 0o600, flag: "wx" });
+		return true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+		const existing = readRetainedMutationHead(parsed.sessionFile);
+		return Boolean(existing && sameRetainedMutationIdentity(existing, parsed));
+	}
+}
+
+export function advanceRetainedMutationHead(
+	lease: SessionLeaseHandle,
+	predecessor: RetainedMutationProvenance | undefined,
+	current: RetainedMutationIdentity,
+): RetainedMutationProvenance | undefined {
+	const parsedCurrent = parseRetainedMutationProvenance({ version: 1, ...current });
+	if (!parsedCurrent
+		|| lease.owner.runId !== parsedCurrent.runId
+		|| lease.owner.canonicalSessionFile !== parsedCurrent.sessionFile) {
+		throw new Error(`Invalid retained mutation head identity for run '${lease.owner.runId}'.`);
+	}
+	const parsedPredecessor = parseRetainedMutationProvenance(predecessor);
+	const head = readRetainedMutationHead(parsedCurrent.sessionFile);
+	const inherited = parsedPredecessor
+		&& lease.owner.sourceRunId === parsedPredecessor.runId
+		&& head && sameRetainedMutationIdentity(head, parsedPredecessor)
+		&& parsedCurrent.agent === parsedPredecessor.agent
+		&& parsedCurrent.cwd === parsedPredecessor.cwd
+		&& (parsedCurrent.managedWorktree === null
+			? parsedPredecessor.managedWorktree === null
+			: parsedPredecessor.managedWorktree !== null
+				&& parsedCurrent.managedWorktree.runId === parsedPredecessor.managedWorktree.runId
+				&& parsedCurrent.managedWorktree.index === parsedPredecessor.managedWorktree.index
+				&& parsedCurrent.managedWorktree.cwd === parsedPredecessor.managedWorktree.cwd);
+	const { version: _version, ...identity } = parsedCurrent;
+	if (!inherited) identity.managedWorktree = null;
+	writePrivateAtomicJson(retainedMutationHeadPath(parsedCurrent.sessionFile), { version: 1, identity });
+	return inherited ? parsedPredecessor : undefined;
 }
 
 export function inspectSessionLease(sessionFile: string, rootDir = SESSION_LEASES_DIR): SessionLeaseState {

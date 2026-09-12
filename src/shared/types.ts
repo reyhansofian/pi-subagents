@@ -552,12 +552,31 @@ export interface ReviewProjection {
 	findings?: AcceptanceReviewResult["findings"];
 }
 
+export interface RetainedMutationIdentity {
+	runId: string;
+	index: number;
+	agent: string;
+	sessionFile: string;
+	cwd: string;
+	managedWorktree: null | {
+		runId: string;
+		index: number;
+		cwd: string;
+	};
+}
+
+export interface RetainedMutationProvenance extends RetainedMutationIdentity {
+	version: 1;
+}
+
 export interface FileMutationEffect {
 	status: "not-requested" | "not-applicable" | "observed" | "missing" | "blocked";
 	expected: boolean;
 	attempted: boolean;
 	message?: string;
-	resolvedBy?: "llm-intent-arbiter";
+	resolvedBy?: "llm-intent-arbiter" | "retained-predecessor";
+	predecessorRunId?: string;
+	currentRunProvenance?: RetainedMutationProvenance;
 	evidence?: TrackedMutationEvidence;
 }
 
