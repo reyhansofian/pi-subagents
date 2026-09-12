@@ -2094,6 +2094,11 @@ async function resumeAsyncRun(input: {
 			sourceRunId: target.runId,
 			...(input.deps.state.currentSessionId ? { parentSessionId: input.deps.state.currentSessionId } : {}),
 		},
+		...(target.source === "async"
+			&& target.retainedMutation
+			&& !(input.params.worktree === true && !("managedWorktree" in target && target.managedWorktree === true))
+			? { retainedMutation: target.retainedMutation }
+			: {}),
 		context: recoveryContext,
 		modelOverride: recoveryDescriptor?.model ?? target.model,
 		fast: recoveryDescriptor?.fast,

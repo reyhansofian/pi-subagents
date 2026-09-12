@@ -877,6 +877,100 @@ export default function() {
 		assert.doesNotMatch(eventsText, /Interrupt:/);
 	});
 
+	it("public async resume consumes nested exec mutation evidence exactly once", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		const cwd = createTempDir("pi-retained-exec-jj-");
+		const parentSessionFile = path.join(cwd, "parent.jsonl");
+		const childSessionFile = path.join(cwd, "child.jsonl");
+		const header = JSON.stringify({ type: "session", version: 1, id: "retained-exec", cwd: fs.realpathSync.native(cwd) });
+		fs.mkdirSync(path.join(cwd, ".jj"));
+		fs.writeFileSync(parentSessionFile, `${header}\n`);
+		fs.writeFileSync(childSessionFile, `${header}\n`);
+		const ctx = {
+			...makeMinimalCtx(cwd),
+			sessionManager: {
+				getSessionId: () => "session-123",
+				getSessionFile: () => parentSessionFile,
+				getLeafId: () => "leaf",
+				openSession: () => ({ createBranchedSession: () => childSessionFile }),
+			},
+		};
+		const executor = makeAsyncExecutor([makeAgent("worker")]);
+		try {
+			mockPi.onCall({
+				writeFiles: [{ path: "implemented.txt", content: "implemented\n" }],
+				jsonl: [
+					{ type: "tool_execution_start", toolCallId: "exec-1", toolName: "exec", args: { code: "text(await tools.apply_patch(patch))" } },
+					{ type: "tool_execution_end", toolCallId: "exec-1", toolName: "exec", result: "Applied patch successfully" },
+					events.assistantMessage("Implemented through nested exec apply_patch."),
+				],
+			});
+			const source = await executor.execute(
+				"retained-exec-source",
+				{ agent: "worker", task: "Implement the retained edit fix", async: true, context: "fork", acceptance: false },
+				new AbortController().signal,
+				undefined,
+				ctx,
+			) as AsyncExecutionResult;
+			assert.ok(!source.isError, source.content[0]?.text);
+			assert.ok(source.details.asyncId);
+			const sourcePayload = await readAsyncPayload(source.details.asyncId);
+			await waitForAsyncEvent(source.details.asyncId, "subagent.run.process_terminal");
+			assert.equal(sourcePayload.success, true);
+			assert.equal(sourcePayload.results[0]?.effects?.fileMutation?.attempted, true);
+			assert.equal(sourcePayload.results[0]?.effects?.fileMutation?.currentRunProvenance?.runId, source.details.asyncId);
+
+			mockPi.onCall({
+				jsonl: [
+					{ type: "compaction_start" },
+					{ type: "compaction_end", willRetry: false },
+					events.assistantMessage("Validated and delivered the retained implementation."),
+					{ type: "agent_settled" },
+				],
+			});
+			const continuation = await executor.execute(
+				"retained-exec-continuation",
+				{ action: "resume", id: source.details.asyncId, message: "Implement any required defect fixes, then validate and deliver the implementation", acceptance: false },
+				new AbortController().signal,
+				undefined,
+				ctx,
+			) as AsyncExecutionResult;
+			assert.ok(!continuation.isError, continuation.content[0]?.text);
+			assert.ok(continuation.details.asyncId);
+			const continuationPayload = await readAsyncPayload(continuation.details.asyncId);
+			await waitForAsyncEvent(continuation.details.asyncId, "subagent.run.process_terminal");
+			assert.equal(continuationPayload.success, true);
+			assert.deepEqual(continuationPayload.results[0]?.effects?.fileMutation, {
+				status: "observed",
+				expected: true,
+				attempted: false,
+				resolvedBy: "retained-predecessor",
+				predecessorRunId: source.details.asyncId,
+				evidence: continuationPayload.results[0]?.effects?.fileMutation?.evidence,
+			});
+			assert.equal(continuationPayload.results[0]?.effects?.fileMutation?.currentRunProvenance, undefined);
+			assert.doesNotMatch(fs.readFileSync(path.join(ASYNC_DIR, continuation.details.asyncId, "events.jsonl"), "utf8"), /completion_guard/);
+
+			for (const [name, sourceId] of [["third-generation", continuation.details.asyncId], ["stale-replay", source.details.asyncId]] as const) {
+				mockPi.onCall({ output: `No-edit ${name} delivery.` });
+				const replay = await executor.execute(
+					`retained-exec-${name}`,
+					{ action: "resume", id: sourceId, message: "Implement any required defect fixes, then validate and deliver the implementation", acceptance: false },
+					new AbortController().signal,
+					undefined,
+					ctx,
+				) as AsyncExecutionResult;
+				assert.ok(!replay.isError, replay.content[0]?.text);
+				assert.ok(replay.details.asyncId);
+				const replayPayload = await readAsyncPayload(replay.details.asyncId);
+				await waitForAsyncEvent(replay.details.asyncId, "subagent.run.process_terminal");
+				assert.equal(replayPayload.success, false, name);
+				assert.match(replayPayload.results[0]?.error ?? "", /completed without making edits/, name);
+			}
+		} finally {
+			removeTempDir(cwd);
+		}
+	});
+
 	it("does not use shared-cwd sibling tracked edits as parallel completion-guard proof", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async (t) => {
 		mockPi.onCall({
 			matchArgIncludes: "Edit tracked file",

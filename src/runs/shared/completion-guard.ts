@@ -1,5 +1,5 @@
 import type { Message } from "@earendil-works/pi-ai";
-import type { AcceptanceRole, TrackedMutationEvidence } from "../../shared/types.ts";
+import type { AcceptanceRole, RetainedMutationProvenance, TrackedMutationEvidence } from "../../shared/types.ts";
 import { isMutatingTool } from "./long-running-guard.ts";
 import { classifyTaskMutationIntent, expectsImplementationMutation, taskMayMutate } from "./task-intent.ts";
 
@@ -51,6 +51,7 @@ interface CompletionMutationGuardInput {
 	mutationTools?: string[];
 	toolAvailabilityError?: string;
 	mutationEvidence?: TrackedMutationEvidence;
+	retainedMutation?: RetainedMutationProvenance;
 }
 
 export interface CompletionMutationGuardResult {
@@ -247,7 +248,7 @@ export function evaluateCompletionMutationGuard(input: CompletionMutationGuardIn
 	return {
 		expectedMutation,
 		attemptedMutation,
-		triggered: expectedMutation && !attemptedMutation && !noEditChallengeComplete,
+		triggered: expectedMutation && !attemptedMutation && !input.retainedMutation && !noEditChallengeComplete,
 		blocked: false,
 	};
 }

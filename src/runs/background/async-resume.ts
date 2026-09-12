@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { DIRS, type AcceptanceInput, type AsyncStatus, type SteeringRecoveryDescriptor, type SubagentRunMode } from "../../shared/types.ts";
+import { DIRS, type AcceptanceInput, type AsyncStatus, type RetainedMutationIdentity, type RetainedMutationProvenance, type SteeringRecoveryDescriptor, type SubagentRunMode } from "../../shared/types.ts";
 import type { AgentConfig } from "../../agents/agents.ts";
 import { normalizeExtensionBindings } from "../shared/extension-bindings.ts";
 import { normalizeWorkflowLaneMetadata } from "../shared/lane-metadata.ts";
@@ -11,11 +11,12 @@ import { validateRunFanoutBudgetDescriptor } from "../shared/run-fanout-budget.t
 import { reconcileAsyncRun } from "./stale-run-reconciler.ts";
 import { resultFilePath, resultPayloadPathForIndexedRun } from "./result-files.ts";
 import { canScanAsyncRunPrefix, MIN_SAFE_ASYNC_RUN_PREFIX_LENGTH } from "./run-id-query.ts";
-import { parallelHandoffPath, resolveRetainedWorktreeCwd } from "../shared/parallel-handoff.ts";
+import { parallelHandoffPath, resolveRetainedWorktreeAllocation } from "../shared/parallel-handoff.ts";
 import { normalizeWorktreeBaseRef } from "../shared/worktree.ts";
 import { intersectThinkingCeilings, parseThinkingLevel, type ThinkingLevel } from "../../shared/thinking-ceiling.ts";
 import { assertWorkflowGraphHostSteps } from "../shared/host-step-status.ts";
 import { validateModelResponseAliases } from "../../shared/model-response-aliases.ts";
+import { canonicalSessionFilePath, parseRetainedMutationProvenance } from "../shared/session-lease.ts";
 
 export interface AsyncResumeParams {
 	id?: string;
@@ -47,7 +48,7 @@ export type AsyncResumeTarget = {
 	sessionName?: string;
 	index: number;
 	cwd?: string;
-	/** True when cwd is the retained managed worktree recorded by the handoff. */
+	/** True when cwd is the retained managed worktree independently confirmed by its allocator handoff. */
 	managedWorktree?: boolean;
 	sessionFile?: string;
 	model?: string;
@@ -58,6 +59,7 @@ export type AsyncResumeTarget = {
 	launchContractDigest?: string;
 	runner?: NonNullable<AsyncStatus["steps"]>[number]["runner"];
 	externalJob?: NonNullable<AsyncStatus["steps"]>[number]["externalJob"];
+	retainedMutation?: RetainedMutationProvenance;
 };
 
 interface AsyncResultFile {
@@ -75,7 +77,7 @@ interface AsyncResultFile {
 	thinking?: string;
 	launchContractDigest?: string;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
-	results?: Array<{ agent?: string; sessionName?: string; success?: boolean; sessionFile?: string; intercomTarget?: string; model?: string; thinking?: string; launchContractDigest?: string; capabilityCeiling?: ResolvedSubagentCapabilityCeiling }>;
+	results?: Array<{ agent?: string; sessionName?: string; success?: boolean; sessionFile?: string; intercomTarget?: string; model?: string; thinking?: string; launchContractDigest?: string; capabilityCeiling?: ResolvedSubagentCapabilityCeiling; currentRunProvenance?: RetainedMutationProvenance }>;
 }
 
 export interface AsyncRunLocation {
@@ -119,8 +121,11 @@ function validateResultFile(value: unknown, resultPath: string): AsyncResultFile
 			const launchContractDigest = validateOptionalString(child, "launchContractDigest", resultPath, `results[${index}].launchContractDigest`);
 			const capabilityCeiling = child.capabilityCeiling === undefined ? undefined : parseSubagentCapabilityCeiling(child.capabilityCeiling, `async result file '${resultPath}' results[${index}].capabilityCeiling`);
 			const success = child.success;
+			const effects = child.effects && typeof child.effects === "object" && !Array.isArray(child.effects) ? child.effects as Record<string, unknown> : undefined;
+			const fileMutation = effects?.fileMutation && typeof effects.fileMutation === "object" && !Array.isArray(effects.fileMutation) ? effects.fileMutation as Record<string, unknown> : undefined;
+			const currentRunProvenance = parseRetainedMutationProvenance(fileMutation?.currentRunProvenance);
 			if (success !== undefined && typeof success !== "boolean") throw new Error(`Invalid async result file '${resultPath}': results[${index}].success must be a boolean.`);
-			return { agent, sessionName, sessionFile, intercomTarget, model, thinking, launchContractDigest, ...(capabilityCeiling ? { capabilityCeiling } : {}), ...(typeof success === "boolean" ? { success } : {}) };
+			return { agent, sessionName, sessionFile, intercomTarget, model, thinking, launchContractDigest, ...(capabilityCeiling ? { capabilityCeiling } : {}), ...(currentRunProvenance ? { currentRunProvenance } : {}), ...(typeof success === "boolean" ? { success } : {}) };
 		});
 	}
 	const success = data.success;
@@ -441,7 +446,7 @@ function validateResumeSessionFile(runId: string, sessionFile: string): string {
 	if (path.extname(sessionFile) !== ".jsonl") throw new Error(`Async run '${runId}' session file must be a .jsonl file: ${sessionFile}`);
 	const resolved = path.resolve(sessionFile);
 	if (!fs.existsSync(resolved)) throw new Error(`Async run '${runId}' session file does not exist: ${sessionFile}`);
-	return resolved;
+	return canonicalSessionFilePath(resolved);
 }
 
 function validateResumeCwd(runId: string, cwd: string | undefined): string | undefined {
@@ -452,7 +457,32 @@ function validateResumeCwd(runId: string, cwd: string | undefined): string | und
 	} catch (error) {
 		throw new Error(`Async run '${runId}' required cwd does not exist: ${cwd}`, { cause: error instanceof Error ? error : undefined });
 	}
-	return resolved;
+	return fs.realpathSync.native(resolved);
+}
+
+function retainedMutationForSelectedChild(input: {
+	provenance?: RetainedMutationProvenance;
+	runId: string;
+	index: number;
+	agent: string;
+	sessionFile?: string;
+	cwd?: string;
+	managedWorktree: RetainedMutationIdentity["managedWorktree"];
+}): RetainedMutationProvenance | undefined {
+	const provenance = input.provenance;
+	if (!provenance || !input.sessionFile || !input.cwd
+		|| provenance.runId !== input.runId
+		|| provenance.index !== input.index
+		|| provenance.agent !== input.agent
+		|| provenance.sessionFile !== input.sessionFile
+		|| provenance.cwd !== input.cwd) return undefined;
+	if (input.managedWorktree === null) {
+		if (provenance.managedWorktree !== null) return undefined;
+	} else if (!provenance.managedWorktree
+		|| provenance.managedWorktree.runId !== input.managedWorktree.runId
+		|| provenance.managedWorktree.index !== input.managedWorktree.index
+		|| provenance.managedWorktree.cwd !== input.managedWorktree.cwd) return undefined;
+	return provenance;
 }
 
 export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncResumeDeps = {}, options: AsyncResumeOptions = {}): AsyncResumeTarget {
@@ -567,10 +597,37 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 	const stepThinking = statusSteps[index]?.thinking ?? resultSteps[index]?.thinking ?? (stepCount === 1 ? result?.thinking : undefined);
 	const thinkingCeiling = statusSteps[index]?.thinkingCeiling ?? (stepCount === 1 ? recoveryDescriptor?.thinkingCeiling : undefined);
 	const capabilityCeiling = intersectSubagentCapabilityCeilings(status?.capabilityCeiling, statusSteps[index]?.capabilityCeiling, result?.capabilityCeiling, resultSteps[index]?.capabilityCeiling);
-	const managedWorktreeCwd = location.asyncDir
-		? resolveRetainedWorktreeCwd(parallelHandoffPath(location.asyncDir), runId, index)
+	const provenance = resultSteps[index]?.currentRunProvenance;
+	let managedWorktree = location.asyncDir
+		? resolveRetainedWorktreeAllocation(parallelHandoffPath(location.asyncDir), runId, index)
 		: undefined;
-	const resumeCwd = validateResumeCwd(runId, managedWorktreeCwd ?? status?.cwd ?? result?.cwd ?? recoveryDescriptor?.cwd);
+	if (!managedWorktree && provenance?.managedWorktree) {
+		let allocatorRunId: string | undefined;
+		try {
+			allocatorRunId = assertRunId(provenance.managedWorktree.runId, "runId");
+		} catch {
+			// Invalid provenance grants no exemption.
+		}
+		if (allocatorRunId) {
+			const allocatorDir = path.join(path.resolve(asyncDirRoot), allocatorRunId);
+			assertInsideRoot(asyncDirRoot, allocatorDir, "Managed worktree allocator directory");
+			managedWorktree = resolveRetainedWorktreeAllocation(
+				parallelHandoffPath(allocatorDir),
+				allocatorRunId,
+				provenance.managedWorktree.index,
+			);
+		}
+	}
+	const resumeCwd = validateResumeCwd(runId, managedWorktree?.cwd ?? status?.cwd ?? result?.cwd ?? recoveryDescriptor?.cwd);
+	const retainedMutation = retainedMutationForSelectedChild({
+		provenance,
+		runId,
+		index,
+		agent,
+		sessionFile: resolvedSessionFile,
+		cwd: resumeCwd,
+		managedWorktree: managedWorktree ?? null,
+	});
 
 	return {
 		kind: "revive",
@@ -582,7 +639,7 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 		...(statusSteps[index]?.sessionName ?? resultSteps[index]?.sessionName ? { sessionName: statusSteps[index]?.sessionName ?? resultSteps[index]?.sessionName } : {}),
 		index,
 		...(resumeCwd ? { cwd: resumeCwd } : {}),
-		...(managedWorktreeCwd ? { managedWorktree: true } : {}),
+		...(managedWorktree ? { managedWorktree: true } : {}),
 		...(resolvedSessionFile ? { sessionFile: resolvedSessionFile } : {}),
 		...(stepModel ? { model: stepModel } : {}),
 		...(stepThinking ? { thinking: stepThinking } : {}),
@@ -592,6 +649,7 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 		...(capabilityCeiling ? { capabilityCeiling } : {}),
 		...(thinkingCeiling ? { thinkingCeiling } : {}),
 		...(recoveryDescriptor ? { recoveryDescriptor } : {}),
+		...(retainedMutation ? { retainedMutation } : {}),
 	};
 }
 

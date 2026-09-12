@@ -55,6 +55,8 @@ import {
 	type NestedRunSummary,
 	type ResolvedControlConfig,
 	type ResolvedToolBudget,
+	type RetainedMutationIdentity,
+	type RetainedMutationProvenance,
 	type RunFanoutBudgetDescriptor,
 	type SubagentRunMode,
 	type SubagentOutputState,
@@ -160,7 +162,7 @@ import { effectiveToolTimeoutMs, formatToolTimeoutMessage, toolTimeoutCallKey } 
 import { usageBudgetExceededMessage, usageBudgetState } from "../shared/usage-budget.ts";
 import { formatParallelHandoffError, formatParallelHandoffReference, parallelHandoffPath, writeParallelHandoffGroup, writeWorktreeSetupHandoff } from "../shared/parallel-handoff.ts";
 import { resolveWatchdogConfig } from "../../watchdog/settings.ts";
-import { acquireSessionLease, type SessionLeaseRequest } from "../shared/session-lease.ts";
+import { acquireSessionLease, advanceRetainedMutationHead, canonicalSessionFilePath, initializeRetainedMutationHead, parseRetainedMutationProvenance, type SessionLeaseRequest } from "../shared/session-lease.ts";
 import { buildExternalCliPrompt, runExternalCli } from "../shared/external-cli-runner.ts";
 import { resolveClaudeCodeLaunch } from "../shared/claude-code-adapter.ts";
 import { resolveCodexExecLaunch } from "../shared/codex-exec-adapter.ts";
@@ -227,6 +229,7 @@ interface SubagentRunConfig {
 	toolBudget?: ResolvedToolBudget;
 	usageBudget?: UsageBudgetConfig;
 	revivalLease?: SessionLeaseRequest;
+	retainedMutation?: RetainedMutationProvenance;
 	revivalLeaseToken?: string;
 	/** Global cap on simultaneously-running subagent tasks within this run. */
 	globalConcurrencyLimit?: number;
@@ -706,7 +709,34 @@ interface SingleStepContext {
 	usageBudget?: UsageBudgetConfig;
 	/** False when sibling work in the same Git worktree could have caused the tracked diff. */
 	trackedMutationEvidenceForCompletionGuard?: boolean;
+	retainedMutation?: RetainedMutationProvenance;
+	managedWorktree?: RetainedMutationIdentity["managedWorktree"];
 	orcaProgressTab?: OrcaProgressTab;
+}
+
+function currentMutationProvenance(input: {
+	attempted: boolean;
+	runId: string;
+	index: number;
+	agent: string;
+	sessionFile?: string;
+	cwd: string;
+	managedWorktree?: RetainedMutationIdentity["managedWorktree"];
+}): RetainedMutationProvenance | undefined {
+	if (!input.attempted || !input.sessionFile) return undefined;
+	try {
+		return parseRetainedMutationProvenance({
+			version: 1,
+			runId: input.runId,
+			index: input.index,
+			agent: input.agent,
+			sessionFile: canonicalSessionFilePath(input.sessionFile),
+			cwd: fs.realpathSync.native(input.cwd),
+			managedWorktree: input.managedWorktree ?? null,
+		});
+	} catch {
+		return undefined;
+	}
 }
 
 /** Run a single pi agent step, returning output and metadata */
@@ -1033,6 +1063,7 @@ export async function runSingleStepInner(
 	let finalRequiredOutputMissing: boolean | undefined;
 	const eventsPath = path.join(path.dirname(ctx.outputFile), "events.jsonl");
 	let finalResult: RunChildSessionResult | undefined;
+	let cumulativeMutationAttemptObserved = false;
 	let finalOutputSnapshot: SingleOutputSnapshot | undefined;
 	let structuredAcceptanceReport: unknown;
 	let structuredAcceptanceReportError: string | undefined;
@@ -1281,9 +1312,11 @@ export async function runSingleStepInner(
 				mutationTools: step.mutationTools,
 				toolAvailabilityError,
 				mutationEvidence: completionMutationEvidence,
+				retainedMutation: ctx.retainedMutation,
 			}))
 			: undefined;
-		const mutationAttemptObserved = run.observedMutationAttempt === true || completionMutationEvidence?.attemptedMutation === true;
+		cumulativeMutationAttemptObserved ||= run.observedMutationAttempt === true || completionMutationEvidence?.attemptedMutation === true;
+		const mutationAttemptObserved = cumulativeMutationAttemptObserved;
 		let arbitration = { triggered: completionGuard?.triggered === true && !mutationAttemptObserved, rescued: false };
 		if (arbitration.triggered) {
 			const modelContext = launch.capture.completionIntentContext?.();
@@ -1304,7 +1337,17 @@ export async function runSingleStepInner(
 			implementationMutationExpected: expectsImplementationMutation(step.agent, taskForCompletionGuard),
 			mutationAttemptObserved,
 			mutationEvidence: completionMutationEvidence,
+			retainedMutation: ctx.retainedMutation,
 			agentContractEnabled: isAgentContract(step.agentContract),
+		});
+		const currentRunProvenance = currentMutationProvenance({
+			attempted: mutationAttemptObserved,
+			runId: ctx.id,
+			index: ctx.flatIndex,
+			agent: step.agent,
+			sessionFile: run.sessionFile,
+			cwd: step.cwd ?? ctx.cwd,
+			managedWorktree: ctx.managedWorktree,
 		});
 		const finalOutputHasPersistableFileContent = run.exitCode === 0 && !run.error && !emptyOutputError && Boolean(stripAcceptanceReport(run.finalOutput).trim());
 		const requiredOutput = step.outputMode === "file-only" && step.outputPath
@@ -1358,7 +1401,11 @@ export async function runSingleStepInner(
 			requiredOutput,
 			afterCompactionSettlement: run.afterCompactionSettlement === true,
 		});
-		const fileMutationEffect = completionEvidence.fileMutation ?? (missingRequiredOutputAfterMutation ? { status: "observed" as const, expected: completionEvidence.mutationExpected, attempted: true, evidence: mutationEvidence } : undefined);
+		const fileMutationEffect = completionEvidence.fileMutation
+			? { ...completionEvidence.fileMutation, ...(currentRunProvenance ? { currentRunProvenance } : {}) }
+			: currentRunProvenance || missingRequiredOutputAfterMutation
+				? { status: "observed" as const, expected: completionEvidence.mutationExpected, attempted: true, evidence: mutationEvidence, ...(currentRunProvenance ? { currentRunProvenance } : {}) }
+				: undefined;
 		finalResult = { ...run, exitCode: effectiveExitCode, model: candidate ?? run.model, error, structuredOutput, runtimeAcknowledgedExtensions, ...(step.agentContract ? { agentContract: step.agentContract } : {}), ...(fileMutationEffect || settlementDiagnostic ? { effects: { ...(fileMutationEffect ? { fileMutation: fileMutationEffect } : {}), ...(settlementDiagnostic ? { settlementDiagnostic } : {}) } } : {}) } as RunChildSessionResult;
 		const abortRecovery = !attempt.success ? planAbortRecovery({
 			messages: run.messages,
@@ -1595,7 +1642,7 @@ export async function runSingleStepInner(
 		outputState,
 		exitCode: effectiveFinalExitCode,
 		error: effectiveFinalError,
-		sessionFile: step.sessionFile,
+		sessionFile: finalResult?.sessionFile ?? step.sessionFile,
 		intercomTarget: ctx.childIntercomTarget,
 		model: finalResult?.model,
 		thinking: resolveEffectiveThinking(finalResult?.model, step.thinking),
@@ -1627,6 +1674,8 @@ export async function runSingleStepInner(
 		launchResolvedExtensions,
 		...((finalResult as (RunChildSessionResult & { runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensions }) | undefined)?.runtimeAcknowledgedExtensions ? { runtimeAcknowledgedExtensions: (finalResult as RunChildSessionResult & { runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensions }).runtimeAcknowledgedExtensions } : {}),
 	});
+	const provenance = result.effects?.fileMutation?.currentRunProvenance;
+	if (provenance) initializeRetainedMutationHead(provenance);
 	return isAgentContract(step.agentContract) ? attachContractProjections(result as unknown as import("../../shared/types.ts").SingleResult) as unknown as typeof result : result;
 }
 
@@ -4096,6 +4145,7 @@ export async function runSubagent(
 							nestedRoute: config.nestedRoute,
 							capabilityCeiling: config.capabilityCeiling,
 							runFanoutBudget: config.runFanoutBudget,
+							managedWorktree: worktreeSetup ? { runId: id, index: fi, cwd: taskCwd } : undefined,
 							registerInterrupt: (interrupt) => registerStepInterrupt(fi, interrupt),
 							registerTimeout: (interrupt) => registerStepTimeout(fi, interrupt),
 							registerStop: (stop) => registerStepStop(fi, stop),
@@ -4115,8 +4165,8 @@ export async function runSubagent(
 							usageBudget: config.usageBudget,
 							orcaProgressTab,
 						}), config.deadlineAt);
-						if (task.sessionFile) {
-							latestSessionFile = task.sessionFile;
+						if (singleResult.sessionFile) {
+							latestSessionFile = singleResult.sessionFile;
 						}
 
 						const taskEndTime = Date.now();
@@ -4496,6 +4546,10 @@ export async function runSubagent(
 				nestedRoute: config.nestedRoute,
 				capabilityCeiling: config.capabilityCeiling,
 				runFanoutBudget: config.runFanoutBudget,
+				retainedMutation: flatIndex === 0 ? config.retainedMutation : undefined,
+				managedWorktree: singleWorktreeSetup
+					? { runId: id, index: flatIndex, cwd: singleCwd }
+					: flatIndex === 0 ? config.retainedMutation?.managedWorktree : undefined,
 				registerInterrupt: (interrupt) => registerStepInterrupt(flatIndex, interrupt),
 				registerTimeout: (interrupt) => registerStepTimeout(flatIndex, interrupt),
 				registerStop: (stop) => registerStepStop(flatIndex, stop),
@@ -4518,8 +4572,8 @@ export async function runSubagent(
 				if (singleWorktreeSetup) await cleanupRemainingWorktree(singleWorktreeSetup, stepIndex, flatIndex);
 				throw error;
 			}
-			if (seqStep.sessionFile) {
-				latestSessionFile = seqStep.sessionFile;
+			if (singleResult.sessionFile) {
+				latestSessionFile = singleResult.sessionFile;
 			}
 
 			previousOutput = singleResult.output;
@@ -5118,6 +5172,16 @@ async function runConfiguredSubagent(config: SubagentRunConfig): Promise<void> {
 					// Startup control cleanup is best effort after the parent commits the run.
 				}
 			}
+			const retainedStep = flattenSteps(config.steps);
+			if (retainedStep.length !== 1 || !retainedStep[0]) throw new Error(`Retained run '${config.id}' must contain exactly one child step.`);
+			config.retainedMutation = advanceRetainedMutationHead(lease, config.retainedMutation, {
+				runId: config.id,
+				index: 0,
+				agent: retainedStep[0].agent,
+				sessionFile: lease.owner.canonicalSessionFile,
+				cwd: fs.realpathSync.native(config.cwd),
+				managedWorktree: config.retainedMutation?.managedWorktree ?? null,
+			});
 		}
 		const childSessions = await loadRunnerChildSessionFactory(config);
 		try {

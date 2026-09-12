@@ -1,3 +1,4 @@
+import { parse } from "acorn";
 import type { ResolvedControlConfig } from "../../shared/types.ts";
 
 interface LongRunningNoticeMetrics {
@@ -141,10 +142,40 @@ export function isMutatingBashCommand(command: string): boolean {
 		|| MUTATING_BASH_PATTERNS.some((pattern) => pattern.test(command));
 }
 
+function execInvokesApplyPatch(code: unknown): boolean {
+	if (typeof code !== "string" || !code.includes("tools") || !code.includes("apply_patch")) return false;
+	let root: unknown;
+	try {
+		root = parse(code, { ecmaVersion: "latest", allowAwaitOutsideFunction: true });
+	} catch {
+		return false;
+	}
+	const pending = [root];
+	while (pending.length > 0) {
+		const node = pending.pop();
+		if (!node || typeof node !== "object") continue;
+		const record = node as Record<string, unknown>;
+		const callee = record.type === "CallExpression" && record.callee && typeof record.callee === "object"
+			? record.callee as Record<string, unknown>
+			: undefined;
+		const object = callee?.object && typeof callee.object === "object" ? callee.object as Record<string, unknown> : undefined;
+		const property = callee?.property && typeof callee.property === "object" ? callee.property as Record<string, unknown> : undefined;
+		if (callee?.type === "MemberExpression"
+			&& callee.computed === false
+			&& object?.type === "Identifier"
+			&& object.name === "tools"
+			&& property?.type === "Identifier"
+			&& property.name === "apply_patch") return true;
+		pending.push(...Object.values(record).flatMap((value) => Array.isArray(value) ? value : [value]));
+	}
+	return false;
+}
+
 export function isMutatingTool(toolName: string | undefined, args: Record<string, unknown> | undefined, mutationTools?: readonly string[]): boolean {
 	if (!toolName) return false;
 	if (mutationTools?.includes(toolName)) return true;
 	if (toolName === "edit" || toolName === "write" || toolName === "apply_patch") return true;
+	if (toolName === "exec") return execInvokesApplyPatch(args?.code);
 	if (toolName === "cursor") {
 		const activityTitle = typeof args?.activityTitle === "string" ? args.activityTitle : "";
 		return /^Cursor (?:edit|write)\b/i.test(activityTitle);

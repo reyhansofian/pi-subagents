@@ -1,11 +1,19 @@
 import assert from "node:assert/strict";
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
-import { acquireSessionLease, canonicalSessionFilePath, SessionLeaseConflictError, sessionLeaseDir } from "../../src/runs/shared/session-lease.ts";
+import {
+	acquireSessionLease,
+	advanceRetainedMutationHead,
+	canonicalSessionFilePath,
+	initializeRetainedMutationHead,
+	readRetainedMutationHead,
+	SessionLeaseConflictError,
+	sessionLeaseDir,
+} from "../../src/runs/shared/session-lease.ts";
 
 function fixture(prefix: string): { root: string; leases: string; sessionFile: string } {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -78,6 +86,116 @@ async function waitForPidExit(pid: number, timeoutMs = 10_000): Promise<void> {
 }
 
 describe("session revival leases", () => {
+	it("consumes retained mutation provenance once while holding the revival lease", () => {
+		const { root, leases, sessionFile } = fixture("pi-session-mutation-head-");
+		try {
+			const canonicalSessionFile = canonicalSessionFilePath(sessionFile);
+			const source = {
+				version: 1 as const,
+				runId: "source-run",
+				index: 2,
+				agent: "worker",
+				sessionFile: canonicalSessionFile,
+				cwd: fs.realpathSync.native(root),
+				managedWorktree: null,
+			};
+			assert.equal(initializeRetainedMutationHead(source), true);
+			const lease = acquireSessionLease(request(sessionFile, "continuation-run"), { rootDir: leases });
+			const { version: _version, ...sourceIdentity } = source;
+			const current = { ...sourceIdentity, runId: "continuation-run", index: 0 };
+			assert.deepEqual(advanceRetainedMutationHead(lease, source, current), source);
+			assert.deepEqual(readRetainedMutationHead(sessionFile), current);
+			lease.release();
+
+			const replayLease = acquireSessionLease(request(sessionFile, "replay-run"), { rootDir: leases });
+			const replay = { ...sourceIdentity, runId: "replay-run", index: 0 };
+			assert.equal(advanceRetainedMutationHead(replayLease, source, replay), undefined);
+			assert.deepEqual(readRetainedMutationHead(sessionFile), replay);
+			replayLease.release();
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a retained managed-allocation mismatch and advances the head fail closed", () => {
+		const { root, leases, sessionFile } = fixture("pi-session-managed-mutation-head-");
+		try {
+			const managed = path.join(root, "managed");
+			const other = path.join(root, "other");
+			fs.mkdirSync(managed);
+			fs.mkdirSync(other);
+			const source = {
+				version: 1 as const,
+				runId: "source-run",
+				index: 0,
+				agent: "worker",
+				sessionFile: canonicalSessionFilePath(sessionFile),
+				cwd: fs.realpathSync.native(managed),
+				managedWorktree: { runId: "source-run", index: 0, cwd: fs.realpathSync.native(managed) },
+			};
+			initializeRetainedMutationHead(source);
+			const lease = acquireSessionLease(request(sessionFile, "continuation-run"), { rootDir: leases });
+			const mismatched = { ...source, managedWorktree: { ...source.managedWorktree, cwd: fs.realpathSync.native(other) } };
+			assert.equal(advanceRetainedMutationHead(lease, mismatched, {
+				runId: "continuation-run",
+				index: 0,
+				agent: "worker",
+				sessionFile: source.sessionFile,
+				cwd: source.cwd,
+				managedWorktree: mismatched.managedWorktree,
+			}), undefined);
+			assert.equal(readRetainedMutationHead(sessionFile)?.managedWorktree, null);
+			lease.release();
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("publishes the mutation head without replacing a competing initializer", () => {
+		const { root, sessionFile } = fixture("pi-session-mutation-head-race-");
+		try {
+			const canonicalSessionFile = canonicalSessionFilePath(sessionFile);
+			const winner = {
+				version: 1, runId: "winner-run", index: 0, agent: "worker",
+				sessionFile: canonicalSessionFile, cwd: fs.realpathSync.native(root), managedWorktree: null,
+			};
+			const contender = { ...winner, runId: "contender-run" };
+			const scriptPath = path.join(root, "compete.mjs");
+			const modulePath = fileURLToPath(new URL("../../src/runs/shared/session-lease.ts", import.meta.url));
+			fs.writeFileSync(scriptPath, `
+				import fs from "node:fs";
+				import { syncBuiltinESMExports } from "node:module";
+				const headPath = ${JSON.stringify(`${canonicalSessionFile}.mutation-head.json`)};
+				const winner = ${JSON.stringify(winner)};
+				const contender = ${JSON.stringify(contender)};
+				const originalExists = fs.existsSync;
+				const originalWrite = fs.writeFileSync;
+				const publishWinner = () => originalWrite(headPath, JSON.stringify({ version: 1, identity: { ...winner, version: undefined } }), { encoding: "utf-8", mode: 0o600 });
+				fs.existsSync = (candidate) => {
+					if (candidate !== headPath) return originalExists(candidate);
+					if (!originalExists(headPath)) publishWinner();
+					return false;
+				};
+				fs.writeFileSync = (candidate, data, options) => {
+					if (candidate === headPath && options?.flag === "wx" && !originalExists(headPath)) publishWinner();
+					return originalWrite(candidate, data, options);
+				};
+				syncBuiltinESMExports();
+				const lease = await import(${JSON.stringify(modulePath)});
+				const accepted = lease.initializeRetainedMutationHead(contender);
+				process.stdout.write(JSON.stringify({ accepted, head: lease.readRetainedMutationHead(contender.sessionFile) }));
+			`, "utf-8");
+
+			const raced = spawnSync(process.execPath, ["--experimental-strip-types", scriptPath], { encoding: "utf-8" });
+			assert.equal(raced.status, 0, raced.stderr);
+			const { version: _version, ...winnerIdentity } = winner;
+			assert.deepEqual(JSON.parse(raced.stdout), { accepted: false, head: winnerIdentity });
+			assert.equal(initializeRetainedMutationHead(winner), true);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("allows one owner and reports its run metadata on contention", () => {
 		const { root, leases, sessionFile } = fixture("pi-session-lease-owner-");
 		try {

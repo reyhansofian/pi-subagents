@@ -538,6 +538,31 @@ test("failed apply_patch tool calls count as mutation attempts", () => {
 	});
 });
 
+test("exec counts only syntactic noncomputed tools.apply_patch calls", () => {
+	for (const code of [
+		"tools.apply_patch(patch)",
+		"await tools.apply_patch(patch)",
+		"text(await tools.apply_patch(patch))",
+		"async function apply() { return tools.apply_patch(patch); }",
+	]) {
+		assert.equal(isMutatingTool("exec", { code }), true, code);
+	}
+
+	for (const code of [
+		"await tools.read({ path: 'src/file.ts' })",
+		"'tools.apply_patch(patch)'",
+		"// tools.apply_patch(patch)\nawait tools.read({ path: 'src/file.ts' })",
+		"/tools\\.apply_patch\\(patch\\)/",
+		"tools.apply_patch",
+		"tools['apply_patch'](patch)",
+		"other.apply_patch(patch)",
+		"tools.apply_patch(",
+	]) {
+		assert.equal(isMutatingTool("exec", { code }), false, code);
+	}
+	assert.equal(isMutatingTool("exec", { code: 42 }), false);
+});
+
 test("obvious mutating bash commands count as mutation attempts", () => {
 	assert.equal(hasMutationToolCall([assistantToolCall("bash", { command: "mkdir -p src && cat > src/file.ts <<'EOF'\nhi\nEOF" })]), true);
 	assert.equal(hasMutationToolCall([assistantToolCall("bash", { command: "cat <<'EOF' > src/file.ts\nhi\nEOF" })]), true);

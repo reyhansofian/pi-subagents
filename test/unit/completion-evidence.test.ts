@@ -14,6 +14,16 @@ const evidence = {
 	attemptedMutation: false,
 };
 
+const retainedMutation = {
+	version: 1 as const,
+	runId: "source-run",
+	index: 0,
+	agent: "worker",
+	sessionFile: "/tmp/session.jsonl",
+	cwd: "/tmp/worktree",
+	managedWorktree: null,
+};
+
 describe("planCompletionEvidence", () => {
 	it("fails closed when expected mutation evidence is missing", () => {
 		const plan = planCompletionEvidence({
@@ -107,6 +117,28 @@ describe("planCompletionEvidence", () => {
 		});
 		assert.equal(plan.mutationExpected, true);
 		assert.equal(plan.fileMutation, undefined);
+	});
+
+	it("attributes a one-hop retained exemption without claiming a current mutation", () => {
+		const plan = planCompletionEvidence({
+			guard: { expectedMutation: true, attemptedMutation: false, triggered: false, blocked: false },
+			retainedMutation,
+			completionGuardEnabled: true,
+			mutationCapable: true,
+			implementationMutationExpected: true,
+			mutationAttemptObserved: false,
+			agentContractEnabled: false,
+		});
+
+		assert.equal(plan.mutationAttempted, false);
+		assert.equal(plan.legacyFailureError, undefined);
+		assert.deepEqual(plan.fileMutation, {
+			status: "observed",
+			expected: true,
+			attempted: false,
+			resolvedBy: "retained-predecessor",
+			predecessorRunId: "source-run",
+		});
 	});
 });
 
