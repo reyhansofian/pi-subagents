@@ -1,6 +1,6 @@
 import type { Message } from "@earendil-works/pi-ai";
 import type { AcceptanceRole, RetainedMutationProvenance, TrackedMutationEvidence } from "../../shared/types.ts";
-import { isMutatingTool } from "./long-running-guard.ts";
+import { hasCodeModeMutationAttempt, isMutatingTool } from "./long-running-guard.ts";
 import { classifyTaskMutationIntent, expectsImplementationMutation, taskMayMutate } from "./task-intent.ts";
 
 export { expectsImplementationMutation };
@@ -134,6 +134,7 @@ function hasCheckpointMutationEvidence(message: Message): boolean {
 export function hasMutationToolCall(messages: Message[], mutationTools?: readonly string[]): boolean {
 	for (const message of messages) {
 		if (hasCheckpointMutationEvidence(message)) return true;
+		if (message.role === "toolResult" && hasCodeModeMutationAttempt((message as unknown as { details?: unknown }).details, mutationTools)) return true;
 		if (message.role !== "assistant") continue;
 		for (const part of message.content) {
 			if (part.type === "thinking" && CURSOR_FILE_MUTATION_THINKING.test(part.thinking)) return true;

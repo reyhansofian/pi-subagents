@@ -87,6 +87,7 @@ import {
 import {
 	createMutatingFailureState,
 	didMutatingToolFail,
+	hasCodeModeMutationAttempt,
 	isMutatingTool,
 	nextLongRunningTrigger,
 	recordMutatingFailure,
@@ -1043,6 +1044,12 @@ async function runSingleAttempt(
 			progress.durationMs = now - startTime;
 			progress.lastActivityAt = now;
 			updateActivityState(now);
+			const codeModeDetails = evt.type === "tool_execution_update"
+				? (evt.partialResult as { details?: unknown } | undefined)?.details
+				: evt.type === "tool_result_end"
+					? (evt.message as { details?: unknown } | undefined)?.details
+					: undefined;
+			observedMutationAttempt = observedMutationAttempt || hasCodeModeMutationAttempt(codeModeDetails, agent.mutationTools);
 
 			if (evt.type === "tool_execution_start") {
 				const toolArgs = evt.args && typeof evt.args === "object" && !Array.isArray(evt.args)

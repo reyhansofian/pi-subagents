@@ -20,7 +20,7 @@ import {
 } from "../../watchdog/child-status.ts";
 import { projectChildLifecycle, type ChildLifecycleAction, type ChildLifecycleState } from "../shared/child-lifecycle.ts";
 import { formatSubagentModelVerificationError } from "../shared/model-fallback.ts";
-import { isMutatingTool, resolveCurrentPath } from "../shared/long-running-guard.ts";
+import { hasCodeModeMutationAttempt, isMutatingTool, resolveCurrentPath } from "../shared/long-running-guard.ts";
 import { effectiveToolTimeoutMs, formatToolTimeoutMessage, toolTimeoutCallKey } from "../shared/tool-timeout.ts";
 import { createReportedChildSessionInput, type InProcessChildLaunch } from "../shared/child-launch.ts";
 import { projectChildSessionEventForJson, type ChildSession, type ChildSessionEvent, type ChildSessionFactory } from "../shared/child-session.ts";
@@ -57,6 +57,7 @@ export interface ChildEvent {
 	toolName?: string;
 	toolCallId?: string;
 	args?: Record<string, unknown>;
+	partialResult?: unknown;
 	willRetry?: unknown;
 }
 
@@ -437,6 +438,12 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 			}
 
 			input.onChildEvent?.(event);
+			const codeModeDetails = event.type === "tool_execution_update"
+				? (event.partialResult as { details?: unknown } | undefined)?.details
+				: event.type === "tool_result_end"
+					? (event.message as unknown as { details?: unknown } | undefined)?.details
+					: undefined;
+			observedMutationAttempt = observedMutationAttempt || hasCodeModeMutationAttempt(codeModeDetails, input.mutationTools);
 
 			if (event.type === "tool_execution_end") {
 				clearActiveToolTimeout(event);

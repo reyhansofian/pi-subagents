@@ -899,7 +899,7 @@ export default function() {
 			mockPi.onCall({
 				writeFiles: [{ path: "implemented.txt", content: "implemented\n" }],
 				jsonl: [
-					{ type: "tool_execution_start", toolCallId: "exec-1", toolName: "exec", args: { code: "text(await tools.apply_patch(patch))" } },
+					{ type: "tool_execution_update", toolCallId: "exec-1", toolName: "exec", partialResult: { details: { codeMode: true, status: "result", traces: [{ name: "apply_patch", status: "done" }] } } },
 					{ type: "tool_execution_end", toolCallId: "exec-1", toolName: "exec", result: "Applied patch successfully" },
 					events.assistantMessage("Implemented through nested exec apply_patch."),
 				],

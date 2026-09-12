@@ -9,7 +9,7 @@ import {
 	hasMutationToolCall,
 	validateImplementationToolContract,
 } from "../../src/runs/shared/completion-guard.ts";
-import { isMutatingTool } from "../../src/runs/shared/long-running-guard.ts";
+import { hasCodeModeMutationAttempt, isMutatingTool } from "../../src/runs/shared/long-running-guard.ts";
 
 function assistantToolCall(name: string, args: Record<string, unknown> = {}): Message {
 	return {
@@ -538,29 +538,27 @@ test("failed apply_patch tool calls count as mutation attempts", () => {
 	});
 });
 
-test("exec counts only syntactic noncomputed tools.apply_patch calls", () => {
-	for (const code of [
-		"tools.apply_patch(patch)",
-		"await tools.apply_patch(patch)",
-		"text(await tools.apply_patch(patch))",
-		"async function apply() { return tools.apply_patch(patch); }",
-	]) {
-		assert.equal(isMutatingTool("exec", { code }), true, code);
+test("runtime-marked Code Mode traces count only nested mutation attempts", () => {
+	const details = (traces: unknown[]) => ({ codeMode: true, status: "result", traces });
+	const patchDetails = details([{ name: "apply_patch", status: "done", input: "*** Begin Patch" }]);
+	assert.equal(hasCodeModeMutationAttempt(patchDetails), true);
+	assert.equal(evaluateCompletionMutationGuard({
+		agent: "worker", task: "Implement the approved fix", messages: [{ role: "toolResult", content: [], details: patchDetails } as unknown as Message],
+		tools: ["exec"], mutationEvidence: { source: "tracked-files", trackedOnly: true, attemptedMutation: false, changedFiles: [], unavailable: "not a Git worktree" },
+	}).triggered, false);
+	assert.equal(hasCodeModeMutationAttempt(details([{ name: "apply_patch", status: "failed", input: "malformed" }])), true);
+	assert.equal(hasCodeModeMutationAttempt(details([{ name: "replace", status: "done" }]), ["replace"]), true);
+	assert.equal(hasCodeModeMutationAttempt(details([{ name: "read", status: "done" }])), false);
+	assert.equal(hasCodeModeMutationAttempt(details([{ name: "exec", status: "done", input: "apply_patch(...)" }])), false);
+	assert.equal(hasCodeModeMutationAttempt({ traces: [{ name: "apply_patch" }] }), false);
+	assert.equal(hasCodeModeMutationAttempt({ codeMode: true, traces: "apply_patch" }), false);
+	assert.equal(hasCodeModeMutationAttempt({ codeMode: true, traces: [{ details: { name: "apply_patch" } }] }), false);
+	assert.equal(hasCodeModeMutationAttempt({ codeMode: true, traces: [{ name: "read", input: "apply_patch" }] }), false);
+	for (const role of ["user", "assistant"] as const) {
+		assert.equal(hasMutationToolCall([{ role, content: [], details: patchDetails } as unknown as Message]), false);
 	}
-
-	for (const code of [
-		"await tools.read({ path: 'src/file.ts' })",
-		"'tools.apply_patch(patch)'",
-		"// tools.apply_patch(patch)\nawait tools.read({ path: 'src/file.ts' })",
-		"/tools\\.apply_patch\\(patch\\)/",
-		"tools.apply_patch",
-		"tools['apply_patch'](patch)",
-		"other.apply_patch(patch)",
-		"tools.apply_patch(",
-	]) {
-		assert.equal(isMutatingTool("exec", { code }), false, code);
-	}
-	assert.equal(isMutatingTool("exec", { code: 42 }), false);
+	assert.equal(hasMutationToolCall([{ role: "toolResult", content: [], details: { codeMode: true, traces: [{ name: "read" }] } } as unknown as Message]), false);
+	assert.equal(hasMutationToolCall([{ role: "toolResult", content: [], details: "applied patch" } as unknown as Message]), false);
 });
 
 test("obvious mutating bash commands count as mutation attempts", () => {

@@ -1469,34 +1469,6 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		]);
 	});
 
-	it("foreground completion guard recognizes only mutation-bearing exec code", async () => {
-		mockPi.onCall({
-			jsonl: [
-				events.toolStart("exec", { code: "text(await tools.apply_patch(patch))" }),
-				events.toolEnd("exec"),
-				events.assistantMessage("Implemented through nested exec."),
-			],
-		});
-		const changed = await runSync(tempDir, [makeAgent("worker")], "worker", "Implement the approved file changes", {
-			runId: "foreground-exec-mutation",
-		});
-		assert.equal(changed.exitCode, 0);
-		assert.equal(changed.error, undefined);
-
-		mockPi.onCall({
-			jsonl: [
-				events.toolStart("exec", { code: "text(await tools.read({ path: 'src/index.ts' }))" }),
-				events.toolEnd("exec"),
-				events.assistantMessage("Read the source only."),
-			],
-		});
-		const readOnly = await runSync(tempDir, [makeAgent("worker")], "worker", "Implement the approved file changes", {
-			runId: "foreground-exec-read",
-		});
-		assert.equal(readOnly.exitCode, 1);
-		assert.match(readOnly.error ?? "", /completed without making edits/);
-	});
-
 	it("preserves terminal empty-output diagnostics after useful foreground work", async () => {
 		const partialOutput = "I’ll inspect the retained candidate before changing it.";
 		mockPi.onCall({
