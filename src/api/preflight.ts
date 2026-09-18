@@ -371,6 +371,7 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 			capabilityCeiling: effectiveCapabilityCeiling,
 			agentName: agent.name,
 			permissionRules,
+			extensionBindings,
 		});
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);

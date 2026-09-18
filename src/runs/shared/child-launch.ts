@@ -192,6 +192,7 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 		agentName: input.childAgentName,
 		permissionRules: input.permissionRules,
 		runtimeSnapshotHost: input.runtimeSnapshotHost,
+		extensionBindings: input.extensionBindings,
 	});
 
 	const inherited = input.inherited;

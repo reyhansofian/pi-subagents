@@ -98,16 +98,21 @@ export interface McpDirectToolResolution {
 	runtimeServerNames?: string[];
 }
 
+export interface McpDirectToolResolutionOverride {
+	config: McpConfig;
+	metadata: Record<string, ServerCacheEntry>;
+}
+
 export function resolveMcpDirectToolResolution(
 	mcpDirectTools: string[] | undefined,
 	cwd = process.cwd(),
 	runtimeSnapshotHost?: McpRuntimeSnapshotHost,
-	configOverride?: McpConfig,
+	override?: McpDirectToolResolutionOverride,
 ): McpDirectToolResolution {
 	const selectors = normalizeMcpDirectToolSelectors(mcpDirectTools);
 	if (selectors.length === 0) return { selections: [], unresolvedSelectors: [] };
 
-	const config = configOverride ?? loadMcpConfig(cwd);
+	const config = override ? mergeConfigs(loadMcpConfig(cwd), override.config) : loadMcpConfig(cwd);
 	const { servers: selectedServers, tools: selectedTools } = parseMcpDirectToolSelectors(selectors);
 	const runtimeSelectionServers = new Set([...selectedServers, ...selectedTools.keys()]);
 	const runtimeServers = resolveRuntimeMcpServers(config, runtimeSelectionServers, runtimeSnapshotHost);
@@ -118,12 +123,15 @@ export function resolveMcpDirectToolResolution(
 	const runtime = Object.keys(runtimeServers).length > 0
 		? { mcpConfig: resolvedConfig, runtimeServerNames: Object.keys(runtimeServers) }
 		: {};
-	const cache = loadMetadataCache();
+	// A lease-bound resolution is authoritative for its selected server and must
+	// never consult the owner-global metadata cache. Unbound calls retain the
+	// legacy persisted-cache path unchanged.
+	const cache = override ? { version: CACHE_VERSION, servers: override.metadata } : loadMetadataCache();
 	if (!cache) return { selections: [], unresolvedSelectors: selectors, ...runtime };
 	const validMetadata: Record<string, ServerCacheEntry> = {};
 	for (const [serverName, definition] of Object.entries(resolvedConfig.mcpServers)) {
 		const serverCache = cache.servers[serverName];
-		if (isServerCacheValid(serverCache, definition)) validMetadata[serverName] = serverCache;
+		if (serverCache && (override?.metadata[serverName] === serverCache || isServerCacheValid(serverCache, definition))) validMetadata[serverName] = serverCache;
 	}
 	const grant = planMcpDirectToolGrant({
 		selectors,
