@@ -528,6 +528,76 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(fs.readFileSync(outputPath, "utf-8"), "async full output\nwith details");
 	});
 
+	it("async runs.all preserves read-only file-only reports alongside structured output", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		const report = "scout report body";
+		const outputPath = path.join(tempDir, "scout-report.md");
+		mockPi.onCall({ output: report, structuredOutput: { ok: true } });
+		const state = { baseCwd: tempDir, currentSessionId: null, asyncJobs: new Map(), foregroundControls: new Map(), lastForegroundControlId: null };
+		const executor = createSubagentExecutor!({
+			pi: { events: createEventBus(), getSessionName: () => undefined },
+			state,
+			config: {},
+			asyncByDefault: false,
+			tempArtifactsDir: tempDir,
+			getSubagentSessionRoot: () => path.join(tempDir, "sessions"),
+			expandTilde: (p: string) => p,
+			discoverAgents: () => ({ agents: [makeAgent("scout", { acceptanceRole: "read-only", tools: ["read", "grep", "find", "ls"] })] }),
+		});
+		const launch = await executor.execute(
+			"async-runs-all-file-only",
+			{
+				workflowScript: `const [scout] = await runs.all([{ key: "scout", agent: "scout", task: "Inspect the repository", output: ${JSON.stringify(outputPath)}, outputMode: "file-only", outputSchema: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } }, acceptance: false }]); return { ok: scout.ok, outputReference: scout.outputReference };`,
+				async: true,
+			},
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		) as AsyncExecutionResult;
+
+		assert.equal(launch.isError, undefined);
+		assert.ok(launch.details.asyncId);
+		const payload = await readAsyncPayload(launch.details.asyncId);
+		const child = payload.results[0] as (typeof payload.results[number] & Record<string, unknown>) | undefined;
+		assert.equal(payload.success, true);
+		assert.equal(child?.success, true);
+		assert.deepEqual(child?.structuredOutput, { ok: true });
+		assert.equal(child?.outputReference, outputPath);
+		assert.equal(fs.readFileSync(outputPath, "utf-8"), report);
+	});
+
+	it("async workflow runs.all rejects structured-only foreground children without a report", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		const outputPath = path.join(tempDir, "workflow-structured-only-report.md");
+		mockPi.onCall({ structuredOutput: { ok: true } });
+		const state = { baseCwd: tempDir, currentSessionId: null, asyncJobs: new Map(), foregroundControls: new Map(), lastForegroundControlId: null };
+		const executor = createSubagentExecutor!({
+			pi: { events: createEventBus(), getSessionName: () => undefined },
+			state,
+			config: {},
+			asyncByDefault: false,
+			tempArtifactsDir: tempDir,
+			getSubagentSessionRoot: () => path.join(tempDir, "sessions"),
+			expandTilde: (p: string) => p,
+			discoverAgents: () => ({ agents: [makeAgent("scout", { acceptanceRole: "read-only", tools: ["read", "grep", "find", "ls"] })] }),
+		});
+		const launch = await executor.execute(
+			"async-runs-all-foreground-file-only",
+			{
+				workflowScript: `const [scout] = await runs.all([{ key: "scout", agent: "scout", task: "Inspect the repository", async: false, output: ${JSON.stringify(outputPath)}, outputMode: "file-only", outputSchema: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } }, acceptance: false }]); return { ok: scout.ok };`,
+				async: true,
+			},
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		) as AsyncExecutionResult;
+
+		assert.equal(launch.isError, undefined);
+		assert.ok(launch.details.asyncId);
+		const payload = await readAsyncPayload(launch.details.asyncId);
+		const child = payload.results[0];
+		assert.equal(child?.success, false);
+		assert.equal(fs.existsSync(outputPath), false);
+	});
+
 	it("removes Pi turn-timing telemetry from runtime-persisted background output", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		const report = "## Review\n\nVERDICT: FINDINGS";
 		const timingFooter = "\x1b[38;2;136;136;136m✻ Turn took 5m 54s (Total time 5m 54s · 2 turns)\x1b[0m";

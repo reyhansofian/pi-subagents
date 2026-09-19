@@ -1463,7 +1463,12 @@ async function runSingleAttempt(
 			? messages.slice(structuredOutputMessageStartIndex ?? messages.length)
 			: messages;
 		const errInfo = detectSubagentError(errorMessages);
-		const missingOutput = !finalText?.trim() && !validatedStructuredOutput;
+		const outputChanged = options.outputMode === "file-only" && options.outputPath
+			? hasSingleOutputChangedSinceSnapshot(options.outputPath, shared.outputSnapshot)
+			: undefined;
+		const missingOutput = options.outputMode === "file-only" && options.outputPath
+			? !finalText?.trim() && outputChanged !== true
+			: !finalText?.trim() && !validatedStructuredOutput;
 		const terminalEmptyAfterUsefulWork = !validatedStructuredOutput
 			&& hasEmptyTerminalAssistantResponse(messages)
 			&& (progress.toolCount > 0 || Boolean(finalText?.trim()));
@@ -1497,7 +1502,6 @@ async function runSingleAttempt(
 
 	const acceptanceOutput = getFinalOutput(result.messages ?? []);
 	let fullOutput = stripAcceptanceReport(acceptanceOutput);
-	if (!fullOutput.trim() && result.structuredOutput !== undefined) fullOutput = JSON.stringify(result.structuredOutput, null, 2);
 	result.outputState = fullOutput.trim() || result.structuredOutput !== undefined ? "present" : "absent";
 	if (result.timedOut) {
 		const timeoutMessage = formatTimeoutMessage(options.timeoutMs ?? 0);
