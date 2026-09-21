@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -21,6 +22,7 @@ import {
 } from "../../src/runs/shared/model-exclusions.ts";
 
 const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+const previousExclusionsPath = process.env.PI_MODEL_EXCLUSIONS_PATH;
 const testAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-model-exclusions-auth-"));
 
 function captureConsole(method: "error" | "warn", run: () => void): unknown[][] {
@@ -35,11 +37,11 @@ function captureConsole(method: "error" | "warn", run: () => void): unknown[][] 
 	return messages;
 }
 process.env.PI_CODING_AGENT_DIR = testAgentDir;
+delete process.env.PI_MODEL_EXCLUSIONS_PATH;
 const authPath = path.join(testAgentDir, "auth.json");
 
-// The exclusion store is a process-wide singleton persisted under TEMP_ROOT_DIR
-// (isolated per test run by test/support/isolated-temp-root.mjs). Clear it
-// before/after each test so cases don't leak state into each other.
+// The exclusion store is a process-wide singleton. Clear it before/after each
+// test so cases don't leak state into each other.
 beforeEach(() => {
 	setDefaultTTL(DEFAULT_MODEL_EXCLUSION_TTL_MS);
 	fs.rmSync(getExclusionsFilePath(), { force: true });
@@ -56,7 +58,82 @@ after(() => {
 	} else {
 		process.env.PI_CODING_AGENT_DIR = previousAgentDir;
 	}
+	if (previousExclusionsPath === undefined) {
+		delete process.env.PI_MODEL_EXCLUSIONS_PATH;
+	} else {
+		process.env.PI_MODEL_EXCLUSIONS_PATH = previousExclusionsPath;
+	}
 	fs.rmSync(testAgentDir, { recursive: true, force: true });
+});
+
+describe("model exclusions — storage scope", () => {
+	it("defaults to the active agent directory", () => {
+		assert.equal(getExclusionsFilePath(), path.join(testAgentDir, "model-exclusions.json"));
+	});
+
+	it("prefers a trimmed explicit path override", () => {
+		const override = path.join(testAgentDir, "custom-exclusions.json");
+		process.env.PI_MODEL_EXCLUSIONS_PATH = `  ${override}  `;
+		try {
+			assert.equal(getExclusionsFilePath(), override);
+		} finally {
+			delete process.env.PI_MODEL_EXCLUSIONS_PATH;
+		}
+	});
+
+	it("isolates default stores for distinct agent directories in separate processes", () => {
+		const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "pi-model-exclusions-scopes-"));
+		const tempRoot = path.join(fixture, "shared-temp");
+		const agentA = path.join(fixture, "agent-a");
+		const agentB = path.join(fixture, "agent-b");
+		const moduleUrl = new URL("../../src/runs/shared/model-exclusions.ts", import.meta.url).href;
+		const recordScript = `import { recordModelFailure } from ${JSON.stringify(moduleUrl)}; recordModelFailure({ provider: "terra", modelId: "terra-model" });`;
+		const readScript = `import { isExcluded, reloadFromDisk } from ${JSON.stringify(moduleUrl)}; reloadFromDisk(); console.log(JSON.stringify({ terra: isExcluded("terra-model", "terra") }));`;
+		const env = { ...process.env, PI_SUBAGENTS_TEMP_ROOT: tempRoot };
+		delete env.PI_MODEL_EXCLUSIONS_PATH;
+		try {
+			const recorded = spawnSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "--eval", recordScript], {
+				encoding: "utf-8",
+				env: { ...env, PI_CODING_AGENT_DIR: agentA },
+			});
+			assert.equal(recorded.status, 0, recorded.stderr);
+			const read = spawnSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "--eval", readScript], {
+				encoding: "utf-8",
+				env: { ...env, PI_CODING_AGENT_DIR: agentB },
+			});
+			assert.equal(read.status, 0, read.stderr);
+			assert.deepEqual(JSON.parse(read.stdout.trim()), { terra: false });
+			assert.equal(fs.existsSync(path.join(agentA, "model-exclusions.json")), true);
+			assert.equal(fs.existsSync(path.join(agentB, "model-exclusions.json")), false);
+		} finally {
+			fs.rmSync(fixture, { recursive: true, force: true });
+		}
+	});
+
+	it("ignores and does not migrate or delete the legacy temp-root store", () => {
+		const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "pi-model-exclusions-legacy-"));
+		const tempRoot = path.join(fixture, "shared-temp");
+		const agentDir = path.join(fixture, "agent");
+		const legacyPath = path.join(tempRoot, "model-exclusions.json");
+		fs.mkdirSync(tempRoot, { recursive: true });
+		fs.writeFileSync(legacyPath, JSON.stringify({
+			version: 1,
+			exclusions: [{ provider: "terra", modelId: "terra-model", recordedAt: Date.now(), expiresAt: Date.now() + 60_000 }],
+		}));
+		const moduleUrl = new URL("../../src/runs/shared/model-exclusions.ts", import.meta.url).href;
+		const script = `import { getExclusionsFilePath, isExcluded, reloadFromDisk } from ${JSON.stringify(moduleUrl)}; reloadFromDisk(); console.log(JSON.stringify({ path: getExclusionsFilePath(), terra: isExcluded("terra-model", "terra") }));`;
+		const env = { ...process.env, PI_CODING_AGENT_DIR: agentDir, PI_SUBAGENTS_TEMP_ROOT: tempRoot };
+		delete env.PI_MODEL_EXCLUSIONS_PATH;
+		try {
+			const result = spawnSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "--eval", script], { encoding: "utf-8", env });
+			assert.equal(result.status, 0, result.stderr);
+			assert.deepEqual(JSON.parse(result.stdout.trim()), { path: path.join(agentDir, "model-exclusions.json"), terra: false });
+			assert.equal(fs.existsSync(legacyPath), true);
+			assert.equal(fs.existsSync(path.join(agentDir, "model-exclusions.json")), false);
+		} finally {
+			fs.rmSync(fixture, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("model exclusions — record & query", () => {

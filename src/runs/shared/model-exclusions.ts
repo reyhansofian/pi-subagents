@@ -1,7 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { splitKnownThinkingSuffix } from "../../shared/model-info.ts";
-import { TEMP_ROOT_DIR } from "../../shared/types.ts";
 import { getAgentDir } from "../../shared/utils.ts";
 
 export const EXCLUSIONS_PATH_ENV = "PI_MODEL_EXCLUSIONS_PATH";
@@ -86,13 +85,13 @@ export function setDefaultTTL(ms: number, options?: { shortenExisting?: boolean 
 
 /**
  * Resolve the persistence path. Honors PI_MODEL_EXCLUSIONS_PATH; defaults to
- * <TEMP_ROOT_DIR>/model-exclusions.json. Resolved lazily so tests can point the
+ * <agentDir>/model-exclusions.json. Resolved lazily so tests can point the
  * store at an isolated location after module load.
  */
 export function getExclusionsFilePath(): string {
 	const envPath = process.env[EXCLUSIONS_PATH_ENV];
 	if (typeof envPath === "string" && envPath.trim()) return envPath.trim();
-	return path.join(TEMP_ROOT_DIR, "model-exclusions.json");
+	return path.join(getAgentDir(), "model-exclusions.json");
 }
 
 /**
