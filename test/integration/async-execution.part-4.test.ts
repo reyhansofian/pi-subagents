@@ -589,6 +589,48 @@ setTimeout(() => process.exit(90), 15000).unref();
 		});
 	});
 
+	it("background completion rejects inherited history without current-launch tool evidence", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const id = `async-required-tool-evidence-${Date.now().toString(36)}`;
+		mockPi.onCall({ jsonl: [
+			{ type: "message_end", message: { role: "toolResult", toolName: "read", isError: false, content: [{ type: "text", text: "result from a prior launch" }] } },
+			events.assistantMessage("Done without current-launch tools"),
+		] });
+		executeAsyncSingle(id, {
+			agent: "scout",
+			task: "Inspect the repository",
+			agentConfig: makeAgent("scout", { tools: ["read"], completionGuard: false }),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+			acceptance: { toolEvidence: ["read"] },
+		});
+
+		const payload = JSON.parse(fs.readFileSync(await waitForAsyncResultFile(id, 10_000), "utf-8")) as AsyncResultPayload;
+		assert.equal(payload.success, false);
+		assert.equal(payload.results[0]?.acceptance?.runtimeChecks[0]?.id, "required-tool-evidence");
+		assert.match(payload.results[0]?.error ?? "", /Expected at least one successful result from required tools: read/);
+		assert.match(payload.results[0]?.error ?? "", /Available launch tools: read/);
+
+		const acceptedId = `async-current-required-tool-evidence-${Date.now().toString(36)}`;
+		mockPi.onCall({ jsonl: [events.toolResult("read", "current launch result"), events.assistantMessage("Done with evidence")] });
+		executeAsyncSingle(acceptedId, {
+			agent: "scout",
+			task: "Inspect the repository",
+			agentConfig: makeAgent("scout", { tools: ["read"], completionGuard: false }),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+			acceptance: { toolEvidence: ["read"] },
+		});
+		const accepted = JSON.parse(fs.readFileSync(await waitForAsyncResultFile(acceptedId, 10_000), "utf-8")) as AsyncResultPayload;
+		assert.equal(accepted.success, true);
+		assert.equal(accepted.results[0]?.acceptance?.runtimeChecks[0]?.status, "passed");
+	});
+
 	it("background forced drain after final assistant output is cleanup success", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({
 			jsonl: [events.assistantMessage("async-done-before-drain")],

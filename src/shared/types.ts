@@ -1059,6 +1059,7 @@ export interface AcceptanceConfig {
 	report?: "on" | "off";
 	criteria?: Array<string | AcceptanceGate>;
 	evidence?: AcceptanceEvidenceKind[];
+	toolEvidence?: string[];
 	verify?: AcceptanceVerifyCommand[];
 	review?: AcceptanceReviewGate | false;
 	stopRules?: string[];
@@ -1081,6 +1082,7 @@ export interface ResolvedAcceptanceConfig {
 	inferredReason: string[];
 	criteria: ResolvedAcceptanceGate[];
 	evidence: AcceptanceEvidenceKind[];
+	toolEvidence: string[];
 	verify: AcceptanceVerifyCommand[];
 	review?: AcceptanceReviewGate | false;
 	stopRules: string[];

@@ -1581,6 +1581,34 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		assert.match(result.acceptance.runtimeChecks?.[0]?.message ?? "", /not-satisfied/);
 	});
 
+	it("required tool evidence rejects inherited history in AgentContract completion", async () => {
+		mockPi.onCall({ jsonl: [
+			{ type: "message_end", message: { role: "toolResult", toolName: "read", isError: false, content: [{ type: "text", text: "result from a prior launch" }] } },
+			events.assistantMessage("Done without current-launch tools"),
+		] });
+		const result = await runSync(tempDir, [makeAgent("scout", { tools: ["read"], completionGuard: false })], "scout", "Inspect the repository", {
+			runId: "v1-required-tool-evidence",
+			agentContract: { version: 1 },
+			acceptance: { toolEvidence: ["read"] },
+		});
+
+		assert.equal(result.exitCode, 1);
+		assert.equal(result.execution?.success, false);
+		assert.equal(result.acceptance?.status, "rejected");
+		assert.equal(result.acceptance?.runtimeChecks[0]?.id, "required-tool-evidence");
+		assert.match(result.error ?? "", /Expected at least one successful result from required tools: read/);
+		assert.match(result.error ?? "", /Available launch tools: read/);
+
+		mockPi.onCall({ jsonl: [events.toolResult("read", "current launch result"), events.assistantMessage("Done with evidence")] });
+		const accepted = await runSync(tempDir, [makeAgent("scout", { tools: ["read"], completionGuard: false })], "scout", "Inspect the repository", {
+			runId: "v1-current-required-tool-evidence",
+			agentContract: { version: 1 },
+			acceptance: { toolEvidence: ["read"] },
+		});
+		assert.equal(accepted.exitCode, 0, accepted.error);
+		assert.equal(accepted.acceptance?.runtimeChecks[0]?.status, "passed");
+	});
+
 	it("agent contract records explicit completion guard as an effect", async () => {
 		mockPi.onCall({ output: "Plan only" });
 		const agents = [makeAgent("worker", { tools: ["read", "write"], completionGuard: true })];

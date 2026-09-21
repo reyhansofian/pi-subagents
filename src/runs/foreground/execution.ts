@@ -118,6 +118,7 @@ import { childSessionFactory, projectChildSessionEventForJson, type ChildSession
 
 const artifactOutputByResult = new WeakMap<SingleResult, string>();
 const acceptanceOutputByResult = new WeakMap<SingleResult, string>();
+const toolEvidenceByResult = new WeakMap<SingleResult, { toolResults: Message[]; availableTools: string[] }>();
 
 function emptyUsage(): Usage {
 	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
@@ -374,6 +375,7 @@ async function runSingleAttempt(
 		readonlyExpected?: SettledReadonlyEvidence;
 		readonlyModel?: string;
 		readonlyHandoffAllowed?: () => boolean;
+		collectToolEvidence?: boolean;
 	},
 ): Promise<SingleResult> {
 	const effectiveThinking = options.thinkingOverride ?? agent.thinking;
@@ -529,6 +531,8 @@ async function runSingleAttempt(
 		...(options.capabilityCeiling ? { capabilityCeiling: options.capabilityCeiling } : {}),
 		...(capabilityAudit ? { capabilityAudit } : {}),
 	}, options.context);
+	const currentLaunchToolResults = shared.collectToolEvidence ? [] as Message[] : undefined;
+	if (currentLaunchToolResults) toolEvidenceByResult.set(result, { toolResults: currentLaunchToolResults, availableTools: toolPlan.effectiveToolAllowlist });
 	const startTime = Date.now();
 	const controlConfig = options.controlConfig ?? DEFAULT_CONTROL_CONFIG;
 	let interruptedByControl = false;
@@ -1148,6 +1152,7 @@ async function runSingleAttempt(
 			}
 
 			if (evt.type === "tool_result_end" && evt.message) {
+				currentLaunchToolResults?.push(evt.message);
 				const toolResultCompletion = {
 					toolCallId: (evt.message as { toolCallId?: unknown }).toolCallId ?? (evt as { toolCallId?: unknown }).toolCallId,
 					toolName: (evt.message as { toolName?: unknown }).toolName ?? (evt as { toolName?: unknown }).toolName,
@@ -1959,6 +1964,7 @@ async function runSyncCompletionInner(
 				readonlyExpected,
 				readonlyModel,
 				readonlyHandoffAllowed: readonlyExpected ? readonlyHandoffAllowed : undefined,
+				collectToolEvidence: effectiveAcceptance.toolEvidence.length > 0,
 			});
 			lastResult = result;
 			if (!recoveringAbort) {
@@ -2151,6 +2157,8 @@ async function runSyncCompletionInner(
 				artifactsDir: options.artifactsDir,
 				runId: options.runId,
 				watchdog: result.watchdog,
+				toolResults: toolEvidenceByResult.get(result)?.toolResults,
+				availableTools: toolEvidenceByResult.get(result)?.availableTools,
 			});
 		}
 	} catch (error) {
@@ -2159,7 +2167,8 @@ async function runSyncCompletionInner(
 	}
 	const acceptanceFailure = acceptanceFailureMessage(result.acceptance);
 	stripAcceptanceReportsFromMessages(result.messages);
-	if (acceptanceFailure && result.acceptance.explicit && result.exitCode === 0 && !result.interrupted && !result.timedOut && !isAgentContract(options.agentContract)) {
+	const requiredToolEvidenceFailed = result.acceptance.runtimeChecks.some((check) => check.id === "required-tool-evidence" && check.status === "failed");
+	if (acceptanceFailure && result.acceptance.explicit && result.exitCode === 0 && !result.interrupted && !result.timedOut && (!isAgentContract(options.agentContract) || requiredToolEvidenceFailed)) {
 		result.exitCode = 1;
 		if (result.savedOutputPath) {
 			result.finalOutput = finalizeSingleOutput({

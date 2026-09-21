@@ -407,6 +407,7 @@ Agent frontmatter or `subagents.agentOverrides` may set `acceptanceRole: "read-o
 
 Edge cases:
 
+- `acceptance.toolEvidence` is an opt-in non-empty list of exact tool names; completion requires at least one successful current-launch result from a listed tool, without changing the acceptance level or requiring a child report.
 - The bare string `"none"` is rejected; use `{ level: "none", reason: "..." }` instead.
 - `acceptance: false` is accepted only as a deprecated shorthand for disabling gates.
 - For reviewer/read-only calls, omit `acceptance`.

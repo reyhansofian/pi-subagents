@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import type { Message } from "@earendil-works/pi-ai";
 import type {
 	AcceptanceConfig,
 	AcceptanceEvidenceKind,
@@ -54,6 +55,7 @@ const ACCEPTANCE_GATE_KEYS = new Set(["id", "must", "evidence", "severity"]);
 const ACCEPTANCE_VERIFY_KEYS = new Set(["id", "command", "timeoutMs", "cwd", "env", "allowFailure"]);
 const ACCEPTANCE_REVIEW_KEYS = new Set(["agent", "focus", "required"]);
 const EXPLICIT_REVIEWED_UNAVAILABLE = "is an achieved status, not a requestable acceptance level. For a read-only reviewer call, omit acceptance. To require independent review of a writer result, use acceptance.review.required and orchestrate the reviewer separately.";
+ACCEPTANCE_CONFIG_KEYS.add("toolEvidence");
 
 function normalizeLevel(level: AcceptanceLevel | undefined): Exclude<AcceptanceLevel, "auto"> | "auto" {
 	return level ?? "auto";
@@ -224,7 +226,7 @@ function explicitAcceptanceCanDisable(explicit: AcceptanceConfig): boolean {
 }
 
 function explicitAcceptanceRequestsPolicy(explicit: AcceptanceConfig): boolean {
-	return (explicit.level !== undefined && explicit.level !== "auto") || Object.keys(explicit).some((key) => key !== "level");
+	return (explicit.level !== undefined && explicit.level !== "auto") || Object.keys(explicit).some((key) => key !== "level" && key !== "toolEvidence");
 }
 
 function unsupportedEvidenceKindMessage(pathLabel: string, item: unknown): string {
@@ -309,6 +311,14 @@ export function validateAcceptanceInput(input: unknown, pathLabel = "acceptance"
 		}
 	} else if (value.evidence !== undefined) {
 		errors.push(`${pathLabel}.evidence must be an array. ${ACCEPTANCE_EVIDENCE_HELP}`);
+	}
+	if (!Array.isArray(value.toolEvidence) || value.toolEvidence.length === 0) {
+		if (value.toolEvidence !== undefined) errors.push(`${pathLabel}.toolEvidence must be a non-empty array.`);
+	} else {
+		for (const [index, item] of value.toolEvidence.entries()) {
+			if (typeof item !== "string" || !item.trim()) errors.push(`${pathLabel}.toolEvidence[${index}] must be a non-blank string.`);
+			else if (item !== item.trim()) errors.push(`${pathLabel}.toolEvidence[${index}] must not have leading or trailing whitespace.`);
+		}
 	}
 	if (value.level === "verified" && (!Array.isArray(value.verify) || value.verify.length === 0)) {
 		errors.push(`${pathLabel}.verify must contain at least one runtime command when level is verified. Use level "checked" or provide a non-empty acceptance.verify array.`);
@@ -450,6 +460,7 @@ export function resolveEffectiveAcceptance(input: {
 			inferredReason: [],
 			criteria,
 			evidence,
+			toolEvidence: unique(explicit.toolEvidence ?? []),
 			verify: explicit.verify ?? [],
 			review: explicit.review,
 			stopRules: explicit.stopRules ?? [],
@@ -475,6 +486,7 @@ export function resolveEffectiveAcceptance(input: {
 		inferredReason: inferred.reasons,
 		criteria: level === "none" ? [] : criteria,
 		evidence: level === "none" ? [] : evidence,
+		toolEvidence: unique(explicit.toolEvidence ?? []),
 		verify: explicit.verify ?? [],
 		review,
 		stopRules: explicit.stopRules ?? [],
@@ -1376,6 +1388,9 @@ export async function evaluateAcceptance(input: {
 	artifactsDir?: string;
 	runId?: string;
 	watchdog?: ChildWatchdogProgress;
+	messages?: readonly Message[];
+	toolResults?: readonly Message[];
+	availableTools?: readonly string[];
 }): Promise<AcceptanceLedger> {
 	const acceptance = input.acceptance;
 	const initialStatus = acceptance.level === "none" ? "not-required" : "claimed";
@@ -1389,6 +1404,27 @@ export async function evaluateAcceptance(input: {
 		runtimeChecks: [],
 		verifyRuns: [],
 	};
+	if (acceptance.toolEvidence.length > 0) {
+		const available = unique([...(input.availableTools ?? [])]).sort();
+		const matched = (input.toolResults ?? []).some((message) =>
+			message.role === "toolResult"
+			&& message.isError === false
+			&& acceptance.toolEvidence.includes(message.toolName),
+		);
+		const required = [...acceptance.toolEvidence].sort();
+		ledger.runtimeChecks.push({
+			id: "required-tool-evidence",
+			status: matched ? "passed" : "failed",
+			message: matched
+				? "Observed a successful result from a required tool: " + required.join(", ") + "."
+				: "Expected at least one successful result from required tools: " + required.join(", ") + ". Available launch tools: " + (available.join(", ") || "none") + ".",
+		});
+		if (!matched) {
+			ledger.status = "rejected";
+			ledger.evidenceStatus = "rejected";
+			return ledger;
+		}
+	}
 	if (acceptance.level === "none") return ledger;
 
 	if (input.watchdog) {

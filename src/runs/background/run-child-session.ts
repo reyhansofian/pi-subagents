@@ -101,6 +101,7 @@ export interface RunChildSessionInput {
 	readonlyContinuation?: { source: ChildSession; expected: SettledReadonlyEvidence; modelId: string };
 	collectReadonlyEvidence?: boolean;
 	canContinue?: () => boolean;
+	collectToolEvidence?: boolean;
 }
 
 const settledChildren = new WeakMap<RunChildSessionResult, ChildSession>();
@@ -112,6 +113,7 @@ export function getSettledReadonlyChild(result: RunChildSessionResult): ChildSes
 export interface RunChildSessionResult {
 	exitCode: number;
 	messages: Message[];
+	toolResults?: Message[];
 	usage: Usage;
 	toolCount: number;
 	durationMs: number;
@@ -173,6 +175,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 	return new Promise((resolve) => {
 		const startedAt = Date.now();
 		const messages: Message[] = [];
+		const toolResults = input.collectToolEvidence ? [] as Message[] : undefined;
 		const usage = emptyUsage();
 		let model: string | undefined;
 		let error: string | undefined;
@@ -468,6 +471,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 
 			if ((event.type === "message_end" || event.type === "tool_result_end") && event.message) {
 				if (event.type === "tool_result_end") {
+					toolResults?.push(event.message);
 					clearActiveToolTimeout(event);
 					removeActiveToolCall({
 						toolCallId: (event.message as { toolCallId?: unknown }).toolCallId ?? event.toolCallId,
@@ -559,6 +563,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 				const result: RunChildSessionResult = omitUndefined({
 					exitCode,
 					messages,
+					toolResults,
 					usage,
 					toolCount,
 					durationMs: Date.now() - startedAt,

@@ -694,6 +694,26 @@ const scout = discovered.builtin.find((candidate) => candidate.name === "scout")
 
 		execFileSync(process.execPath, ["--experimental-strip-types", "challenge.mjs"], { cwd: fixture, stdio: "pipe" });
 	});
+
+	it("opts the bundled scout into read-only tool evidence without inheritance across shadows", () => withTempHome((home) => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-scout-evidence-"));
+		tempDirs.push(dir);
+		const bundled = discoverAgentsAll(dir).builtin.find((agent) => agent.name === "scout");
+		assert.deepEqual(bundled?.tools, ["read", "grep", "find", "ls", "bash"]);
+		assert.deepEqual(bundled?.defaultAcceptance, { toolEvidence: ["read", "grep", "find", "ls", "bash"] });
+
+		writeAgent(path.join(home, ".pi", "agent", "agents", "scout.md"), `---
+name: scout
+description: User scout
+tools: read
+---
+
+User scout.
+`);
+		const shadow = discoverAgentsAll(dir).user.find((agent) => agent.name === "scout");
+		assert.deepEqual(shadow?.tools, ["read"]);
+		assert.equal(shadow?.defaultAcceptance, undefined);
+	}));
 });
 
 describe("agent frontmatter launch defaults", () => {
@@ -1906,6 +1926,7 @@ Do work
 				scout: ["read", "grep", "find", "ls", "bash", "write", "contact_supervisor"],
 				researcher: ["read", "write", "web_search", "fetch_content", "get_search_content", "source_check"],
 			};
+			expectedTools.scout = ["read","grep","find","ls","bash"];
 			for (const [name, tools] of Object.entries(expectedTools)) {
 				const agent = agents.find((candidate) => candidate.name === name);
 				assert.ok(agent, `${name} builtin should be discovered`);

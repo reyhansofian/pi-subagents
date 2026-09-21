@@ -63,6 +63,96 @@ function tempGitRepo(): string {
 }
 
 describe("acceptance gates", () => {
+	it("validates and deduplicates exact required tool evidence names", () => {
+		assert.deepEqual(validateAcceptanceInput({ toolEvidence: [] }), ["acceptance.toolEvidence must be a non-empty array."]);
+		assert.deepEqual(validateAcceptanceInput({ toolEvidence: ["read", " ", 1] }), [
+			"acceptance.toolEvidence[1] must be a non-blank string.",
+			"acceptance.toolEvidence[2] must be a non-blank string.",
+		]);
+		assert.deepEqual(validateAcceptanceInput({ toolEvidence: [" read "] }), [
+			"acceptance.toolEvidence[0] must not have leading or trailing whitespace.",
+		]);
+
+		const resolved = resolveEffectiveAcceptance({
+			agentName: "scout",
+			task: "Inspect the repository",
+			explicit: { toolEvidence: ["grep", "read", "grep"] },
+		});
+		assert.equal(resolved.level, "none");
+		assert.deepEqual(resolved.toolEvidence, ["grep", "read"]);
+	});
+
+	it("requires one successful exact current-launch tool result before level-none completion", async () => {
+		const acceptance = resolveEffectiveAcceptance({
+			agentName: "scout",
+			task: "Inspect the repository",
+			explicit: { toolEvidence: ["read", "grep"] },
+		});
+		const evaluate = (toolResults: Message[], messages: Message[] = []) => evaluateAcceptance({
+			acceptance,
+			output: "done",
+			cwd: process.cwd(),
+			messages,
+			toolResults,
+			availableTools: ["read","bash","read"],
+		});
+
+		for (const [messages] of [
+			[[], "none"],
+			[[{ role: "toolResult", toolName: "read", isError: true, content: [] } as unknown as Message], "read"],
+			[
+				[
+					{ role: "toolResult", toolName: "bash", isError: false, content: [] } as unknown as Message,
+					{ role: "toolResult", toolName: "Read", isError: false, content: [] } as unknown as Message,
+				],
+				"Read, bash",
+			],
+		] as const) {
+			const ledger = await evaluate(messages);
+			assert.equal(ledger.status, "rejected");
+			assert.deepEqual(ledger.runtimeChecks, [{
+				id: "required-tool-evidence",
+				status: "failed",
+				message: "Expected at least one successful result from required tools: grep, read. Available launch tools: bash, read.",
+			}]);
+		}
+
+		const matching = await evaluate([{ role: "toolResult", toolName: "read", isError: false, content: [] } as unknown as Message]);
+		assert.equal(matching.status, "not-required");
+		assert.equal(matching.runtimeChecks[0]?.status, "passed");
+		assert.deepEqual(matching.effectiveAcceptance.toolEvidence, ["read","grep"]);
+
+		const inheritedHistory = [{ role: "toolResult", toolName: "read", isError: false, content: [] } as unknown as Message];
+		const historical = await evaluate([], inheritedHistory);
+		assert.equal(historical.status, "rejected", "inherited historical tool result must not satisfy current-launch evidence");
+
+		const noOptIn = await evaluateAcceptance({
+			acceptance: resolveEffectiveAcceptance({ agentName: "scout", task: "Inspect" }),
+			output: "done",
+			cwd: process.cwd(),
+			messages: [],
+		});
+		assert.equal(noOptIn.status, "not-required");
+		assert.deepEqual(noOptIn.runtimeChecks, []);
+	});
+
+	it("rejects inherited historical tool results without a current-launch result", async () => {
+		const acceptance = resolveEffectiveAcceptance({ agentName: "scout", task: "Inspect", explicit: { toolEvidence: ["read"] } });
+		const inheritedHistoricalMessages = [
+			{ role: "toolResult", toolName: "read", isError: false, content: [{ type: "text", text: "result from a prior launch" }] },
+			{ role: "assistant", content: [{ type: "text", text: "current launch did not call tools" }] },
+		] as unknown as Message[];
+		const ledger = await evaluateAcceptance({
+			acceptance,
+			output: "done",
+			cwd: process.cwd(),
+			messages: inheritedHistoricalMessages,
+			availableTools: ["read"],
+		});
+
+		assert.equal(ledger.status, "rejected", "inherited historical tool result must not satisfy current-launch evidence");
+	});
+
 	it("infers evidence levels and review requirements independently", () => {
 		assert.equal(resolveEffectiveAcceptance({ agentName: "reviewer", task: "Review-only. Do not edit.", mode: "single" }).level, "none");
 		assert.equal(resolveEffectiveAcceptance({ agentName: "worker", task: "Implement the fix", mode: "single" }).level, "checked");

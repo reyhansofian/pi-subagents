@@ -1064,6 +1064,7 @@ export async function runSingleStepInner(
 	let finalRequiredOutputMissing: boolean | undefined;
 	const eventsPath = path.join(path.dirname(ctx.outputFile), "events.jsonl");
 	let finalResult: RunChildSessionResult | undefined;
+	let finalAvailableTools: string[] = [];
 	let cumulativeMutationAttemptObserved = false;
 	let finalOutputSnapshot: SingleOutputSnapshot | undefined;
 	let structuredAcceptanceReport: unknown;
@@ -1155,6 +1156,7 @@ export async function runSingleStepInner(
 			failContinuationLaunch(candidate, error);
 			break modelAttemptsLoop;
 		}
+		if (step.effectiveAcceptance?.toolEvidence.length) finalAvailableTools = launch.toolPlan.effectiveToolAllowlist;
 		if (effectiveStructuredOutput && launch.config.structuredOutput) {
 			// The runner reads the value back from the runtime's files after the run.
 			launch.config.structuredOutput.capture = createStructuredOutputFileCapture(effectiveStructuredOutput);
@@ -1216,6 +1218,7 @@ export async function runSingleStepInner(
 			factory: ctx.childSessions,
 			launch,
 			collectReadonlyEvidence: true,
+			collectToolEvidence: step.effectiveAcceptance?.toolEvidence.length ? true : undefined,
 			readonlyContinuation,
 			canContinue,
 			prompt: `Task: ${attemptTask}`,
@@ -1571,6 +1574,8 @@ export async function runSingleStepInner(
 			artifactsDir: ctx.artifactsDir,
 			runId: ctx.id,
 			watchdog: finalResult?.watchdog,
+			toolResults: finalResult?.toolResults,
+			availableTools: finalAvailableTools,
 		}))
 		: undefined;
 	const stoppedAfterAcceptance = finalResult?.stopped === true || ctx.stopSignal?.aborted === true;
@@ -1583,7 +1588,8 @@ export async function runSingleStepInner(
 				: acceptance
 		: undefined;
 	const acceptanceFailure = effectiveAcceptance ? acceptanceFailureMessage(effectiveAcceptance) : undefined;
-	const acceptanceCanFailRun = acceptanceFailure && effectiveAcceptance?.explicit && (finalResult?.exitCode ?? 1) === 0 && !finalResult?.interrupted && !timedOutAfterAcceptance && !stoppedAfterAcceptance && !isAgentContract(step.agentContract);
+	const requiredToolEvidenceFailed = effectiveAcceptance?.runtimeChecks.some((check) => check.id === "required-tool-evidence" && check.status === "failed");
+	const acceptanceCanFailRun = acceptanceFailure && effectiveAcceptance?.explicit && (finalResult?.exitCode ?? 1) === 0 && !finalResult?.interrupted && !timedOutAfterAcceptance && !stoppedAfterAcceptance && (!isAgentContract(step.agentContract) || requiredToolEvidenceFailed);
 	const effectiveFinalExitCode = timedOutAfterAcceptance || stoppedAfterAcceptance ? 1 : acceptanceCanFailRun ? 1 : finalResult?.exitCode ?? 1;
 	const intercomDetachReceipt = finalResult?.finalOutput === INTERCOM_DETACH_RECEIPT;
 	const baseFinalError = stoppedAfterAcceptance
@@ -3535,7 +3541,8 @@ export async function runSubagent(
 				const groupTimedOut = !groupStopped && (timedOut || timeoutAbortController.signal.aborted);
 				const effectiveGroupAcceptance = groupTimedOut || groupStopped ? undefined : groupAcceptance;
 				if (placeholder && effectiveGroupAcceptance) placeholder.acceptance = effectiveGroupAcceptance;
-				const groupAcceptanceFailure = effectiveGroupAcceptance && (!isAgentContract(step.agentContract) || step.gateOn === "acceptance") ? acceptanceFailureMessage(effectiveGroupAcceptance) : undefined;
+				const groupRequiredToolEvidenceFailed = effectiveGroupAcceptance?.runtimeChecks.some((check) => check.id === "required-tool-evidence" && check.status === "failed");
+				const groupAcceptanceFailure = effectiveGroupAcceptance && (!isAgentContract(step.agentContract) || step.gateOn === "acceptance" || groupRequiredToolEvidenceFailed) ? acceptanceFailureMessage(effectiveGroupAcceptance) : undefined;
 				if (groupTimedOut || groupStopped || groupAcceptanceFailure) {
 					const errorMessage = groupStopped ? stopMessage : groupTimedOut ? timeoutMessage ?? "Subagent timed out." : groupAcceptanceFailure!;
 					statusPayload.state = groupStopped ? "stopped" : "failed";
@@ -3905,7 +3912,8 @@ export async function runSubagent(
 					const groupStopped = stopped || stopAbortController.signal.aborted;
 					const groupTimedOut = !groupStopped && (timedOut || timeoutAbortController.signal.aborted);
 					const effectiveGroupAcceptance = groupTimedOut || groupStopped ? undefined : groupAcceptance;
-					const groupAcceptanceFailure = effectiveDynamicGroupAcceptance.explicit && effectiveGroupAcceptance && (!isAgentContract(step.agentContract) || step.gateOn === "acceptance") ? acceptanceFailureMessage(effectiveGroupAcceptance) : undefined;
+					const groupRequiredToolEvidenceFailed = effectiveGroupAcceptance?.runtimeChecks.some((check) => check.id === "required-tool-evidence" && check.status === "failed");
+					const groupAcceptanceFailure = effectiveDynamicGroupAcceptance.explicit && effectiveGroupAcceptance && (!isAgentContract(step.agentContract) || step.gateOn === "acceptance" || groupRequiredToolEvidenceFailed) ? acceptanceFailureMessage(effectiveGroupAcceptance) : undefined;
 					const groupError = groupStopped ? stopMessage : groupTimedOut ? timeoutMessage ?? "Subagent timed out." : groupAcceptanceFailure;
 					markDynamicGraphGroup(stepIndex, groupError ? groupStopped ? "stopped" : "failed" : "completed", groupError, effectiveGroupAcceptance);
 					if (groupError) {
