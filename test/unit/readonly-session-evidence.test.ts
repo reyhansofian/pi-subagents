@@ -26,6 +26,7 @@ import { releaseActiveRunIndex, updateActiveRunIndex } from "../../src/runs/back
 import { resolveChildWatchdogConfig } from "../../src/watchdog/child-status.ts";
 import { DEFAULT_WATCHDOG_CONFIG } from "../../src/watchdog/settings.ts";
 import { DEFAULT_CONTROL_CONFIG } from "../../src/runs/shared/subagent-control.ts";
+import { PI_SUBAGENT_EXTENSION_BINDINGS_ENV } from "../../src/runs/shared/extension-bindings.ts";
 
 function launch(cwd: string): ChildSessionLaunch & { storage: Extract<ChildSessionLaunch["storage"], { kind: "file" }> } {
 	return { cwd, storage: { kind: "file", sessionFile: join(cwd, "session.jsonl") }, model: "baseten/model-a", tools: ["read"], extensionPaths: [],
@@ -126,6 +127,10 @@ describe("native 0.85.1 factory evidence (synthetic transport, real configured M
 		const chunk = { id: "synthetic", object: "chat.completion.chunk", created: 1, model: "model-a", choices: [{ index: 0, delta, finish_reason: tool ? "tool_calls" : "stop" }], usage: { prompt_tokens: tokens, completion_tokens: tokens, total_tokens: tokens * 2 } };
 		return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`, { headers: { "content-type": "text/event-stream" } });
 	}
+	function toolSse(name: string, args: Record<string, unknown>): Response {
+		const chunk = { id: "synthetic", object: "chat.completion.chunk", created: 1, model: "model-a", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: name + "-1", type: "function", function: { name, arguments: JSON.stringify(args) } }] }, finish_reason: "tool_calls" }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } };
+		return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`, { headers: {"content-type":"text/event-stream"} });
+	}
 	function http(status: number): Response {
 		return new Response(JSON.stringify({ error: { message: "synthetic rate limit", type: "rate_limit_error" } }), { status, headers: { "content-type": "application/json", "retry-after-ms": "1" } });
 	}
@@ -194,6 +199,149 @@ describe("native 0.85.1 factory evidence (synthetic transport, real configured M
 			sessionName: "resolved reader", forkCacheKey: "resolved-cache", systemPrompt: "Retain the completed read.",
 		});
 	}
+
+	it("keeps parent environment isolated while request context spans loader and session initialization", async () => fixture(async ({ factory, cwd }) => {
+		const binding = '{"fixture.bound/1":{"value":"child"}}';
+		for (const scenario of ["success", "failure"] as const) {
+			const extensionPath = join(cwd, "context-" + scenario + ".ts");
+			const startedPath = join(cwd, "context-" + scenario + "-started.json");
+			const releasePath = join(cwd, "context-" + scenario + "-release");
+			const sessionPath = join(cwd, "context-" + scenario + "-session.json");
+			writeFileSync(extensionPath, [
+				'import { existsSync, writeFileSync } from "node:fs";',
+				'export default async function (pi) {',
+				'  const descriptor = Object.getOwnPropertyDescriptor(globalThis, Symbol.for("pi-subagents.extension-binding-context.v1"));',
+				'  const channel = descriptor && "value" in descriptor ? descriptor.value : undefined;',
+				'  writeFileSync(' + JSON.stringify(startedPath) + ', JSON.stringify(channel?.getStore()));',
+				'  while (!existsSync(' + JSON.stringify(releasePath) + ')) await new Promise(resolve => setTimeout(resolve, 5));',
+				'  pi.on("session_start", () => writeFileSync(' + JSON.stringify(sessionPath) + ', JSON.stringify(channel?.getStore())));',
+				'}',
+			].join("\n"));
+			process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV] = "parent-binding";
+			process.env.MCP_DIRECT_TOOLS = "parent-tools";
+			const launch = buildInProcessChildLaunch({
+				host: "parent", cwd, sessionEnabled: false, model: "baseten/model-a", tools: ["read"], extensions: [extensionPath], extensionBindings: { "fixture.bound/1": { value: "child" } },
+				childAgentName: "worker", childIndex: 0, inheritProjectContext: false, inheritGlobalContext: false, inheritSkills: false, allowNestedSubagents: false,
+			});
+			assert.equal(launch.session.processEnv, undefined);
+			const sessionInput = createReportedChildSessionInput(launch);
+			if (scenario === "failure") sessionInput.storage = { kind: "file", sessionFile: cwd };
+			const settled = factory.create(sessionInput).then(async (child) => { await child.dispose(); return undefined; }, (error: unknown) => error);
+			while (!existsSync(startedPath)) await new Promise((resolve) => setTimeout(resolve, 5));
+			assert.deepEqual(JSON.parse(readFileSync(startedPath, "utf8")), { extensionBindingsJson: binding, mcpDirectTools: "__none__" });
+			assert.deepEqual([process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV], process.env.MCP_DIRECT_TOOLS], ["parent-binding", "parent-tools"]);
+			process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV] = "concurrent-binding";
+			process.env.MCP_DIRECT_TOOLS = "concurrent-tools";
+			writeFileSync(releasePath, "release");
+			const error = await settled;
+			assert.deepEqual([process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV], process.env.MCP_DIRECT_TOOLS], ["concurrent-binding", "concurrent-tools"]);
+			if (scenario === "success") {
+				assert.equal(error, undefined);
+				assert.deepEqual(JSON.parse(readFileSync(sessionPath, "utf8")), { extensionBindingsJson: binding, mcpDirectTools: "__none__" });
+			} else assert.ok(error instanceof Error);
+		}
+		delete process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV];
+		delete process.env.MCP_DIRECT_TOOLS;
+	}, {}, true));
+
+	it("loads runs.all extension bindings for a schema-bearing foreground child without leaking them", async () => fixture(async ({ factory, cwd, requests, setResponses }) => {
+		const extensionPath = join(cwd, "bound-tool.ts");
+		const observedPath = join(cwd, "observed-binding.txt");
+		writeFileSync(extensionPath, `import { writeFileSync } from "node:fs";
+import { Type } from "typebox";
+export default function (pi) {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, Symbol.for("pi-subagents.extension-binding-context.v1"));
+  const channel = descriptor && "value" in descriptor ? descriptor.value : undefined;
+  const raw = channel?.getStore()?.extensionBindingsJson;
+  writeFileSync(${JSON.stringify(observedPath)}, raw || "absent");
+  let binding;
+  try { binding = JSON.parse(raw || "{}")["fixture.bound/1"]; } catch {}
+  if (!binding) return;
+  pi.registerTool({
+    name: "bound_value", label: "Bound value", description: "Return the request-scoped bound value.",
+    parameters: Type.Object({}, { additionalProperties: false }),
+    async execute() { return { content: [{ type: "text", text: "BOUND_TOOL_RESULT:" + binding.value }], details: {} }; }
+  });
+}
+`);
+		const agent: AgentConfig = {
+			name: "bound-worker", description: "Use the bound tool", systemPrompt: "Call bound_value, then submit its result.", systemPromptMode: "append",
+			tools: ["bound_value"], extensions: [extensionPath], allowNestedSubagents: false,
+			inheritProjectContext: false, inheritGlobalContext: false, inheritSkills: false, source: "project", filePath: join(cwd, "bound-worker.md"), model: "baseten/model-a",
+		};
+		const state = { baseCwd: cwd, currentSessionId: null, asyncJobs: new Map(), foregroundRuns: new Map(), foregroundControls: new Map(), lastForegroundControlId: null, pendingForegroundControlNotices: new Map(), cleanupTimers: new Map(), lastUiContext: null, poller: null, completionSeen: new Map(), watcher: null, watcherRestartTimer: null, resultFileCoalescer: { schedule: () => false, clear() {} } };
+		process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV] = "parent-sentinel";
+		process.env.MCP_DIRECT_TOOLS = "parent-tools";
+		let launchIndex = 0;
+		setChildSessionFactory({ ...factory, async create(input) {
+			assert.equal(input.processEnv, undefined);
+			const binding = input.extensionBindingContext?.extensionBindingsJson;
+			const index = launchIndex++;
+			assert.equal(binding, ['{"fixture.bound/1":{"value":"expected"}}', undefined, '{"fixture.bound/1":{"value":"expected"}}'][index]);
+			const child = await factory.create(input);
+			if (index < 2) assert.equal(readFileSync(observedPath, "utf8"), binding ?? "absent");
+			return child;
+		} });
+		try {
+			setResponses([
+				() => toolSse("bound_value", {}),
+				() => toolSse("structured_output", { value: { proof: "BOUND_TOOL_RESULT:expected" } }),
+			]);
+			const executor = createSubagentExecutor({
+				pi: { events: { emit() {}, on() { return () => {}; } }, getSessionName() { return "parent"; } } as any,
+				state: state as any, config: { maxSubagentDepth: 2, control: {}, intercomBridge: { mode: "off" } } as any,
+				asyncByDefault: false, waitToolEnabled: false, tempArtifactsDir: join(cwd, "artifacts"), getSubagentSessionRoot: () => join(cwd, "sessions"), expandTilde: (value) => value,
+				discoverAgents: () => ({ agents: [agent] }),
+			});
+			const result = await executor.execute("bound-workflow", {
+				async: false,
+				workflowScript: `
+            const [bound] = await runs.all([{ key: "bound", agent: "bound-worker", task: "Use the bound tool", extensionBindings: { "fixture.bound/1": { value: "expected" } }, outputSchema: { type: "object", required: ["proof"], properties: { proof: { type: "string" } } } }]);
+            const [omitted] = await runs.all([{ key: "omitted", agent: "bound-worker", task: "Submit omitted", outputSchema: { type: "object", required: ["proof"], properties: { proof: { type: "string" } } } }]);
+            return [bound, omitted];
+          `,
+			}, undefined, undefined, { cwd, hasUI: false, sessionManager: { getSessionId() { return "parent"; }, getSessionFile() { return null; } }, modelRegistry: { getAvailable() { return [{ provider: "baseten", id: "model-a" }]; } }, model: { provider: "baseten", id: "model-a" } } as any);
+
+			assert.equal(result.isError, undefined, result.content[0]?.text ?? "workflow failed");
+			assert.deepEqual(result.details.results[0]?.structuredOutput, { proof: "BOUND_TOOL_RESULT:expected" });
+			assert.match(result.details.results[1]?.error ?? "", /child tools were unavailable: bound_value/, "an omitted binding cannot observe the prior child's value");
+			const advertised = (request: { body: Record<string, unknown> }) => ((request.body.tools ?? []) as Array<{ function?: { name?: string } }>).map((tool) => tool.function?.name);
+			assert.ok(advertised(requests[0]!).includes("bound_value"), "the binding-loaded extension exposes its tool");
+			assert.match(JSON.stringify(requests[1]!.body.messages), /BOUND_TOOL_RESULT:expected/, "the child invokes the bound tool before structured output");
+			assert.equal(requests.length, 2, "the omitted binding never exposes the bound tool to the model");
+			assert.deepEqual([process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV], process.env.MCP_DIRECT_TOOLS], ["parent-sentinel", "parent-tools"]);
+			const directLaunch = buildInProcessChildLaunch({
+				host: "parent", cwd, sessionEnabled: false, model: "baseten/model-a", tools: ["bound_value"], extensions: [extensionPath], extensionBindings: { "fixture.bound/1": { value: "direct" } },
+				childAgentName: "bound-worker", childIndex: 0, inheritProjectContext: false, inheritGlobalContext: false, inheritSkills: false, allowNestedSubagents: false,
+			});
+			const directChild = await factory.create(createReportedChildSessionInput(directLaunch));
+			assert.equal(readFileSync(observedPath, "utf8"), '{"fixture.bound/1":{"value":"direct"}}');
+			await directChild.dispose();
+			assert.deepEqual([process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV], process.env.MCP_DIRECT_TOOLS], ["parent-sentinel", "parent-tools"]);
+
+			writeFileSync(extensionPath, [
+				'import { Type } from "typebox";',
+				'export default function (pi) {',
+				'  let binding;',
+				'  try { binding = JSON.parse(process.env.PI_SUBAGENT_EXTENSION_BINDINGS || "{}")["fixture.bound/1"]; } catch {}',
+				'  if (!binding) return;',
+				'  pi.registerTool({ name: "bound_value", label: "Bound value", description: "legacy", parameters: Type.Object({}), async execute() { return { content: [{ type: "text", text: binding.value }], details: {} }; } });',
+				'}',
+			].join("\n"));
+			const requestCount = requests.length;
+			const mixedVersion = await executor.execute("mixed-version", {
+				async: false,
+				workflowScript: 'return await runs.all([{ key: "legacy", agent: "bound-worker", task: "Use the bound tool", extensionBindings: { "fixture.bound/1": { value: "expected" } } }]);',
+			}, undefined, undefined, { cwd, hasUI: false, sessionManager: { getSessionId() { return "parent"; }, getSessionFile() { return null; } }, modelRegistry: { getAvailable() { return [{ provider: "baseten", id: "model-a" }]; } }, model: { provider: "baseten", id: "model-a" } } as any);
+			assert.match(mixedVersion.details.results[0]?.error ?? "", /child tools were unavailable: bound_value/);
+			assert.equal(requests.length, requestCount, "an old environment-only adapter receives no unsafe foreground injection");
+		} finally {
+			setChildSessionFactory(undefined);
+			delete process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV];
+			delete process.env.MCP_DIRECT_TOOLS;
+			for (const timer of state.cleanupTimers.values()) clearTimeout(timer);
+		}
+	}, {}, true));
 
 	for (const scenario of ["success", "retained", "cross-provider-skip", "no-sibling", "second429", "sibling-startup", "sibling-abort", "unverified-sibling", "wrong-model", "changed-file", "missing-file", "cancel-at-create", "deadline-at-create", "usage-budget", "tool-budget", "wait-profile", "directory", "text429", "stop-at-settlement", "steer-at-settlement", "smaller-model"] as const) {
 		it(`actual foreground owned continuation loop: ${scenario}`, async (test) => fixture(async ({ pi, l, factory, requests, setResponses, captured, cwd, agentDir }) => {
@@ -637,6 +785,7 @@ describe("native 0.85.1 factory evidence (synthetic transport, real configured M
 			assert.deepEqual(input.hooks.map((hook) => hook.name), ["pi-subagents:prompt-runtime", "pi-subagents:completion-intent"]);
 			assert.equal(input.ambientExtensions, false, "configured extensions:[] disables ambient through ordinary tool-plan resolution");
 			assert.equal(input.processEnv?.MCP_DIRECT_TOOLS, "__none__", "runner environment is retained");
+			assert.equal(input.extensionBindingContext?.mcpDirectTools, "__none__", "runner sessions also establish an explicit context");
 			assert.equal(input.runtime.watchdogStatus, undefined);
 			assert.deepEqual(input.runtime.requiredTools, ["read"]);
 			assert.equal(typeof input.runtime.toolDiagnostic, "function");

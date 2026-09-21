@@ -417,6 +417,7 @@ async function runSingleAttempt(
 		// Exact terminal protocol belongs to session resources, not compactable history.
 		systemPrompt: shared.acceptancePrompt ? `${shared.systemPrompt}\n${shared.acceptancePrompt}` : shared.systemPrompt,
 		mcpDirectTools: agent.mcpDirectTools,
+		extensionBindings: options.extensionBindings,
 		cwd: options.cwd ?? runtimeCwd,
 		intercomSessionName: options.intercomSessionName,
 		sessionName: childSessionName,

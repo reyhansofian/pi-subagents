@@ -15,6 +15,7 @@ import { runSync } from "../../src/runs/foreground/execution.ts";
 import { childSessionFactory, createDefaultChildSessionFactory, disposeChildSessions, type ChildSessionFactory, type ChildSessionLaunch, type PiCodingAgentModule } from "../../src/runs/shared/child-session.ts";
 import { createNestedRoute } from "../../src/runs/shared/nested-events.ts";
 import { createStructuredOutputRuntime } from "../../src/runs/shared/structured-output.ts";
+import { createExtensionBindingContext, EXTENSION_BINDING_CONTEXT_KEY } from "../../src/runs/shared/extension-bindings.ts";
 import type { ForegroundChildSessionControls, SingleResult } from "../../src/shared/types.ts";
 
 async function waitFor(read: () => boolean, timeoutMs = 5_000): Promise<void> {
@@ -246,6 +247,24 @@ describe("default child session factory", () => {
 		delete process.env.PI_SUBAGENT_TEST_ENV;
 		assert.deepEqual(seen, ["a", "b"]);
 		assert.deepEqual(bound, ["a", "b"]);
+	});
+
+	it("keeps request-scoped extension inputs in the loader async realm without mutating parent env", async () => {
+		const seen: unknown[] = [];
+		process.env.PI_SUBAGENT_EXTENSION_BINDINGS = "parent-binding";
+		process.env.MCP_DIRECT_TOOLS = "parent-tools";
+		const readStore = () => {
+			const descriptor = Object.getOwnPropertyDescriptor(globalThis, EXTENSION_BINDING_CONTEXT_KEY);
+			return descriptor && "value" in descriptor ? descriptor.value.getStore() : undefined;
+		};
+		const bindExtensions = async () => { await Promise.resolve(); seen.push(readStore()); };
+		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => stubPi({ bindExtensions }, () => { seen.push(readStore()); }) });
+		const context = createExtensionBindingContext('{"fixture/1":true}', "__none__");
+		await factory.create({ ...stubLaunch, extensionBindingContext: context });
+		assert.deepEqual(seen, [context, context]);
+		assert.deepEqual([process.env.PI_SUBAGENT_EXTENSION_BINDINGS, process.env.MCP_DIRECT_TOOLS], ["parent-binding", "parent-tools"]);
+		delete process.env.PI_SUBAGENT_EXTENSION_BINDINGS;
+		delete process.env.MCP_DIRECT_TOOLS;
 	});
 
 	it("marks each child's loader as reloaded so pi resets its extension cache", async () => {

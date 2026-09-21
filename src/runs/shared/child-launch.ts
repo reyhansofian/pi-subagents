@@ -22,7 +22,7 @@ import type { PermissionRules } from "./permissions.ts";
 import type { StructuredOutputRuntime } from "./structured-output.ts";
 import type { ChildToolDiagnostic } from "./tool-availability.ts";
 import type { RuntimeAcknowledgedChildExtensions } from "../../shared/types.ts";
-import { encodeExtensionBindings, PI_SUBAGENT_EXTENSION_BINDINGS_ENV, type ExtensionBindings } from "./extension-bindings.ts";
+import { createExtensionBindingContext, encodeExtensionBindings, PI_SUBAGENT_EXTENSION_BINDINGS_ENV, type ExtensionBindings } from "./extension-bindings.ts";
 import type { ResolvedSubagentCapabilityCeiling, SubagentCapabilityAudit } from "./capability-ceiling.ts";
 import {
 	isSubagentRuntimeExtensionPath,
@@ -105,12 +105,7 @@ export interface BuildInProcessChildLaunchInput {
 	runtimeSnapshotHost?: McpRuntimeSnapshotHost;
 	/** The launching executor's own child runtime when it is itself an in-process child. */
 	inherited?: InheritedChildRuntime;
-	/**
-	 * Which process hosts the session. The parent never loads ambient extensions
-	 * or writes child environment values (it shares its process with the parent
-	 * session); the runner loads ambient extensions when the tool plan allows
-	 * them and exposes the child environment external extensions read.
-	 */
+	/** Which process hosts the session. Only the runner loads ambient extensions. */
 	host: "parent" | "runner";
 }
 
@@ -149,15 +144,20 @@ function inheritedCapabilityCeiling(inherited: InheritedChildRuntime | undefined
 	return inherited?.capabilityCeiling;
 }
 
-/** Environment values external child extensions read; only the runner applies them. */
+function childMcpDirectTools(input: BuildInProcessChildLaunchInput, toolPlan: PiLaunchToolPlan): string {
+	if (!toolPlan.capabilityCeiling && input.mcpDirectTools?.length) return input.mcpDirectTools.join(",");
+	if (toolPlan.capabilityCeiling && toolPlan.effectiveMcpSelections.length && !toolPlan.capabilityCeiling.denyExtensions) {
+		return toolPlan.effectiveMcpSelections.map((selection) => selection.selector).join(",");
+	}
+	return "__none__";
+}
+
+/** Environment transport retained only for the isolated background runner process. */
 function childProcessEnv(input: BuildInProcessChildLaunchInput, toolPlan: PiLaunchToolPlan): Record<string, string | undefined> {
-	const env: Record<string, string | undefined> = {};
-	env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV] = encodeExtensionBindings(input.extensionBindings);
-	if (!toolPlan.capabilityCeiling && input.mcpDirectTools?.length) env[MCP_DIRECT_TOOLS_ENV] = input.mcpDirectTools.join(",");
-	else if (toolPlan.capabilityCeiling && toolPlan.effectiveMcpSelections.length && !toolPlan.capabilityCeiling.denyExtensions) {
-		env[MCP_DIRECT_TOOLS_ENV] = toolPlan.effectiveMcpSelections.map((selection) => selection.selector).join(",");
-	} else env[MCP_DIRECT_TOOLS_ENV] = "__none__";
-	return env;
+	return {
+		[PI_SUBAGENT_EXTENSION_BINDINGS_ENV]: encodeExtensionBindings(input.extensionBindings),
+		[MCP_DIRECT_TOOLS_ENV]: childMcpDirectTools(input, toolPlan),
+	};
 }
 
 function childStorage(input: BuildInProcessChildLaunchInput): ChildSessionStorage {
@@ -294,6 +294,7 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 		extensionPaths,
 		ambientExtensions,
 		hooks: capturedHooks.hooks,
+		extensionBindingContext: createExtensionBindingContext(encodeExtensionBindings(input.extensionBindings), childMcpDirectTools(input, toolPlan)),
 		...(input.host === "runner" ? { processEnv: childProcessEnv(input, toolPlan) } : {}),
 		runtime: config,
 		noSkills: !input.inheritSkills,

@@ -12,6 +12,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "../../shared/utils.ts";
 import type { ChildRuntimeConfig } from "./child-runtime-config.ts";
+import { createExtensionBindingContext, runWithExtensionBindingContext, type ExtensionBindingContext } from "./extension-bindings.ts";
 import { prepareReadonlySessionEvidence } from "./readonly-session-evidence.ts";
 import { toModelInfo, type ModelInfo } from "../../shared/model-info.ts";
 
@@ -72,13 +73,10 @@ export interface ChildSessionLaunch {
 	noContextFiles: boolean;
 	systemPrompt?: string;
 	appendSystemPrompt?: string;
-	/**
-	 * Environment values that extensions loaded into the child read from
-	 * `process.env`. Applied to the hosting process while the session is created
-	 * and its extensions load and start; launches in one process take that
-	 * window one at a time. An undefined value removes the variable.
-	 */
+	/** Environment transport for an isolated runner process. Parent-host launches omit this. */
 	processEnv?: Record<string, string | undefined>;
+	/** Request-scoped extension initialization inputs shared across the loader's async call chain. */
+	extensionBindingContext?: ExtensionBindingContext;
 	/** The typed runtime config the hooks were built from; informational for factories. */
 	runtime: ChildRuntimeConfig;
 	onExtensionError?: (error: ChildSessionExtensionError) => void;
@@ -124,7 +122,7 @@ export interface DefaultChildSessionFactoryOptions {
 
 type ModelRuntimeInstance = Awaited<ReturnType<PiCodingAgentModule["ModelRuntime"]["create"]>>;
 
-/** One launch at a time from env application through `session_start`, so parallel launches never observe each other's `processEnv` while their extensions load and start. */
+/** One launch at a time through session start to serialize Pi's process-wide extension cache reset. */
 let loading: Promise<unknown> = Promise.resolve();
 
 /**
@@ -216,6 +214,8 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 			});
 			const open = async () => {
 				applyProcessEnv(launch.processEnv);
+				const context = launch.extensionBindingContext ?? createExtensionBindingContext(undefined, undefined);
+				return runWithExtensionBindingContext(context, async () => {
 				if (!resetExtensionCacheOnReload(loader) && (launch.ambientExtensions || launch.extensionPaths.length)) launch.onExtensionError?.({ extensionPath: "<loader>", event: "load", error: new Error("pi's extension cache reset is unavailable; extensions loaded into this child share module state with other sessions in this process.") });
 				observeReadonly?.loadingHooks(true);
 				try { await loader.reload(); } finally { observeReadonly?.loadingHooks(false); }
@@ -257,6 +257,7 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 					throw error;
 				}
 				return session;
+				});
 			};
 			const opened = loading.catch(() => {}).then(open);
 			loading = opened;

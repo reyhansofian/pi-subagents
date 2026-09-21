@@ -1,4 +1,7 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+
 export const PI_SUBAGENT_EXTENSION_BINDINGS_ENV = "PI_SUBAGENT_EXTENSION_BINDINGS";
+export const EXTENSION_BINDING_CONTEXT_KEY = Symbol.for("pi-subagents.extension-binding-context.v1");
 export const MAX_EXTENSION_BINDING_NAMESPACES = 16;
 export const MAX_EXTENSION_BINDINGS_BYTES = 16 * 1024;
 export const MAX_EXTENSION_BINDINGS_DEPTH = 16;
@@ -12,6 +15,92 @@ export type ExtensionBindings = Readonly<Record<string, ExtensionBindingJson>>;
 export interface NormalizedExtensionBindings {
 	value: ExtensionBindings;
 	json: string;
+}
+
+export interface ExtensionBindingContext {
+	readonly extensionBindingsJson: string | undefined;
+	readonly mcpDirectTools: string | undefined;
+}
+
+export interface ExtensionBindingContextChannel {
+	readonly version: 1;
+	run<T>(context: ExtensionBindingContext, callback: () => T): T;
+	getStore(): ExtensionBindingContext | undefined;
+}
+
+const INVALID_CONTEXT = "Invalid pi-subagents extension-binding context v1";
+const CONTEXT_KEYS = ["extensionBindingsJson", "mcpDirectTools"];
+const CHANNEL_KEYS = ["getStore", "run", "version"];
+
+function invalidContext(): Error {
+	return new Error(INVALID_CONTEXT);
+}
+
+function exactFrozenDataObject(value: unknown, keys: string[]): Record<string, unknown> {
+	try {
+		if (!value || typeof value !== "object" || Array.isArray(value)) throw invalidContext();
+		const prototype = Object.getPrototypeOf(value);
+		if (prototype !== Object.prototype && prototype !== null) throw invalidContext();
+		if (!Object.isFrozen(value) || Object.getOwnPropertySymbols(value).length > 0) throw invalidContext();
+		const descriptors = Object.getOwnPropertyDescriptors(value);
+		if (Object.keys(descriptors).sort().join("\0") !== keys.join("\0")) throw invalidContext();
+		for (const key of keys) {
+			const descriptor = descriptors[key]!;
+			if (!descriptor.enumerable || !("value" in descriptor)) throw invalidContext();
+		}
+		return value as Record<string, unknown>;
+	} catch {
+		throw invalidContext();
+	}
+}
+
+function validateContext(value: unknown): asserts value is ExtensionBindingContext {
+	const context = exactFrozenDataObject(value, CONTEXT_KEYS);
+	if ((context.extensionBindingsJson !== undefined && typeof context.extensionBindingsJson !== "string")
+		|| (context.mcpDirectTools !== undefined && typeof context.mcpDirectTools !== "string")) throw invalidContext();
+}
+
+function validateChannel(value: unknown): asserts value is ExtensionBindingContextChannel {
+	const channel = exactFrozenDataObject(value, CHANNEL_KEYS);
+	if (channel.version !== 1 || typeof channel.run !== "function" || typeof channel.getStore !== "function") throw invalidContext();
+}
+
+export function createExtensionBindingContext(extensionBindingsJson: string | undefined, mcpDirectTools: string | undefined): ExtensionBindingContext {
+	return Object.freeze({ extensionBindingsJson, mcpDirectTools });
+}
+
+export function installExtensionBindingContext(target: object = globalThis): ExtensionBindingContextChannel {
+	let descriptor: PropertyDescriptor | undefined;
+	try { descriptor = Object.getOwnPropertyDescriptor(target, EXTENSION_BINDING_CONTEXT_KEY); }
+	catch { throw invalidContext(); }
+	if (descriptor) {
+		if (descriptor.enumerable || descriptor.configurable || !("value" in descriptor) || descriptor.writable) throw invalidContext();
+		validateChannel(descriptor.value);
+		return descriptor.value;
+	}
+	const storage = new AsyncLocalStorage<ExtensionBindingContext>();
+	const channel: ExtensionBindingContextChannel = Object.freeze({
+		version: 1,
+		run<T>(context: ExtensionBindingContext, callback: () => T): T {
+			validateContext(context);
+			if (typeof callback !== "function") throw invalidContext();
+			return storage.run(context, callback);
+		},
+		getStore: () => storage.getStore(),
+	});
+	try {
+		Object.defineProperty(target, EXTENSION_BINDING_CONTEXT_KEY, { value: channel, enumerable: false, writable: false, configurable: false });
+	} catch {
+		throw invalidContext();
+	}
+	return channel;
+}
+
+const extensionBindingContextChannel = installExtensionBindingContext();
+
+export function runWithExtensionBindingContext<T>(context: ExtensionBindingContext, callback: () => T): T {
+	validateContext(context);
+	return extensionBindingContextChannel.run(context, callback);
 }
 
 function canonicalizeJson(value: unknown, path: string, depth: number, seen: Set<object>, propertyCount: { value: number }): ExtensionBindingJson {
