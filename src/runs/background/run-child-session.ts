@@ -23,7 +23,7 @@ import { formatSubagentModelVerificationError } from "../shared/model-fallback.t
 import { hasCodeModeMutationAttempt, isMutatingTool, resolveCurrentPath } from "../shared/long-running-guard.ts";
 import { effectiveToolTimeoutMs, formatToolTimeoutMessage, toolTimeoutCallKey } from "../shared/tool-timeout.ts";
 import { createReportedChildSessionInput, type InProcessChildLaunch } from "../shared/child-launch.ts";
-import { projectChildSessionEventForJson, type ChildSession, type ChildSessionEvent, type ChildSessionFactory } from "../shared/child-session.ts";
+import { collectCurrentLaunchToolEvidence, projectChildSessionEventForJson, type ChildSession, type ChildSessionEvent, type ChildSessionFactory } from "../shared/child-session.ts";
 import { formatSteerMessage } from "../shared/subagent-prompt-runtime.ts";
 import { getReadonlySessionEvidence, requestReadonlySessionEvidence, type SettledReadonlyEvidence } from "../shared/readonly-session-evidence.ts";
 import type { SteerDeliveryStatus, SteerRequest } from "./control-channel.ts";
@@ -176,6 +176,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 		const startedAt = Date.now();
 		const messages: Message[] = [];
 		const toolResults = input.collectToolEvidence ? [] as Message[] : undefined;
+		const toolResultIndexesByCallId = new Map<string, { index: number; failed: boolean }>();
 		const usage = emptyUsage();
 		let model: string | undefined;
 		let error: string | undefined;
@@ -449,6 +450,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 			observedMutationAttempt = observedMutationAttempt || hasCodeModeMutationAttempt(codeModeDetails, input.mutationTools);
 
 			if (event.type === "tool_execution_end") {
+				collectCurrentLaunchToolEvidence(event, toolResults, toolResultIndexesByCallId);
 				clearActiveToolTimeout(event);
 				removeActiveToolCall(event);
 				return;
@@ -471,7 +473,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 
 			if ((event.type === "message_end" || event.type === "tool_result_end") && event.message) {
 				if (event.type === "tool_result_end") {
-					toolResults?.push(event.message);
+					collectCurrentLaunchToolEvidence(event, toolResults, toolResultIndexesByCallId);
 					clearActiveToolTimeout(event);
 					removeActiveToolCall({
 						toolCallId: (event.message as { toolCallId?: unknown }).toolCallId ?? event.toolCallId,

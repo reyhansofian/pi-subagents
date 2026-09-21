@@ -631,6 +631,71 @@ setTimeout(() => process.exit(90), 15000).unref();
 		assert.equal(accepted.results[0]?.acceptance?.runtimeChecks[0]?.status, "passed");
 	});
 
+	it("background completion collects successful current tool execution end evidence privately", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const run = async (name: string, event: object | object[]) => {
+			const id = "async-tool-execution-end-" + name + "-" + Date.now().toString(36);
+			mockPi.onCall({ jsonl: [...(Array.isArray(event) ? event : [event]), events.assistantMessage("Done with evidence")] });
+			executeAsyncSingle(id, {
+				agent: "scout",
+				task: "Inspect the repository",
+				agentConfig: makeAgent("scout", { completionGuard: false }),
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+				acceptance: { toolEvidence: ["read"] },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false,
+				sessionRoot: path.join(tempDir, "sessions"),
+				maxSubagentDepth: 2,
+			});
+			return JSON.parse(fs.readFileSync(await waitForAsyncResultFile(id, 10_000), "utf-8")) as AsyncResultPayload;
+		};
+
+		const successful = await run("success", { type: "tool_execution_end", toolCallId: "read-success", toolName: "read", result: {}, isError: false });
+		assert.equal(successful.success, true);
+		assert.equal(successful.results[0]?.acceptance?.runtimeChecks[0]?.status, "passed");
+
+		for (const [name, event] of [
+			["error", { type: "tool_execution_end", toolCallId: "read-error", toolName: "read", result: {}, isError: true }],
+			["missing-status", { type: "tool_execution_end", toolCallId: "read-missing-status", toolName: "read", result: {} }],
+			["non-boolean-status", { type: "tool_execution_end", toolCallId: "read-non-boolean-status", toolName: "read", result: {}, isError: "false" }],
+			["missing-name", { type: "tool_execution_end", toolCallId: "read-missing-name", result: {}, isError: false }],
+			["non-string-name", { type: "tool_execution_end", toolCallId: "read-non-string-name", toolName: 1, result: {}, isError: false }],
+			["exact-mismatch", { type: "tool_execution_end", toolCallId: "read-mismatch", toolName: "Read", result: {}, isError: false }],
+		] as const) {
+			const rejected = await run(name, event);
+			assert.equal(rejected.success, false);
+			assert.equal(rejected.results[0]?.acceptance?.runtimeChecks[0]?.status, "failed");
+			if (name === "error") assert.match(rejected.results[0]?.error ?? "", /Available launch tools: none/);
+		}
+
+		const legacy = await run("legacy", events.toolResult("read", "legacy result"));
+		assert.equal(legacy.success, true);
+
+		const dual = await run("dual", [
+			{ type: "tool_result_end", toolCallId: "read-dual", message: { role: "toolResult", toolCallId: "read-dual", toolName: "read", isError: false, content: [{ type: "text", text: "result" }] } },
+			{ type: "tool_execution_end", toolCallId: "read-dual", toolName: "read", result: {}, isError: false },
+		]);
+		assert.equal(dual.success, true);
+		assert.equal(dual.results[0]?.messages, undefined);
+		for (const [name, events] of [
+			["legacy-success-then-execution-error", [
+				{ type: "tool_result_end", toolCallId: "read-failure-1", message: { role: "toolResult", toolCallId: "read-failure-1", toolName: "read", isError: false, content: [] } },
+				{ type: "tool_execution_end", toolCallId: "read-failure-1", toolName: "read", result: {}, isError: true },
+			]],
+			["execution-success-then-legacy-error", [
+				{ type: "tool_execution_end", toolCallId: "read-failure-2", toolName: "read", result: {}, isError: false },
+				{ type: "tool_result_end", toolCallId: "read-failure-2", message: { role: "toolResult", toolCallId: "read-failure-2", toolName: "read", isError: true, content: [] } },
+			]],
+			["legacy-success-then-malformed-execution", [
+				{ type: "tool_result_end", toolCallId: "read-failure-3", message: { role: "toolResult", toolCallId: "read-failure-3", toolName: "read", isError: false, content: [] } },
+				{ type: "tool_execution_end", toolCallId: "read-failure-3", toolName: "read", result: {} },
+			]],
+		] as const) {
+			const rejected = await run(name, events);
+			assert.equal(rejected.success, false);
+			assert.equal(rejected.results[0]?.acceptance?.runtimeChecks[0]?.status, "failed");
+		}
+	});
+
 	it("background forced drain after final assistant output is cleanup success", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({
 			jsonl: [events.assistantMessage("async-done-before-drain")],

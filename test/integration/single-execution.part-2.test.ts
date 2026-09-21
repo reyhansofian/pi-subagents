@@ -1609,6 +1609,64 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		assert.equal(accepted.acceptance?.runtimeChecks[0]?.status, "passed");
 	});
 
+	it("agent contract collects successful current tool execution end evidence privately", async () => {
+		const agent = makeAgent("scout", { completionGuard: false });
+		const run = async (runId: string, event: object | object[]) => {
+			mockPi.onCall({ jsonl: [...(Array.isArray(event) ? event : [event]), events.assistantMessage("Done with evidence")] });
+			return runSync(tempDir, [agent], "scout", "Inspect the repository", {
+				runId,
+				agentContract: { version: 1 },
+				acceptance: { toolEvidence: ["read"] },
+			});
+		};
+
+		const successful = await run("v1-tool-execution-end-success", { type: "tool_execution_end", toolCallId: "read-success", toolName: "read", result: {}, isError: false });
+		assert.equal(successful.exitCode, 0, successful.error);
+		assert.equal(successful.acceptance?.runtimeChecks[0]?.status, "passed");
+
+		for (const [name, event] of [
+			["error", { type: "tool_execution_end", toolCallId: "read-error", toolName: "read", result: {}, isError: true }],
+			["missing-status", { type: "tool_execution_end", toolCallId: "read-missing-status", toolName: "read", result: {} }],
+			["non-boolean-status", { type: "tool_execution_end", toolCallId: "read-non-boolean-status", toolName: "read", result: {}, isError: "false" }],
+			["missing-name", { type: "tool_execution_end", toolCallId: "read-missing-name", result: {}, isError: false }],
+			["non-string-name", { type: "tool_execution_end", toolCallId: "read-non-string-name", toolName: 1, result: {}, isError: false }],
+			["exact-mismatch", { type: "tool_execution_end", toolCallId: "read-mismatch", toolName: "Read", result: {}, isError: false }],
+		] as const) {
+			const rejected = await run("v1-tool-execution-end-" + name, event);
+			assert.equal(rejected.exitCode, 1);
+			assert.equal(rejected.acceptance?.runtimeChecks[0]?.status, "failed");
+			if (name === "error") assert.match(rejected.error ?? "", /Available launch tools: none/);
+		}
+
+		const legacy = await run("v1-tool-result-end-legacy", events.toolResult("read", "legacy result"));
+		assert.equal(legacy.exitCode, 0, legacy.error);
+
+		const dual = await run("v1-tool-evidence-dual-end", [
+			{ type: "tool_result_end", toolCallId: "read-dual", message: { role: "toolResult", toolCallId: "read-dual", toolName: "read", isError: false, content: [{ type: "text", text: "result" }] } },
+			{ type: "tool_execution_end", toolCallId: "read-dual", toolName: "read", result: {}, isError: false },
+		]);
+		assert.equal(dual.exitCode, 0, dual.error);
+		assert.deepEqual(dual.messages?.map((message) => message.role), ["toolResult", "assistant"]);
+		for (const [name, events] of [
+			["legacy-success-then-execution-error", [
+				{ type: "tool_result_end", toolCallId: "read-failure-1", message: { role: "toolResult", toolCallId: "read-failure-1", toolName: "read", isError: false, content: [] } },
+				{ type: "tool_execution_end", toolCallId: "read-failure-1", toolName: "read", result: {}, isError: true },
+			]],
+			["execution-success-then-legacy-error", [
+				{ type: "tool_execution_end", toolCallId: "read-failure-2", toolName: "read", result: {}, isError: false },
+				{ type: "tool_result_end", toolCallId: "read-failure-2", message: { role: "toolResult", toolCallId: "read-failure-2", toolName: "read", isError: true, content: [] } },
+			]],
+			["legacy-success-then-malformed-execution", [
+				{ type: "tool_result_end", toolCallId: "read-failure-3", message: { role: "toolResult", toolCallId: "read-failure-3", toolName: "read", isError: false, content: [] } },
+				{ type: "tool_execution_end", toolCallId: "read-failure-3", toolName: "read", result: {} },
+			]],
+		] as const) {
+			const rejected = await run("v1-tool-evidence-" + name, events);
+			assert.equal(rejected.exitCode, 1);
+			assert.equal(rejected.acceptance?.runtimeChecks[0]?.status, "failed");
+		}
+	});
+
 	it("agent contract records explicit completion guard as an effect", async () => {
 		mockPi.onCall({ output: "Plan only" });
 		const agents = [makeAgent("worker", { tools: ["read", "write"], completionGuard: true })];

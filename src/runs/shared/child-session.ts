@@ -10,6 +10,7 @@
  */
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { Message } from "@earendil-works/pi-ai";
 import { getAgentDir } from "../../shared/utils.ts";
 import type { ChildRuntimeConfig } from "./child-runtime-config.ts";
 import { createExtensionBindingContext, runWithExtensionBindingContext, type ExtensionBindingContext } from "./extension-bindings.ts";
@@ -25,6 +26,53 @@ export function getReadonlyChildModels(child: ChildSession) {
 export interface ChildSessionEvent {
 	type: string;
 	[key: string]: unknown;
+}
+
+type ToolEvidenceState = { index: number; failed: boolean };
+
+function recordToolEvidence(toolResults: Message[], states: Map<string, ToolEvidenceState>, toolCallId: string, message: Message, failed: boolean): void {
+	const existing = states.get(toolCallId);
+	if (existing) {
+		if (existing.failed) return;
+		if (failed) states.set(toolCallId, { index: existing.index, failed: true });
+		toolResults[existing.index] = message;
+		return;
+	}
+	states.set(toolCallId, { index: toolResults.length, failed });
+	toolResults.push(message);
+}
+
+function failedToolEvidence(toolCallId: string, toolName: unknown): Message {
+	return { role: "toolResult", toolCallId, toolName: typeof toolName === "string" ? toolName : "", isError: true, content: [], timestamp: Date.now() };
+}
+
+/** Collect current-launch tool evidence without exposing synthetic messages. */
+export function collectCurrentLaunchToolEvidence(event: ChildSessionEvent, toolResults: Message[] | undefined, toolEvidenceByCallId: Map<string, ToolEvidenceState>): void {
+	if (!toolResults) return;
+	if (event.type === "tool_execution_end") {
+		const toolCallId = typeof event.toolCallId === "string" ? event.toolCallId : "";
+		if (typeof event.toolName !== "string" || event.isError !== false) {
+			if (toolCallId) recordToolEvidence(toolResults, toolEvidenceByCallId, toolCallId, failedToolEvidence(toolCallId, event.toolName), true);
+			return;
+		}
+		const message: Message = { role: "toolResult", toolCallId, toolName: event.toolName, isError: false, content: [], timestamp: Date.now() };
+		if (toolCallId) recordToolEvidence(toolResults, toolEvidenceByCallId, toolCallId, message, false);
+		else toolResults.push(message);
+		return;
+	}
+	if (event.type !== "tool_result_end" || !event.message) return;
+	const message = event.message as Message;
+	const toolCallId = typeof event.toolCallId === "string"
+		? event.toolCallId
+		: typeof (message as { toolCallId?: unknown }).toolCallId === "string"
+			? (message as { toolCallId: string }).toolCallId
+			: "";
+	if (!toolCallId) {
+		toolResults.push(message);
+		return;
+	}
+	const succeeded = message.role === "toolResult" && typeof message.toolName === "string" && message.isError === false;
+	recordToolEvidence(toolResults, toolEvidenceByCallId, toolCallId, message, !succeeded);
 }
 
 /** Mirror pi's JSON event projection: `message_update` drops the partial message. */

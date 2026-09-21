@@ -114,7 +114,7 @@ import {
 	type ChildWatchdogStatusEvent,
 } from "../../watchdog/child-status.ts";
 import { buildInProcessChildLaunch, createReportedChildSessionInput } from "../shared/child-launch.ts";
-import { childSessionFactory, projectChildSessionEventForJson, type ChildSession, type ChildSessionEvent } from "../shared/child-session.ts";
+import { childSessionFactory, collectCurrentLaunchToolEvidence, projectChildSessionEventForJson, type ChildSession, type ChildSessionEvent } from "../shared/child-session.ts";
 
 const artifactOutputByResult = new WeakMap<SingleResult, string>();
 const acceptanceOutputByResult = new WeakMap<SingleResult, string>();
@@ -532,6 +532,7 @@ async function runSingleAttempt(
 		...(capabilityAudit ? { capabilityAudit } : {}),
 	}, options.context);
 	const currentLaunchToolResults = shared.collectToolEvidence ? [] as Message[] : undefined;
+	const toolResultIndexesByCallId = new Map<string, { index: number; failed: boolean }>();
 	if (currentLaunchToolResults) toolEvidenceByResult.set(result, { toolResults: currentLaunchToolResults, availableTools: toolPlan.effectiveToolAllowlist });
 	const startTime = Date.now();
 	const controlConfig = options.controlConfig ?? DEFAULT_CONTROL_CONFIG;
@@ -1080,6 +1081,7 @@ async function runSingleAttempt(
 			}
 
 			if (evt.type === "tool_execution_end") {
+				collectCurrentLaunchToolEvidence(evt, currentLaunchToolResults, toolResultIndexesByCallId);
 				clearActiveToolTimeout(evt);
 				const endedTool = removeActiveToolCall(evt);
 				if (endedTool) {
@@ -1152,7 +1154,7 @@ async function runSingleAttempt(
 			}
 
 			if (evt.type === "tool_result_end" && evt.message) {
-				currentLaunchToolResults?.push(evt.message);
+				collectCurrentLaunchToolEvidence(evt, currentLaunchToolResults, toolResultIndexesByCallId);
 				const toolResultCompletion = {
 					toolCallId: (evt.message as { toolCallId?: unknown }).toolCallId ?? (evt as { toolCallId?: unknown }).toolCallId,
 					toolName: (evt.message as { toolName?: unknown }).toolName ?? (evt as { toolName?: unknown }).toolName,
