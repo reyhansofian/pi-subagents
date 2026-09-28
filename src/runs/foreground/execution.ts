@@ -1605,7 +1605,7 @@ async function runSingleAttempt(
 	}
 		if (options.outputPath && result.exitCode === 0) {
 			const resolvedOutput = resolveSingleOutput(options.outputPath, fullOutput,
-				structuredOnlyOutput ? captureSingleOutputSnapshot(options.outputPath) : shared.outputSnapshot, options.outputClaimPath);
+				shared.outputSnapshot, options.outputClaimPath);
 			fullOutput = stripAcceptanceReport(resolvedOutput.fullOutput);
 			result.savedOutputPath = resolvedOutput.savedPath;
 			result.outputSaveError = resolvedOutput.saveError;
@@ -1621,7 +1621,7 @@ async function runSingleAttempt(
 		artifactOutputByResult.set(result, fullOutput);
 		acceptanceOutputByResult.set(result, acceptanceOutput);
 	result.outputMode = options.outputMode ?? "inline";
-	result.finalOutput = options.outputMode === "file-only" && !structuredOnlyOutput && result.savedOutputPath && result.outputReference
+	result.finalOutput = options.outputMode === "file-only" && result.savedOutputPath && result.outputReference
 		? result.outputReference.message
 		: fullOutput;
 	result.controlEvents = allControlEvents.length ? allControlEvents : undefined;

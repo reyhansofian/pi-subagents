@@ -1662,6 +1662,40 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		assert.equal(result.finalOutput, "Assistant summary");
 	});
 
+	it("preserves child-written Markdown over structured JSON in file-only mode", async () => {
+		const outputPath = path.join(tempDir, "context.md");
+		const markdown = ["# Context", "", "Detailed findings remain intact.", ""].join("\n");
+		const structured = { ok: true, count: 2 };
+		mockPi.onCall({ writeFiles: [{ path: outputPath, content: markdown }], structuredOutput: structured });
+		const result = await runSync(tempDir, [makeAgent("echo")], "echo", "Write context", {
+			runId: "structured-file-only-authoritative-markdown", outputMode: "file-only", outputPath,
+			structuredOutput: { schema: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" }, count: { type: "number" } } },
+				schemaPath: path.join(tempDir, "context-schema.json"), outputPath: path.join(tempDir, "context-structured.json") },
+		});
+		assert.equal(result.exitCode, 0, result.error);
+		assert.equal(fs.readFileSync(outputPath, "utf-8"), markdown);
+		assert.deepEqual(result.structuredOutput, structured);
+		assert.equal(result.savedOutputPath, outputPath);
+		assert.equal(result.outputReference?.path, outputPath);
+		assert.match(result.finalOutput ?? "", /^Output saved to:/);
+		assert.doesNotMatch(result.finalOutput ?? "", /count/);
+	});
+
+	it("serializes validated structured JSON into an unwritten configured file", async () => {
+		const outputPath = path.join(tempDir, "context-fallback.md");
+		mockPi.onCall({ structuredOutput: { ok: true } });
+		const result = await runSync(tempDir, [makeAgent("echo")], "echo", "Return structured data", {
+			runId: "structured-file-only-json-fallback", outputMode: "file-only", outputPath,
+			structuredOutput: { schema: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } },
+				schemaPath: path.join(tempDir, "fallback-schema.json"), outputPath: path.join(tempDir, "fallback-structured.json") },
+		});
+		assert.equal(result.exitCode, 0, result.error);
+		assert.deepEqual(JSON.parse(fs.readFileSync(outputPath, "utf-8")), { ok: true });
+		assert.deepEqual(result.structuredOutput, { ok: true });
+		assert.equal(result.savedOutputPath, outputPath);
+		assert.match(result.finalOutput ?? "", /^Output saved to:/);
+	});
+
 	it("routes retained workflow follow-ups to distinct outputs without overwriting the writer report", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		for (const relative of [false, true]) {
 			const writerPath = path.join(tempDir, `writer-${relative}.md`);
@@ -3190,6 +3224,54 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 
 		const result = await runSync(tempDir, agents, "echo", "Task", {
 			runId: "resume-provider-after-tool",
+			sessionFile,
+		});
+
+		assert.equal(result.exitCode, 0);
+		assert.equal(result.finalOutput, "Recovered from retained session");
+		assert.deepEqual(result.attemptedModels, ["openai/gpt-5-mini"]);
+		assert.deepEqual(result.modelAttempts?.map((attempt) => attempt.success), [false, true]);
+		assert.equal(mockPi.callCount(), 2);
+		const [firstArgs, resumedArgs] = readAllCallArgs();
+		assert.equal(firstArgs?.[firstArgs.indexOf("--session") + 1], sessionFile);
+		assert.equal(resumedArgs?.[resumedArgs.indexOf("--session") + 1], sessionFile);
+		assert.match(readAllCallArgs(true)[1]?.at(-1) ?? "", /Continue from the current files and transcript/);
+		assert.equal(fs.readFileSync(path.join(tempDir, "side-effect.txt"), "utf-8"), "done");
+	});
+
+	it("resumes the retained session once after late compaction_start following settlement following completed tool work", async () => {
+		const sessionFile = path.join(tempDir, "late-abort-recovery-session.jsonl");
+		mockPi.onCall({
+			jsonl: [
+				events.toolStart("write", { path: "side-effect.txt", content: "done" }),
+				events.toolEnd("write"),
+				events.toolResult("write", "Wrote side-effect.txt"),
+				{
+					type: "message_end",
+					message: {
+						role: "assistant",
+						content: [],
+						model: "openai/gpt-5-mini",
+						stopReason: "error", errorMessage: "This operation was aborted",
+						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+					},
+				},
+				{ type: "agent_settled" },
+				{ type: "compaction_start" },
+			],
+			omitImplicitFinalEvents: true,
+			writeFiles: [{ path: "side-effect.txt", content: "done" }, { path: sessionFile, content: "{}\n" }],
+			keepAliveAfterFinalMessageMs: 5_000,
+			exitCode: 0,
+		});
+		mockPi.onCall({ output: "Recovered from retained session" });
+		const agents = [makeAgent("echo", {
+			model: "openai/gpt-5-mini",
+			fallbackModels: ["anthropic/claude-sonnet-4"],
+		})];
+
+		const result = await runSync(tempDir, agents, "echo", "Task", {
+			runId: "resume-provider-after-late-compaction",
 			sessionFile,
 		});
 
