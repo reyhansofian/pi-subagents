@@ -17,6 +17,9 @@ import { createSubagentExecutor } from "../../src/runs/foreground/subagent-execu
 import { drainOutstandingWork } from "../../src/runs/background/auto-drain.ts";
 import { waitForSubagents } from "../../src/runs/background/subagent-wait.ts";
 import { updateActiveRunIndex } from "../../src/runs/background/active-run-index.ts";
+import { buildInProcessChildLaunch } from "../../src/runs/shared/child-launch.ts";
+import { runChildSession } from "../../src/runs/background/run-child-session.ts";
+import type { ChildSessionEvent, ChildSessionFactory } from "../../src/runs/shared/child-session.ts";
 import type { ForegroundRunControl, ForegroundSteerInput, SubagentState } from "../../src/shared/types.ts";
 import { DIRS } from "../../src/shared/types.ts";
 
@@ -621,7 +624,7 @@ describe("supervisor ask registration", () => {
 		};
 		let blocked: ReturnType<SupervisorTool["execute"]> | undefined;
 		let waitEntered = false;
-		let replied = false;
+		let childCompleted = false;
 		try {
 			writeState("running");
 			channel.start();
@@ -629,7 +632,7 @@ describe("supervisor ask registration", () => {
 				channelDir, runId, agent: "worker", childIndex: 0, orchestratorSessionId: owner,
 			});
 			const drain = () => drainOutstandingWork({ state, timeoutMs: 2000,
-				hasWork: () => !replied,
+				hasWork: () => !childCompleted,
 				hasPendingSupervisorRequest: channel.hasPendingRequests,
 				wait: (params, signal, deps) => {
 					waitEntered = true;
@@ -639,18 +642,37 @@ describe("supervisor ask registration", () => {
 			});
 			const draining = drain();
 			await waitForCondition(() => waitEntered, "parent to enter its actual wait");
-			blocked = childTools.get("contact_supervisor")!.execute("ask", { action: "ask", reason: "need_decision", message: "Choose the next step" } as never);
+			let emit: (event: ChildSessionEvent) => void = () => {};
+			const factory: ChildSessionFactory = {
+				async create() { return {
+					subscribe(listener) { emit = listener; return () => { emit = () => {}; }; },
+					async prompt() {
+						blocked = childTools.get("contact_supervisor")!.execute("ask", { action: "ask", reason: "need_decision", message: "Choose the next step" } as never);
+						await blocked;
+						emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Completed after reply" }], stopReason: "stop" } });
+						emit({ type: "agent_settled" });
+					},
+					async abort() {}, async dispose() {}, async steer() {}, async followUp() {},
+					messages: [], sessionId: "worker", sessionFile: undefined, modelId: undefined,
+				}; },
+				async dispose() {},
+			};
+			const launch = buildInProcessChildLaunch({ cwd: root, host: "parent", sessionEnabled: false,
+				allowNestedSubagents: false, waitToolEnabled: false, inheritProjectContext: false,
+				inheritGlobalContext: false, inheritSkills: false, parentSessionId: owner,
+				runId, childAgentName: "worker", childIndex: 0, sessionName: "worker", systemPrompt: "Test." });
+			const child = runChildSession({ factory, launch, prompt: "Ask then complete", appendChildEvent() {}, writeOutputLine() {} })
+				.then((result) => { writeState("complete"); childCompleted = true; return result; });
 			await waitForCondition(() => channel.hasPendingRequests(), "owned child ask to reach mailbox");
 			await draining;
-			assert.equal(replied, false, "agent_end must yield before child reply");
+			assert.equal(childCompleted, false, "agent_end must yield before child reply and completion");
 			const requestId = [...channel.pending.keys()][0]!;
 			assert.ok(requestId);
 			await tools.get(NATIVE_SUPERVISOR_TOOL_NAME)!.execute("reply", { action: "reply", replyTo: requestId, message: "Proceed" });
 			assert.match(text(await blocked), /Proceed/);
-			writeState("complete");
-			replied = true;
+			assert.equal((await child).finalOutput, "Completed after reply");
 			await drain();
-			assert.equal(replied, true);
+			assert.equal(childCompleted, true);
 		} finally { channel.dispose(); fs.rmSync(root, { recursive: true, force: true }); }
 	});
 
