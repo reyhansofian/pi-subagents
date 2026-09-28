@@ -1647,8 +1647,19 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		assert.equal(result.isError, undefined);
 		const child = result.details?.results?.[0];
 		assert.deepEqual(child?.structuredOutput, { ok: true, note: "captured" });
-		assert.match(child?.finalOutput ?? "", /"ok": true/);
-		if (child?.artifactPaths?.outputPath) assert.match(fs.readFileSync(child.artifactPaths.outputPath, "utf-8"), /"note": "captured"/);
+		assert.deepEqual(JSON.parse(child?.finalOutput ?? ""), { ok: true, note: "captured" });
+		if (child?.artifactPaths?.outputPath) assert.deepEqual(JSON.parse(fs.readFileSync(child.artifactPaths.outputPath, "utf-8")), { ok: true, note: "captured" });
+	});
+
+	it("keeps assistant text authoritative when structured output is captured", async () => {
+		mockPi.onCall({ output: "Assistant summary", structuredOutput: { ok: true } });
+		const result = await runSync(tempDir, [makeAgent("echo")], "echo", "Return structured data", {
+			runId: "structured-with-text",
+			structuredOutput: { schema: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } }, schemaPath: path.join(tempDir, "schema.json"), outputPath: path.join(tempDir, "structured.json") },
+		});
+		assert.equal(result.exitCode, 0);
+		assert.deepEqual(result.structuredOutput, { ok: true });
+		assert.equal(result.finalOutput, "Assistant summary");
 	});
 
 	it("routes retained workflow follow-ups to distinct outputs without overwriting the writer report", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {

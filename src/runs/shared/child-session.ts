@@ -270,17 +270,21 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 			// extensions loaded into it (ambient extensions included) release their
 			// watchers, servers, and timers. Do the same, then dispose.
 			const shutdown = async (): Promise<void> => {
+				let shutdownTimer: NodeJS.Timeout | undefined;
 				try {
 					const runner = session.extensionRunner;
 					if (runner.hasHandlers("session_shutdown")) {
 						evidence?.beforeShutdown();
-						const settled = await Promise.race([runner.emit({ type: "session_shutdown", reason: "quit" }).then(() => true), new Promise<false>((resolve) => setTimeout(() => resolve(false), shutdownTimeoutMs).unref?.())]);
+						const settled = await Promise.race([runner.emit({ type: "session_shutdown", reason: "quit" }).then(() => true), new Promise<false>((resolve) => {
+							shutdownTimer = setTimeout(() => resolve(false), shutdownTimeoutMs);
+						})]);
 						if (!settled) evidence?.invalidate();
 					}
 				} catch (error) {
 					evidence?.invalidate();
 					launch.onExtensionError?.({ extensionPath: "<session>", event: "session_shutdown", error });
 				} finally {
+				if (shutdownTimer) clearTimeout(shutdownTimer);
 					session.dispose();
 					evidence?.finish(child);
 				}

@@ -565,7 +565,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(fs.readFileSync(outputPath, "utf-8"), report);
 	});
 
-	it("async workflow runs.all rejects structured-only foreground children without a report", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+	it("async workflow runs.all saves validated structured-only foreground output as JSON", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
 		const outputPath = path.join(tempDir, "workflow-structured-only-report.md");
 		mockPi.onCall({ structuredOutput: { ok: true } });
 		const state = { baseCwd: tempDir, currentSessionId: null, asyncJobs: new Map(), foregroundControls: new Map(), lastForegroundControlId: null };
@@ -594,8 +594,11 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.ok(launch.details.asyncId);
 		const payload = await readAsyncPayload(launch.details.asyncId);
 		const child = payload.results[0];
-		assert.equal(child?.success, false);
-		assert.equal(fs.existsSync(outputPath), false);
+		assert.equal(payload.success, true);
+		assert.equal(child?.success, true);
+		assert.deepEqual(child?.structuredOutput, { ok: true });
+		assert.deepEqual(JSON.parse(fs.readFileSync(outputPath, "utf-8")), { ok: true });
+		assert.equal(child?.outputReference, outputPath);
 	});
 
 	it("removes Pi turn-timing telemetry from runtime-persisted background output", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {

@@ -59,6 +59,7 @@ function writePackageAgent(name: string): void {
 describe("agent eject/disable/enable/reset management actions", () => {
 	beforeEach(() => {
 		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-eject-"));
+		fs.mkdirSync(path.join(tempDir, ".pi"));
 		oldAgentDir = process.env.PI_CODING_AGENT_DIR;
 		process.env.PI_CODING_AGENT_DIR = path.join(tempDir, "agent-home");
 		clearSkillCache();
@@ -104,7 +105,9 @@ describe("agent eject/disable/enable/reset management actions", () => {
 		it("copies a package agent that shadows a builtin by runtime precedence", () => {
 			const ctx = { cwd: tempDir, modelRegistry: { getAvailable: () => [] } };
 			writePackageAgent("reviewer");
-			assert.equal(discoverAgents(tempDir, "both").agents.find((a) => a.name === "reviewer")?.source, "package");
+			const packageAgent = discoverAgents(tempDir, "both").agents.find((a) => a.name === "reviewer");
+			assert.equal(packageAgent?.source, "package");
+			assert.equal(packageAgent.filePath, packageAgentPath("reviewer"));
 
 			const ejected = handleManagementAction("eject", { agent: "reviewer" }, ctx);
 			assert.equal(ejected.isError, false);

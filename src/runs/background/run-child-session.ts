@@ -170,6 +170,7 @@ function omitUndefined<T extends object>(value: T): T {
 const FINAL_STOP_GRACE_MS = 1000;
 const HARD_FINISH_MS = 3000;
 const ABORT_SETTLE_MS = 3000;
+const POST_TOOL_ERROR_REQUEST_DEADLINE_MS = 120_000;
 
 export function runChildSession(input: RunChildSessionInput): Promise<RunChildSessionResult> {
 	return new Promise((resolve) => {
@@ -203,6 +204,8 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 		let finalHardFinishTimer: NodeJS.Timeout | undefined;
 		let watchdogTailTimer: NodeJS.Timeout | undefined;
 		let abortSettleTimer: NodeJS.Timeout | undefined;
+		let postErrorTimer: NodeJS.Timeout | undefined;
+		let postErrorDeadlineAt: number | undefined;
 		let childWatchdogState: ChildWatchdogStateSnapshot | undefined;
 		const childLifecycleState: ChildLifecycleState = { compactionRetryActive: false };
 		const timeoutMessage = () => input.timeoutMessage ?? "Subagent timed out.";
@@ -370,12 +373,33 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 		const clearAllToolTimeouts = (): void => {
 			for (const key of [...activeToolTimeouts.keys()]) removeToolTimeoutKey(key);
 		};
+		const clearPostErrorDeadline = (): void => {
+			if (postErrorTimer) clearTimeout(postErrorTimer);
+			postErrorTimer = undefined;
+			postErrorDeadlineAt = undefined;
+		};
 		const terminateForTimeout = (message: string): void => {
 			if (settled || promptSettled || timedOut || stopped) return;
+			clearPostErrorDeadline();
 			timedOut = true;
 			interrupted = false;
 			error = message;
 			abortChild();
+		};
+		const checkPostErrorDeadline = (): void => {
+			if (postErrorDeadlineAt !== undefined && Date.now() >= postErrorDeadlineAt && activeToolCalls.size === 0) {
+				terminateForTimeout(`Post-tool-error assistant request exceeded its deadline of ${POST_TOOL_ERROR_REQUEST_DEADLINE_MS}ms.`);
+				// Keep the detached runner alive through forced settlement if abort ignores us.
+				abortSettleTimer?.ref?.();
+			}
+		};
+		const armPostErrorDeadline = (): void => {
+			if (postErrorDeadlineAt !== undefined || timedOut || stopped || interrupted) return;
+			postErrorDeadlineAt = Date.now() + POST_TOOL_ERROR_REQUEST_DEADLINE_MS;
+			postErrorTimer = setTimeout(() => {
+				postErrorTimer = undefined;
+				checkPostErrorDeadline();
+			}, POST_TOOL_ERROR_REQUEST_DEADLINE_MS);
 		};
 		const armToolTimeout = (event: { toolCallId?: unknown; toolName: string }): void => {
 			const timeoutForTool = effectiveToolTimeoutMs(event.toolName, input.toolTimeoutMs);
@@ -451,10 +475,12 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 			if (event.type === "tool_execution_end") {
 				clearActiveToolTimeout(event);
 				removeActiveToolCall(event);
+				checkPostErrorDeadline();
 				return;
 			}
 
 			if (event.type === "tool_execution_start" && event.toolName) {
+				clearPostErrorDeadline();
 				toolCount += 1;
 				const toolArgs = event.args && typeof event.args === "object" && !Array.isArray(event.args) ? event.args : {};
 				armToolTimeout({ toolCallId: event.toolCallId, toolName: event.toolName });
@@ -477,7 +503,10 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 						toolCallId: (event.message as { toolCallId?: unknown }).toolCallId ?? event.toolCallId,
 						toolName: (event.message as { toolName?: unknown }).toolName ?? event.toolName,
 					});
+					if (event.message.role === "toolResult" && event.message.isError === true) armPostErrorDeadline();
+					checkPostErrorDeadline();
 				}
+				if (event.type === "message_end" && event.message.role === "assistant") clearPostErrorDeadline();
 				messages.push(event.message);
 				const text = extractTextFromContent(event.message.content);
 				if (text) writeOutputText(text);
@@ -523,6 +552,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 
 		/** Stops observing the child and returns when its extensions have shut down. */
 		const finish = (): Promise<void> => {
+			clearPostErrorDeadline();
 			clearFinalDrainTimers();
 			clearWatchdogTailTimer();
 			clearAllToolTimeouts();
@@ -591,6 +621,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 
 		input.registerInterrupt?.(() => {
 			if (settled || promptSettled || timedOut || stopped) return;
+			clearPostErrorDeadline();
 			interrupted = true;
 			if (!error) error = "Interrupted. Waiting for explicit next action.";
 			abortChild();
@@ -598,6 +629,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 		input.registerTimeout?.(() => terminateForTimeout(timeoutMessage()));
 		input.registerStop?.(() => {
 			if (settled || promptSettled || timedOut || stopped) return;
+			clearPostErrorDeadline();
 			stopped = true;
 			interrupted = false;
 			error = stopMessage();
