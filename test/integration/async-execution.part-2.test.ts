@@ -2131,6 +2131,71 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(fs.readFileSync(path.join(tempDir, "side-effect.txt"), "utf-8"), "done");
 	});
 
+	it("background runs resume the retained session once after late compaction_start following settlement following completed tool work", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const sessionFile = path.join(tempDir, "async-late-abort-recovery-session.jsonl");
+		mockPi.onCall({
+			jsonl: [
+				events.toolStart("write", { path: "side-effect.txt", content: "done" }),
+				events.toolEnd("write"),
+				events.toolResult("write", "Wrote side-effect.txt"),
+				{
+					type: "message_end",
+					message: {
+						role: "assistant",
+						content: [],
+						model: "openai/gpt-5-mini",
+						stopReason: "error", errorMessage: "This operation was aborted",
+						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+					},
+				},
+				{ type: "agent_settled" },
+				{ type: "compaction_start" },
+			],
+			omitImplicitFinalEvents: true,
+			writeFiles: [{ path: "side-effect.txt", content: "done" }, { path: sessionFile, content: "{}\n" }],
+			keepAliveAfterFinalMessageMs: 5_000,
+			exitCode: 0,
+		});
+		mockPi.onCall({ output: "Recovered asynchronously from retained session" });
+		const id = `async-late-compaction-provider-after-tool-${Date.now().toString(36)}`;
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Do work",
+			sessionFile,
+			agentConfig: makeAgent("worker", {
+				model: "openai/gpt-5-mini:high",
+				fallbackModels: ["anthropic/claude-sonnet-4:low"],
+			}),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			availableModels: [
+				{ provider: "openai", id: "gpt-5-mini", fullId: "openai/gpt-5-mini" },
+				{ provider: "anthropic", id: "claude-sonnet-4", fullId: "anthropic/claude-sonnet-4" },
+			],
+			artifactConfig: {
+				enabled: false,
+				includeInput: false,
+				includeOutput: false,
+				includeJsonl: false,
+				includeMetadata: false,
+				cleanupDays: 7,
+			},
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+		});
+
+		const payload = JSON.parse(fs.readFileSync(await waitForAsyncResultFile(id), "utf-8"));
+		assert.equal(payload.success, true);
+		assert.deepEqual(payload.results[0].attemptedModels, ["openai/gpt-5-mini:high"]);
+		assert.deepEqual(payload.results[0].modelAttempts.map((attempt: { success: boolean }) => attempt.success), [false, true]);
+		assert.equal(mockPi.callCount(), 2);
+		const firstArgs = readMockPiArgs(mockPi, 0);
+		const resumedArgs = readMockPiArgs(mockPi, 1);
+		assert.equal(firstArgs[firstArgs.indexOf("--session") + 1], sessionFile);
+		assert.equal(resumedArgs[resumedArgs.indexOf("--session") + 1], sessionFile);
+		assert.match(resumedArgs.at(-1) ?? "", /Continue from the current files and transcript/);
+		assert.equal(fs.readFileSync(path.join(tempDir, "side-effect.txt"), "utf-8"), "done");
+	});
+
 	it("background compaction abort without a retained session does not fall back", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({
 			jsonl: [
