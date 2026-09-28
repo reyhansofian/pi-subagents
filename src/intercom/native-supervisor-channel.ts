@@ -609,6 +609,7 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 	start: () => void;
 	activateTransport: () => void;
 	findPendingAsks: (target: { runId: string; agent: string; childIndex: number }) => string[];
+	hasPendingRequests: () => boolean;
 	dispose: () => void;
 	pending: Map<string, PendingSupervisorRequest>;
 	getSupervisorRequestState: (event: ControlEvent) => SupervisorRequestState;
@@ -851,6 +852,11 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 					&& request.agent === target.agent && request.childIndex === target.childIndex
 					&& requestLifecycle(request, state, now, runState(request)) === "pending" ? [request.id] : [];
 			}).sort();
+		},
+		hasPendingRequests: () => {
+			if (!started) return false;
+			poll();
+			return pending.size > 0;
 		},
 		start: () => {
 			if (started) return;

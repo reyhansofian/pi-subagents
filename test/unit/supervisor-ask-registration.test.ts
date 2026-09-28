@@ -14,6 +14,9 @@ import {
 } from "../../src/intercom/native-supervisor-channel.ts";
 import { steerWorkflowForegroundTarget } from "../../src/runs/foreground/workflow-foreground-steering.ts";
 import { createSubagentExecutor } from "../../src/runs/foreground/subagent-executor.ts";
+import { drainOutstandingWork } from "../../src/runs/background/auto-drain.ts";
+import { waitForSubagents } from "../../src/runs/background/subagent-wait.ts";
+import { updateActiveRunIndex } from "../../src/runs/background/active-run-index.ts";
 import type { ForegroundRunControl, ForegroundSteerInput, SubagentState } from "../../src/shared/types.ts";
 import { DIRS } from "../../src/shared/types.ts";
 
@@ -396,11 +399,13 @@ describe("supervisor ask registration", () => {
 			channel.start();
 			const tool = tools.get(NATIVE_SUPERVISOR_TOOL_NAME)!;
 			const expired = writeRequest({ sessionId, runId, expiresAt: Date.now() - 1 });
+			assert.equal(channel.hasPendingRequests(), false, "expired asks never stop headless drain");
 			await assert.rejects(tool.execute("expired", { action: "reply", replyTo: expired, message: "Too late" }), /No pending supervisor request found/);
 			const missing = writeRequest({ sessionId, runId });
 			const resolved = writeRequest({ sessionId, runId });
 			await tool.execute("pending", { action: "pending" });
 			assert.equal(channel.pending.size, 2);
+			assert.equal(channel.hasPendingRequests(), true);
 			const dir = resolveSupervisorChannelDir(runId, "worker", 0);
 			fs.rmSync(path.join(dir, "requests", `${missing}.json`));
 			const replyFile = path.join(dir, "replies", `${resolved}.json`);
@@ -409,6 +414,7 @@ describe("supervisor ask registration", () => {
 				await assert.rejects(tool.execute("stale", { action: "reply", replyTo, message: "Must not overwrite" }), /No pending supervisor request found/);
 			}
 			assert.equal(channel.pending.size, 0);
+			assert.equal(channel.hasPendingRequests(), false, "resolved and missing asks must not stop drain");
 			assert.deepEqual(fs.readdirSync(path.join(dir, "replies")), [`${resolved}.json`]);
 			assert.equal(JSON.parse(fs.readFileSync(replyFile, "utf8")).message, "Already answered");
 		} finally { channel.dispose(); }
@@ -596,6 +602,58 @@ describe("supervisor ask registration", () => {
 	});
 
 	// Drive the real child-side disk protocol: steering cannot resolve asks, explicit reply can.
+	it("yields a headless parent drain for an ask arriving mid-wait, then completes after the real reply", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "supervisor-drain-reply-"));
+		const owner = randomUUID();
+		const runId = "run-" + randomUUID();
+		const channelDir = resolveSupervisorChannelDir(runId, "worker", 0);
+		createdChannels.push(channelDir);
+		const tools = new Map<string, SupervisorTool>();
+		const childTools = new Map<string, SupervisorTool>();
+		const state = makeState(owner, makeCtx(owner));
+		const channel = createNativeSupervisorChannel(makePi({ tools }) as never, state, { platform: "darwin" });
+		const runDir = path.join(root, "runs", runId);
+		fs.mkdirSync(runDir, { recursive: true });
+		const writeState = (status: "running" | "complete") => {
+			fs.writeFileSync(path.join(runDir, "status.json"), JSON.stringify({ runId, mode: "single", state: status,
+				sessionId: owner, pid: 999999, startedAt: Date.now(), lastUpdate: Date.now(), steps: [{ agent: "worker", status }] }));
+			updateActiveRunIndex(runDir, status);
+		};
+		let blocked: ReturnType<SupervisorTool["execute"]> | undefined;
+		let waitEntered = false;
+		let replied = false;
+		try {
+			writeState("running");
+			channel.start();
+			registerNativeSupervisorClient(makePi({ tools: childTools }) as never, {
+				channelDir, runId, agent: "worker", childIndex: 0, orchestratorSessionId: owner,
+			});
+			const drain = () => drainOutstandingWork({ state, timeoutMs: 2000,
+				hasWork: () => !replied,
+				hasPendingSupervisorRequest: channel.hasPendingRequests,
+				wait: (params, signal, deps) => {
+					waitEntered = true;
+					return waitForSubagents(params, signal, { ...deps, asyncDirRoot: path.join(root, "runs"), resultsDir: path.join(root, "results"),
+						kill: () => true, pollIntervalMs: 250, sleep: async () => { await new Promise(resolve => setTimeout(resolve, 10)); } });
+				},
+			});
+			const draining = drain();
+			await waitForCondition(() => waitEntered, "parent to enter its actual wait");
+			blocked = childTools.get("contact_supervisor")!.execute("ask", { action: "ask", reason: "need_decision", message: "Choose the next step" } as never);
+			await waitForCondition(() => channel.hasPendingRequests(), "owned child ask to reach mailbox");
+			await draining;
+			assert.equal(replied, false, "agent_end must yield before child reply");
+			const requestId = [...channel.pending.keys()][0]!;
+			assert.ok(requestId);
+			await tools.get(NATIVE_SUPERVISOR_TOOL_NAME)!.execute("reply", { action: "reply", replyTo: requestId, message: "Proceed" });
+			assert.match(text(await blocked), /Proceed/);
+			writeState("complete");
+			replied = true;
+			await drain();
+			assert.equal(replied, true);
+		} finally { channel.dispose(); fs.rmSync(root, { recursive: true, force: true }); }
+	});
+
 	it("only unblocks the real contact_supervisor tool through an explicit reply, not steer or follow_up", async () => {
 		const sessionId = `session-${randomUUID()}`;
 		const workflowRunId = `workflow-${randomUUID()}`;

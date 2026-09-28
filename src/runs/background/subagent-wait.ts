@@ -118,6 +118,8 @@ export interface SubagentWaitDeps {
 	failOnFailedRuns?: boolean;
 	/** Internal auto-drain mode surfaces actionable attention as an error. */
 	failOnAttention?: boolean;
+	/** Internal headless drain barrier for live owned reply-bearing requests. */
+	hasPendingSupervisorRequest?: () => boolean;
 	/** Arm a durable exact-target wait subscription in a long-lived interactive runtime. */
 	subscribe?: (input: { targetKind: "async" | "foreground"; runId: string; requestedId: string; timeoutMs: number }) => { token: string; expiresAt: number };
 	/** Injectable provider protocol surfaces for deterministic tests. */
@@ -378,6 +380,16 @@ function windowElapsedResult(
 	};
 }
 
+function supervisorYieldResult(activeRunIds: string[], activeProviderItems: readonly RegisteredBackgroundWorkItem[] = []): AgentToolResult<Details> {
+	return {
+		content: [{ type: "text", text: "Wait yielded for a pending supervisor request. Background work remains active." }],
+		details: { mode: "management", results: [], wait: {
+			reason: "supervisor_request", timedOut: false, activeRunIds,
+			activeProviderItems: activeProviderItems.map(({ provider, id }) => ({ provider, id })),
+		} },
+	};
+}
+
 /** Build the live status shown while async work keeps bg_wait blocked. */
 function asyncWaitUpdate(runs: AsyncRunSummary[], providerCount: number, elapsedMs: number): AgentToolResult<Details> {
 	const activity = runs.flatMap((run) => {
@@ -500,6 +512,7 @@ async function waitForDetachedForegroundRun(
 	now: () => number,
 	pollIntervalMs: number,
 	timeoutMs: number,
+	supervisorYield?: () => AgentToolResult<Details>,
 ): Promise<AgentToolResult<Details>> {
 	const initialDetachedIndices = new Set(run.children.filter((child) => child.status === "detached").map((child) => child.index));
 	while (true) {
@@ -510,6 +523,7 @@ async function waitForDetachedForegroundRun(
 		if (!current || current.sessionId !== run.sessionId) {
 			return result(`Remembered foreground run "${run.runId}" disappeared before a terminal child result was recorded. Completion cannot be confirmed; do not launch a replacement without checking the originating child session.`, true);
 		}
+		if (deps.hasPendingSupervisorRequest?.()) return supervisorYield?.() ?? supervisorYieldResult([run.runId]);
 		const pending = current.children.filter((child) => initialDetachedIndices.has(child.index) && child.status === "detached");
 		const attention = foregroundChildrenNeedingAttention(current, initialDetachedIndices);
 		if (attention.length > 0) return formatForegroundAttention(current, attention, now() - startedAt);
@@ -617,8 +631,23 @@ export async function waitForSubagents(
 	const initialCount = initialAsyncIds.size + initialProviderIds.size;
 	const stopOnAttention = params.stopOnAttention ?? deps.stopOnAttention !== false;
 	let attention = active.filter((run) => needsAttention(run));
+	let supervisorBarrier = false;
+	const supervisorYield = () => {
+		let activeIds = active.filter((run) => initialAsyncIds.has(run.id)).map((run) => run.id);
+		let providerItems = providerActive.filter((item) => initialProviderIds.has(backgroundWorkIdentity(item)));
+		try {
+			activeIds = activeRunsForSession(waitParams, deps).filter((run) => initialAsyncIds.has(run.id)).map((run) => run.id);
+			providerItems = (params.id ? providerActive : backgroundWorkForSession(deps, now()).items)
+				.filter((item) => initialProviderIds.has(backgroundWorkIdentity(item)));
+		} catch { /* Retain the last observed initial identities when status is unavailable. */ }
+		return supervisorYieldResult(activeIds, providerItems);
+	};
 
 	const isDone = (): boolean => {
+		if (deps.hasPendingSupervisorRequest?.()) {
+			supervisorBarrier = true;
+			return true;
+		}
 		if (attention.some((run) => initialAsyncIds.has(run.id) && (stopOnAttention || hasSupervisorTool(run)))) return true;
 		const activeAsyncIds = new Set(active.map((run) => run.id));
 		const activeProviderIds = new Set(providerActive.map(backgroundWorkIdentity));
@@ -663,6 +692,8 @@ export async function waitForSubagents(
 			return result(error instanceof Error ? error.message : String(error), true);
 		}
 	}
+
+	if (supervisorBarrier) return supervisorYield();
 
 	let terminalSummary: string;
 	let finishedAsyncCount: number;

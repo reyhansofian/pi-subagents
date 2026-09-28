@@ -1343,6 +1343,7 @@ describe("subagent extension child mode", () => {
 			function makePi(source) {
 				return {
 					events: { on() { return () => {}; }, emit() {} },
+					on() {},
 					registerTool(tool) {
 						if (registeredNames.has(tool.name)) {
 							throw new Error("Tool " + tool.name + " conflicts with " + source);
@@ -1382,6 +1383,7 @@ describe("subagent extension child mode", () => {
 			let registeredTool;
 			const fakePi = {
 				events: { on() { return () => {}; }, emit() {} },
+				on() {},
 				registerTool(tool) { registeredTool = tool; },
 				getSessionName() { return undefined; },
 			};

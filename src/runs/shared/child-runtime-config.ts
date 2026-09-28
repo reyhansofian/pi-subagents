@@ -86,6 +86,8 @@ export interface ChildRuntimeConfig {
 	/** Receives child watchdog status events. */
 	watchdogStatus?: (event: ChildWatchdogStatusEvent) => void;
 	waitTool: ResolvedWaitToolConfig;
+	/** Installation-local owner-channel barrier, never serialized into descendants. */
+	hasPendingSupervisorRequest?: () => boolean;
 	structuredOutput?: ChildStructuredOutput;
 	requiredTools?: string[];
 	mcpDirectTools?: string[];

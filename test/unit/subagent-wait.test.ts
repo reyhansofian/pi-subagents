@@ -624,6 +624,26 @@ describe("bg_wait tool", () => {
 		}
 	});
 
+	it("yields an active workflow when its owned supervisor request arrives after waiting begins", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-owned-ask-"));
+		try {
+			const runs = path.join(root, "runs");
+			const state = makeState("sess-1");
+			writeStatus(runs, "workflow-a", "running", { sessionId: "sess-1", pid: 999999, mode: "workflow" });
+			let pending = false;
+			let polls = 0;
+			const outcome = await waitForSubagents({ all: true, stopOnAttention: false }, undefined, baseDeps(root, state, {
+				failOnAttention: true, hasPendingSupervisorRequest: () => pending,
+				sleep: async () => { polls++; pending = true; },
+			}));
+			assert.equal(outcome.isError, undefined);
+			assert.deepEqual(outcome.details.wait, { reason: "supervisor_request", timedOut: false, activeRunIds: ["workflow-a"], activeProviderItems: [] });
+			assert.equal(outcome.details.completions, undefined, "yield must not consume terminal completion evidence");
+			assert.equal(polls, 1);
+			assert.equal(JSON.parse(fs.readFileSync(path.join(runs, "workflow-a", "status.json"), "utf-8")).state, "running");
+		} finally { fs.rmSync(root, { recursive: true, force: true }); }
+	});
+
 	it("reports runs that already need attention before waiting starts", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-initial-attn-"));
 		try {

@@ -492,7 +492,7 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI, config?:
 				if ((ctx as ExtensionContext)?.sessionManager?.getSessionFile() !== waitState.currentSessionId) drainObservation.deny();
 			} catch { drainObservation.deny(); }
 		}
-		await drainOutstandingWork({ state: waitState, events: pi.events }, drainObservation);
+		await drainOutstandingWork({ state: waitState, events: pi.events, hasPendingSupervisorRequest: config.hasPendingSupervisorRequest }, drainObservation);
 	});
 	if (config.structuredOutput) registerStructuredOutputTool(pi, config.structuredOutput);
 

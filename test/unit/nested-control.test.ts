@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, it } from "node:test";
 import registerFanoutChildSubagentExtension from "../../src/extension/fanout-child.ts";
+import { NATIVE_SUPERVISOR_TOOL_NAME, registerNativeSupervisorClient, resolveSupervisorChannelDir } from "../../src/intercom/native-supervisor-channel.ts";
 import { createSubagentExecutor, readNestedRecoveryDescriptor } from "../../src/runs/foreground/subagent-executor.ts";
 import { createNestedRoute, findNestedControlResult, projectNestedEvents, readNestedControlRequests, readNestedControlResults, snapshotNestedEventFiles, writeNestedControlRequest, writeNestedControlResult, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
 import type { ChildRuntimeConfig } from "../../src/runs/shared/child-runtime-config.ts";
@@ -494,12 +495,50 @@ describe("nested control routing", () => {
 		}
 	});
 
+	it("binds a nested coordinator's live descendant request to its own headless drain barrier and reply", async () => {
+		const route = createNestedRoute("root-nested-supervisor");
+		routeRoots.push(path.dirname(route.eventSink));
+		const runtime = fanoutChildRuntime(route, "root-nested-supervisor");
+		const handlers = new Map<string, Array<(event?: unknown, context?: unknown) => unknown>>();
+		const parentTools = new Map<string, { execute: (id: string, params: unknown) => Promise<{ content: Array<{ text?: string }> }> }>();
+		const pi = {
+			events: { emit() {}, on() { return () => {}; } },
+			on(event: string, handler: (event?: unknown, context?: unknown) => unknown) { handlers.set(event, [...(handlers.get(event) ?? []), handler]); },
+			registerTool(tool: { name: string; execute: (id: string, params: unknown) => Promise<{ content: Array<{ text?: string }> }> }) { parentTools.set(tool.name, tool); },
+			getAllTools() { return [...parentTools.keys()].map(name => ({ name })); },
+			getSessionName() { return "coordinator"; },
+			sendMessage() {},
+		} as any;
+		const descendantRunId = "nested-descendant-" + Date.now();
+		const channelDir = resolveSupervisorChannelDir(descendantRunId, "worker", 0);
+		try {
+			registerFanoutChildSubagentExtension(pi, runtime);
+			assert.equal(runtime.hasPendingSupervisorRequest?.(), false, "no inherited barrier before ownership starts");
+			for (const handler of handlers.get("session_start") ?? []) handler({}, { sessionManager: { getSessionId: () => "nested-owner", getSessionFile: () => null } });
+			const childTools = new Map<string, { execute: (id: string, params: unknown) => Promise<{ content: Array<{ text?: string }> }> }>();
+			registerNativeSupervisorClient({ getAllTools: () => [], registerTool(tool: { name: string; execute: (id: string, params: unknown) => Promise<{ content: Array<{ text?: string }> }> }) { childTools.set(tool.name, tool); } } as any, {
+				channelDir, runId: descendantRunId, agent: "worker", childIndex: 0, orchestratorSessionId: "nested-owner",
+			});
+			const blocked = childTools.get("contact_supervisor")!.execute("ask", { reason: "need_decision", message: "Nested descendant needs a decision" });
+			await waitFor(() => runtime.hasPendingSupervisorRequest?.() === true);
+			const pending = await parentTools.get(NATIVE_SUPERVISOR_TOOL_NAME)!.execute("pending", { action: "pending" });
+			const id = (pending as { details?: { pending?: Array<{ id: string }> } }).details?.pending?.[0]?.id;
+			assert.ok(id, "nested owner must discover the descendant request");
+			await parentTools.get(NATIVE_SUPERVISOR_TOOL_NAME)!.execute("reply", { action: "reply", replyTo: id, message: "Proceed" });
+			assert.match(JSON.stringify(await blocked), /Proceed/);
+			assert.equal(runtime.hasPendingSupervisorRequest?.(), false);
+			for (const handler of handlers.get("session_shutdown") ?? []) handler();
+			assert.equal(runtime.hasPendingSupervisorRequest, undefined);
+		} finally { fs.rmSync(channelDir, { recursive: true, force: true }); }
+	});
+
 	it("keeps the fanout child control listener alive after control inbox polling errors", async () => {
 		const route = createNestedRoute("root-poll-error");
 		routeRoots.push(path.dirname(route.eventSink));
 		const childRuntime = fanoutChildRuntime(route, "root-poll-error");
 		const pi = {
 			events: { emit() {}, on() { return () => {}; } },
+			on() {},
 			registerTool() {},
 			getSessionName() { return "child"; },
 		} as any;
@@ -536,6 +575,7 @@ describe("nested control routing", () => {
 		const childRuntime = fanoutChildRuntime(route, "root-result-write-fails");
 		const pi = {
 			events: { emit() {}, on() { return () => {}; } },
+			on() {},
 			registerTool() {},
 			getSessionName() { return "child"; },
 		} as any;
@@ -586,6 +626,7 @@ describe("nested control routing", () => {
 		try {
 			const makePi = () => ({
 				events: { emit() {}, on() { return () => {}; } },
+				on() {},
 				registerTool() { registrations.push("subagent"); },
 				getSessionName() { return "child"; },
 			}) as any;
@@ -627,6 +668,7 @@ describe("nested control routing", () => {
 		const childRuntime = fanoutChildRuntime(route, "root-ownerless");
 		const pi = {
 			events: { emit() {}, on() { return () => {}; } },
+			on() {},
 			registerTool() {},
 			getSessionName() { return "child"; },
 		} as any;
