@@ -12,6 +12,7 @@ import { externalJobFollowUpRequestDigest, externalJobFollowUpRunId, externalJob
 import { waitForSubagents } from "../../src/runs/background/subagent-wait.ts";
 import { createRunFanoutBudget } from "../../src/runs/shared/run-fanout-budget.ts";
 import { acquireSessionLease, sessionLeaseDir } from "../../src/runs/shared/session-lease.ts";
+import { readProcessTerminal } from "../../src/runs/background/process-terminal.ts";
 import type { MockPi } from "../support/helpers.ts";
 import {
 	createMockPi,
@@ -181,6 +182,17 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 			await new Promise((resolve) => setTimeout(resolve, 50));
 		}
 		assert.fail(`Timed out waiting for status at ${filePath}; last status: ${JSON.stringify(lastStatus)}`);
+	}
+
+	async function waitForOwnedRunnerTerminal(runId: string): Promise<void> {
+		const asyncDir = path.join(ASYNC_DIR, runId);
+		const deadline = Date.now() + 10_000;
+		let proof = readProcessTerminal(asyncDir, { runId });
+		while (proof?.state !== "observed") {
+			assert.ok(Date.now() <= deadline, "No terminal proof for owned runner " + runId + "; retaining " + asyncDir + "; proof=" + JSON.stringify(proof));
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			proof = readProcessTerminal(asyncDir, { runId });
+		}
 	}
 
 	function writeRecoveryDescriptor(asyncDir: string, runId: string, agent = "worker", overrides: Record<string, unknown> = {}): void {
@@ -363,7 +375,10 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 			assert.equal(mockPi.callCount(), 2, "each retained follow-up must execute once without replay or extra children");
 		} finally {
 			fs.rmSync(sourceAsyncDir, { recursive: true, force: true });
-			for (const id of revivedIds) fs.rmSync(path.join(ASYNC_DIR, id), { recursive: true, force: true });
+			for (const id of revivedIds) {
+				await waitForOwnedRunnerTerminal(id);
+				fs.rmSync(path.join(ASYNC_DIR, id), { recursive: true, force: true });
+			}
 		}
 	});
 
@@ -597,6 +612,7 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 			assert.equal(status.steps?.[0]?.externalJob?.requestDigest, requestDigest);
 			assert.equal(status.steps?.[0]?.externalJob?.providerJobId, "job-child");
 		} finally {
+			if (fs.existsSync(continuationAsyncDir)) await waitForOwnedRunnerTerminal(expectedRunId);
 			fs.rmSync(sourceAsyncDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
 			fs.rmSync(continuationAsyncDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
 			fs.rmSync(path.join(RESULTS_DIR, `${expectedRunId}.json`), { force: true });
@@ -667,6 +683,7 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 			assert.equal(status.steps?.[0]?.externalJob?.sourceStepIndex, 1);
 			assert.equal(status.steps?.[0]?.externalJob?.parentProviderJobId, "job-second");
 		} finally {
+			if (fs.existsSync(continuationAsyncDir)) await waitForOwnedRunnerTerminal(expectedRunId);
 			fs.rmSync(sourceAsyncDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
 			fs.rmSync(continuationAsyncDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
 			fs.rmSync(path.join(RESULTS_DIR, `${expectedRunId}.json`), { force: true });
@@ -1064,7 +1081,11 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 			assert.equal(handoff.groups?.[0]?.children?.[0]?.patch?.filesChanged, 1);
 		} finally {
 			fs.rmSync(asyncDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
-			if (revivedId) fs.rmSync(path.join(ASYNC_DIR, revivedId), { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+			if (revivedId) {
+				const revivedDir = path.join(ASYNC_DIR, revivedId);
+				await waitForOwnedRunnerTerminal(revivedId);
+				fs.rmSync(revivedDir, { recursive: true, force: true });
+			}
 			if (revivedId) fs.rmSync(path.join(RESULTS_DIR, `${revivedId}.json`), { force: true });
 			fs.rmSync(sessionFile, { force: true });
 		}
@@ -1187,6 +1208,7 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 		const sessionFile = path.join(tempDir, "workflow-resume-start-session.jsonl");
 		let workflowRunId: string | undefined;
 		let revivedRunId: string | undefined;
+		let workflowIsLive: (() => boolean) | undefined;
 		try {
 			fs.mkdirSync(sourceAsyncDir, { recursive: true });
 			fs.writeFileSync(sessionFile, "", "utf-8");
@@ -1203,7 +1225,8 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 			}, null, 2), "utf-8");
 			writeRecoveryDescriptor(sourceAsyncDir, sourceRunId);
 			const competingLease = acquireSessionLease({ sessionFile, runId: "workflow-competing-revival", sourceRunId, parentSessionId });
-			const { executor } = makeExecutor({ maxActiveAsyncRunsPerSession: 1 });
+			const { executor, state } = makeExecutor({ maxActiveAsyncRunsPerSession: 1 });
+			workflowIsLive = () => (state as typeof state & { workflowControllers?: Map<string, unknown> }).workflowControllers?.has(workflowRunId ?? "") === true;
 			const ctx = makeMinimalCtx(tempDir);
 			ctx.sessionManager.getSessionId = () => parentSessionId;
 			try {
@@ -1218,20 +1241,29 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 				assert.ok(workflowRunId, "expected async workflow id");
 				await waitForFile(path.join(RESULTS_DIR, `${workflowRunId}.json`));
 				const workflowStatusPath = path.join(ASYNC_DIR, workflowRunId, "status.json");
-				const workflowStatus = await waitForStatus(workflowStatusPath, (value) => value?.state === "failed") as { steps?: Array<{ async?: boolean; runId?: string; lane?: unknown }>; error?: string };
+				const workflowStatus = await waitForStatus(workflowStatusPath, (value) => value?.state === "failed") as { pid?: number; steps?: Array<{ async?: boolean; runId?: string; lane?: unknown }>; error?: string };
 				revivedRunId = workflowStatus.steps?.[0]?.runId;
 
+				assert.equal(workflowStatus.pid, process.pid, "workflow owner executes in this test process");
 				assert.equal(workflowStatus.steps?.[0]?.async, true);
 				assert.ok(revivedRunId, "expected the workflow step to keep revived run identity");
 				assert.deepEqual(workflowStatus.steps?.[0]?.lane, { version: 1, key: "resume-child", mode: "mutation", sourceRef: "owner/repo#1621", claims: ["retained.txt"] });
 				assert.match(workflowStatus.error ?? "", /already owned by run 'workflow-competing-revival'/);
+				assert.equal(mockPi.callCount(), 0, "failed-before-proceed revival never launches a Pi writer");
 				assert.deepEqual(getActiveAsyncCapacitySnapshot(parentSessionId, 1), { used: 0, limit: 1 });
 			} finally {
 				competingLease.release();
 			}
 		} finally {
 			fs.rmSync(sourceAsyncDir, { recursive: true, force: true });
-			if (workflowRunId) fs.rmSync(path.join(ASYNC_DIR, workflowRunId), { recursive: true, force: true });
+			if (workflowRunId) {
+				const deadline = Date.now() + 10_000;
+				while (workflowIsLive?.()) {
+					assert.ok(Date.now() <= deadline, "In-process workflow still owns " + workflowRunId);
+					await new Promise((resolve) => setTimeout(resolve, 50));
+				}
+				fs.rmSync(path.join(ASYNC_DIR, workflowRunId), { recursive: true, force: true });
+			}
 			if (revivedRunId) fs.rmSync(path.join(ASYNC_DIR, revivedRunId), { recursive: true, force: true });
 			fs.rmSync(path.join(ACTIVE_ASYNC_CAPACITY_DIR, activeAsyncCapacitySessionKey(parentSessionId)), { recursive: true, force: true });
 		}

@@ -5,11 +5,18 @@ import { afterEach, test } from "node:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { createOrcaProgressTab, resolveOrcaCommand, resolvePiSessionId } from "../../src/runs/shared/orca-progress-tabs.ts";
+import { createOrcaProgressTab as createTab, resolveOrcaCommand, resolvePiSessionId } from "../../src/runs/shared/orca-progress-tabs.ts";
 import { TEMP_ROOT_DIR } from "../../src/shared/types.ts";
 import { writeNodeCommand } from "../support/node-command.ts";
 
 const tempDirs: string[] = [];
+const pendingCreations: Promise<void>[] = [];
+
+function createOrcaProgressTab(input: Parameters<typeof createTab>[0]): ReturnType<typeof createTab> {
+	const tab = createTab(input);
+	if (tab) pendingCreations.push(tab.creationSettled);
+	return tab;
+}
 
 function removeProgressFiles(prefix: string): void {
 	const root = path.join(TEMP_ROOT_DIR, "orca-progress");
@@ -19,7 +26,8 @@ function removeProgressFiles(prefix: string): void {
 	}
 }
 
-afterEach(() => {
+afterEach(async () => {
+	await Promise.all(pendingCreations.splice(0).map(awaitCreation));
 	const progressRoot = path.join(TEMP_ROOT_DIR, "orca-progress");
 	for (const dir of tempDirs.splice(0)) {
 		let scope = path.resolve(dir);
@@ -50,6 +58,17 @@ async function waitForFile(file: string, timeoutMs = 5_000): Promise<void> {
 	while (!fs.existsSync(file)) {
 		if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${file}`);
 		await new Promise((resolve) => setTimeout(resolve, 20));
+	}
+}
+
+async function awaitCreation(settled: Promise<void>): Promise<void> {
+	let timer!: NodeJS.Timeout;
+	try {
+		await Promise.race([settled, new Promise<never>((_, reject) => {
+			timer = setTimeout(() => reject(new Error("Orca creation did not settle")), 5_000);
+		})]);
+	} finally {
+		clearTimeout(timer);
 	}
 }
 
@@ -171,6 +190,13 @@ test("hung Orca terminal creation does not delay the owning process", { skip: pr
 		await waitForFile(pidFile);
 		fakePid = Number.parseInt(fs.readFileSync(pidFile, "utf-8"), 10);
 		process.kill(fakePid, 0);
+		const progressRoot = path.join(TEMP_ROOT_DIR, "orca-progress");
+		const key = createHash("sha256").update(fs.realpathSync(dir)).digest("hex").slice(0, 20);
+		const pending = fs.readdirSync(progressRoot).find((name) => name.startsWith(`create-${key}-`) && name.endsWith(".pending"));
+		assert.ok(pending, "owner watchdog must have reserved its sequence");
+		process.kill(fakePid, "SIGKILL");
+		await waitForFile(path.join(progressRoot, pending.replace(/\.pending$/, ".ready")));
+		fakePid = undefined;
 	} finally {
 		if (fakePid !== undefined) {
 			try { process.kill(fakePid, "SIGKILL"); } catch { /* already stopped */ }
@@ -195,7 +221,7 @@ test("malformed optional observer metadata cannot break child execution", { skip
 	assert.ok(tab);
 	await tab.finish("completed");
 	// Capture precedes the watchdog's final manifest/queue writes; wait for its close.
-	await tab.creationSettled;
+	await awaitCreation(tab.creationSettled);
 	const args = JSON.parse(fs.readFileSync(capture, "utf-8")) as string[];
 	assert.equal(args[args.indexOf("--title") + 1], "subagents · subagent · 1");
 	const manifestDir = path.join(dir, ".pi", "subagents", "views", "orca");
@@ -206,6 +232,36 @@ test("malformed optional observer metadata cannot break child execution", { skip
 	assert.match(await captureCommand(viewer, dir), /completed/);
 	assert.equal(fs.existsSync(manifest.logPath), false);
 	assert.equal(fs.existsSync(manifest.logPath.replace(/\.log$/, ".done")), false);
+});
+
+test("watchdog spawn errors settle creation and unblock later tabs", { skip: process.platform === "win32" ? "Orca progress tabs are not supported on Windows" : undefined }, async () => {
+	const dir = tempDir();
+	const fakeNode = path.join(dir, "node");
+	fs.writeFileSync(fakeNode, "#!/no-such-test-interpreter\n", { mode: 0o755 });
+	const originalExecPath = process.execPath;
+	let tab;
+	try {
+		process.execPath = fakeNode;
+		tab = createOrcaProgressTab({
+			cwd: dir, runId: "spawn-error", agent: "worker", index: 0,
+			config: { enabled: true }, command: path.join(dir, "unused-orca"),
+		});
+	} finally {
+		process.execPath = originalExecPath;
+	}
+	assert.ok(tab);
+	await awaitCreation(tab.creationSettled);
+	const capture = path.join(dir, "node-capture");
+	assert.equal(fs.existsSync(capture), false);
+	const second = createOrcaProgressTab({
+		cwd: dir, runId: "after-spawn-error", agent: "worker", index: 0,
+		config: { enabled: true }, command: writeCaptureOrca(dir),
+		env: { ...process.env, ORCA_TEST_CAPTURE: capture },
+	});
+	assert.ok(second);
+	await awaitCreation(second.creationSettled);
+	assert.equal(fs.existsSync(capture), true);
+	await second.finish("failed");
 });
 
 test("disabled Orca progress tabs do not invoke Orca", async () => {

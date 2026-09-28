@@ -1431,6 +1431,12 @@ export interface Details {
 		timedOut: true;
 		activeRunIds: string[];
 		activeProviderItems: Array<{ provider: string; id: string }>;
+	} | {
+		/** Internal nonterminal yield while owned work remains active. */
+		reason: "supervisor_request";
+		timedOut: false;
+		activeRunIds: string[];
+		activeProviderItems: Array<{ provider: string; id: string }>;
 	};
 	controlEvents?: ControlEvent[];
 	steering?: SteerActionResult;

@@ -1,7 +1,9 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { createNativeSupervisorChannel } from "../intercom/native-supervisor-channel.ts";
+import { resolveCurrentSessionId } from "../shared/session-identity.ts";
 import { discoverAgents } from "../agents/agents.ts";
 import { getArtifactsDir } from "../shared/artifacts.ts";
 import { createSubagentExecutor, type SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
@@ -157,6 +159,21 @@ export default function registerFanoutChildSubagentExtension(pi: ExtensionAPI, c
 	const config = loadConfig();
 	const waitToolConfig = resolveWaitToolConfig(config.waitTool);
 	const state = createChildSafeState();
+	const supervisorChannel = createNativeSupervisorChannel(pi, state, {
+		getCurrentOwnerStates: () => executor.getCurrentSupervisorOwnerStates(),
+	});
+	childConfig.hasPendingSupervisorRequest = supervisorChannel.hasPendingRequests;
+	pi.on("session_start", (_event, ctx) => {
+		state.currentSessionId = resolveCurrentSessionId(ctx.sessionManager);
+		state.supervisorOwnerSessionId = ctx.sessionManager.getSessionId() || null;
+		supervisorChannel.start();
+		supervisorChannel.activateTransport();
+	});
+	pi.on("session_shutdown", () => {
+		supervisorChannel.dispose();
+		if (childConfig.hasPendingSupervisorRequest === supervisorChannel.hasPendingRequests) childConfig.hasPendingSupervisorRequest = undefined;
+		state.supervisorOwnerSessionId = null;
+	});
 	const executor = createSubagentExecutor({
 		pi,
 		state,

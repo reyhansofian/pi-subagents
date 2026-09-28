@@ -23,6 +23,8 @@ export interface FakeChildResponse {
 	waitForPath?: string;
 	keepAliveAfterFinalMessageMs?: number;
 	jsonl?: unknown[];
+	/** Leave terminal lifecycle events to scripted JSONL for ordering-sensitive regressions. */
+	omitImplicitFinalEvents?: boolean;
 	/** Raw JSON lines; parsed into events for the in-process child without acceptance-report injection. */
 	stdoutRaw?: string;
 	steps?: Array<{ delay?: number; waitForPath?: string; jsonl?: unknown[]; stdoutRaw?: string }>;
@@ -320,8 +322,10 @@ export function createFakeChildSessions(queueDir: () => string): FakeChildSessio
 					emit({ type: "tool_execution_end", toolName: "structured_output" });
 				}
 				if (record.aborted) return;
-				emit({ type: "agent_end", messages: [...messages], willRetry: false });
-				emit({ type: "agent_settled" });
+				if (!response.omitImplicitFinalEvents) {
+					emit({ type: "agent_end", messages: [...messages], willRetry: false });
+					emit({ type: "agent_settled" });
+				}
 				if (typeof response.keepAliveAfterFinalMessageMs === "number" && response.keepAliveAfterFinalMessageMs > 0) {
 					await Promise.race([sleep(response.keepAliveAfterFinalMessageMs), abortedPromise]);
 				}

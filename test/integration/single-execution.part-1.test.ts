@@ -302,6 +302,8 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(child?.savedOutputPath, configuredPath);
 		assert.equal(child?.outputMode, "file-only");
 		assert.deepEqual(child?.structuredOutput, { ok: true });
+		assert.match(child?.finalOutput ?? "", /^Output saved to:/);
+		assert.equal(child?.outputReference?.path, configuredPath);
 		assert.deepEqual(JSON.parse(fs.readFileSync(configuredPath, "utf-8")), { ok: true });
 	});
 

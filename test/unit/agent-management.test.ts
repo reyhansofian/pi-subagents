@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { editableAgentConfig, handleCreate, handleList, handleManagementAction, handleUpdate } from "../../src/agents/agent-management.ts";
-import { EXTRA_AGENT_DIRS_ENV } from "../../src/agents/agents.ts";
+import { discoverAgentsAll, EXTRA_AGENT_DIRS_ENV } from "../../src/agents/agents.ts";
 import { EXTERNAL_JOB_PROVIDER_REGISTRY_KEY, registerExternalJobProvider } from "../../src/api/external-job-provider.ts";
 import { clearSkillCache } from "../../src/agents/skills.ts";
 import { PI_CODING_AGENT_PACKAGE_ROOT_ENV } from "../../src/shared/utils.ts";
@@ -24,6 +24,7 @@ function readText(result: { content: Array<{ type: string; text?: string }> }): 
 describe("agent management config parsing", () => {
 	beforeEach(() => {
 		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-management-"));
+		fs.mkdirSync(path.join(tempDir, ".pi"));
 		oldAgentDir = process.env.PI_CODING_AGENT_DIR;
 		process.env.PI_CODING_AGENT_DIR = path.join(tempDir, "agent-home");
 		clearSkillCache();
@@ -34,6 +35,13 @@ describe("agent management config parsing", () => {
 		else process.env.PI_CODING_AGENT_DIR = oldAgentDir;
 		clearSkillCache();
 		fs.rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	it("keeps project discovery inside the fixture root", () => {
+		const discovered = discoverAgentsAll(tempDir);
+		assert.equal(discovered.projectDir, path.join(tempDir, ".pi", "agents"));
+		assert.ok(discovered.project.every((agent) => agent.filePath.startsWith(tempDir + path.sep)));
+		assert.equal(discovered.project.some((agent) => agent.name === "test-runner"), false);
 	});
 
 	it("surfaces JSON parse errors for create config strings", () => {

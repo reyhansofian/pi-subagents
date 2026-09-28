@@ -676,6 +676,8 @@ async function runSingleAttempt(
 			}
 			if (!accepted) return false;
 			detached = true;
+			timeoutTimer?.unref?.();
+			timeoutHardFinishTimer?.unref?.();
 			if (session) session.detached = true;
 			return true;
 		};
@@ -994,7 +996,10 @@ async function runSingleAttempt(
 			jsonlWriter.writeLine(JSON.stringify(projectChildSessionEventForJson(evt)));
 			shared.transcriptWriter?.writeChildEvent(evt);
 			shared.orcaProgressTab?.event(evt);
-			if (evt.type === "compaction_start") compactionStartedReceived = true;
+			if (evt.type === "compaction_start") {
+				compactionStartedReceived = true;
+				if (agentSettledReceived) afterCompactionSettlement = true;
+			}
 			if (evt.type === "compaction_end" && evt.willRetry === true) {
 				compactionStartedReceived = false;
 				afterCompactionSettlement = false;
@@ -1231,9 +1236,8 @@ async function runSingleAttempt(
 					if (sessionSettled || lifecycleFinished) return;
 					settle(undefined, true);
 				}, 4000);
-				timeoutHardFinishTimer.unref?.();
+			if (detached) timeoutHardFinishTimer.unref?.();
 			}, attemptTimeout.remainingMs);
-			timeoutTimer.unref?.();
 		}
 
 		let toolTimeoutSequence = 0;
@@ -1475,7 +1479,7 @@ async function runSingleAttempt(
 			? hasSingleOutputChangedSinceSnapshot(options.outputPath, shared.outputSnapshot)
 			: undefined;
 		const missingOutput = options.outputMode === "file-only" && options.outputPath
-			? !finalText?.trim() && outputChanged !== true
+			? !finalText?.trim() && outputChanged !== true && !validatedStructuredOutput
 			: !finalText?.trim() && !validatedStructuredOutput;
 		const terminalEmptyAfterUsefulWork = !validatedStructuredOutput
 			&& hasEmptyTerminalAssistantResponse(messages)
@@ -1510,6 +1514,8 @@ async function runSingleAttempt(
 
 	const acceptanceOutput = getFinalOutput(result.messages ?? []);
 	let fullOutput = stripAcceptanceReport(acceptanceOutput);
+	const structuredOnlyOutput = result.exitCode === 0 && validatedStructuredOutput && !fullOutput.trim();
+	if (structuredOnlyOutput) fullOutput = JSON.stringify(result.structuredOutput, null, 2) ?? "";
 	result.outputState = fullOutput.trim() || result.structuredOutput !== undefined ? "present" : "absent";
 	if (result.timedOut) {
 		const timeoutMessage = formatTimeoutMessage(options.timeoutMs ?? 0);
@@ -1600,7 +1606,8 @@ async function runSingleAttempt(
 		}));
 	}
 		if (options.outputPath && result.exitCode === 0) {
-			const resolvedOutput = resolveSingleOutput(options.outputPath, fullOutput, shared.outputSnapshot, options.outputClaimPath);
+			const resolvedOutput = resolveSingleOutput(options.outputPath, fullOutput,
+				shared.outputSnapshot, options.outputClaimPath);
 			fullOutput = stripAcceptanceReport(resolvedOutput.fullOutput);
 			result.savedOutputPath = resolvedOutput.savedPath;
 			result.outputSaveError = resolvedOutput.saveError;

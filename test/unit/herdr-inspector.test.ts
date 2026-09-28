@@ -57,10 +57,14 @@ describe("Herdr inspector", () => {
 		assert.equal(missingResult.ok, false);
 		if (!missingResult.ok) assert.equal(missingResult.error.code, "HERDR_UNAVAILABLE");
 
-		const timeout = createHerdrClient({ spawn: (() => fakeChild()) as never });
+		const stalled = fakeChild();
+		let killed = false;
+		stalled.kill = () => { killed = true; return true; };
+		const timeout = createHerdrClient({ spawn: (() => stalled) as never });
 		const timeoutResult = await timeout.run(["pane", "get", "w1:p2"], { timeoutMs: 5 });
 		assert.equal(timeoutResult.ok, false);
 		if (!timeoutResult.ok) assert.equal(timeoutResult.error.code, "TIMEOUT");
+		assert.equal(killed, true);
 
 		const gone = createHerdrClient({ spawn: (() => {
 			const child = fakeChild();

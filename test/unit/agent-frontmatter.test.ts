@@ -1236,6 +1236,7 @@ Agent prompt
 	it("prunes repo internals and nested project roots from broad package discovery", () => withTempHome(() => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-broad-package-prune-"));
 		tempDirs.push(dir);
+		fs.mkdirSync(path.join(dir, ".pi"));
 		writeJson(path.join(dir, "package.json"), {
 			name: "repo-root-workflow",
 			pi: {
@@ -1857,6 +1858,7 @@ Do work
 
 	it("builtin agents inherit project context by default", () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-builtin-default-prompt-settings-"));
+		fs.mkdirSync(path.join(dir, ".pi"));
 		const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-builtin-default-home-"));
 		tempDirs.push(dir);
 		tempDirs.push(homeDir);

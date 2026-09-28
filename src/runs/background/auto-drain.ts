@@ -18,6 +18,7 @@ export interface AutoDrainDeps {
 		deps: SubagentWaitDeps,
 	) => Promise<AgentToolResult<Details>>;
 	hasWork?: (sessionId: string, nowMs: number) => boolean;
+	hasPendingSupervisorRequest?: () => boolean;
 }
 
 function resultText(value: AgentToolResult<Details>): string {
@@ -37,7 +38,7 @@ function hasOutstandingWork(sessionId: string, nowMs: number, observation?: Read
 /** Drain all work owned by the current headless session, including work added while draining. */
 export async function drainOutstandingWork(deps: AutoDrainDeps, observation?: ReadonlyDrainObservation): Promise<void> {
 	const sessionId = deps.state.currentSessionId;
-	observation?.begin(sessionId, !deps.hasWork && !deps.wait && !deps.now);
+	observation?.begin(sessionId, !deps.hasWork && !deps.wait && !deps.now && !deps.hasPendingSupervisorRequest);
 	try {
 		if (!sessionId) throw new Error("Cannot auto-drain background work without an active session identity.");
 		const now = deps.now ?? Date.now;
@@ -48,6 +49,7 @@ export async function drainOutstandingWork(deps: AutoDrainDeps, observation?: Re
 		const wait = deps.wait ?? waitForSubagents;
 
 		while (true) {
+			if (deps.hasPendingSupervisorRequest?.()) break;
 			const work = hasWork(sessionId, now());
 			observation?.predicate(work);
 			if (!work) break;
@@ -65,11 +67,14 @@ export async function drainOutstandingWork(deps: AutoDrainDeps, observation?: Re
 					stopOnAttention: false,
 					failOnFailedRuns: true,
 					failOnAttention: true,
+					hasPendingSupervisorRequest: deps.hasPendingSupervisorRequest,
 				},
 			);
 			if (waitResult.isError) {
 				throw new Error(`Auto-drain failed for session '${sessionId}': ${resultText(waitResult) || "bg_wait returned an error without details"}.`);
 			}
+			if (waitResult.details.wait?.reason === "supervisor_request") break;
+			if (deps.hasPendingSupervisorRequest?.()) break;
 		}
 		observation?.complete();
 	} catch (error) {
