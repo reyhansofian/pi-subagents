@@ -78,7 +78,8 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			assert.equal(notices.length, count);
 		};
 		try {
-			await waitForAsyncState(id, (value) => value.steps?.[0]?.status === "running");
+			// A separate jiti runner must boot before this step starts; CI suite contention can exceed the default 10s status wait.
+			await waitForAsyncState(id, (value) => value.steps?.[0]?.status === "running", 30_000);
 			tracker.handleStarted({ id, asyncDir: path.join(ASYNC_DIR, id), agent: "worker", sessionId: "session-two-failures" });
 			await waitForAsyncState(id, (value) => value.steps?.[0]?.attention?.toolCallId === "a");
 			await waitNotices(1);
