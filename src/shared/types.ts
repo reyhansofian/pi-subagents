@@ -385,7 +385,7 @@ export interface ControlEvent {
 	toolCount?: number;
 	currentTool?: string;
 	toolCallId?: string;
-	/** Stable identity of one failed invocation (also present when Pi omitted toolCallId). */
+	/** Identified failed invocation only: id:<toolCallId>, scoped to its child/run. */
 	failureId?: string;
 	currentToolDurationMs?: number;
 	currentPath?: string;
