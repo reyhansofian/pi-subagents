@@ -1,5 +1,3 @@
-import { randomUUID } from "node:crypto";
-
 type ToolEvent = { type?: string; toolName?: unknown; toolCallId?: unknown; isError?: unknown; message?: unknown; assistantMessageEvent?: unknown };
 
 /** A pending empty assistant stream is initialization, not model continuation. */
@@ -23,7 +21,7 @@ export interface FailedToolCall {
 
 /** A completion pair is one observation, not two failures or evidence of recovery. */
 export function createToolErrorWatch() {
-	type Call = { tool: string; id?: string; path?: string; failureId: string; failed?: boolean; endSeen?: boolean; resultSeen?: boolean; resultStartSeen?: boolean };
+	type Call = { tool: string; id: string; path?: string; failureId: string; failed?: boolean };
 	const active = new Map<string, Call>();
 	const completed = new Map<string, Call>();
 	let failure: FailedToolCall | undefined;
@@ -39,7 +37,12 @@ export function createToolErrorWatch() {
 			}
 			if (event.type === "tool_execution_start") {
 				const id = typeof event.toolCallId === "string" && event.toolCallId ? event.toolCallId : undefined;
-				const key = id ? "id:" + id : "fallback:" + randomUUID();
+				if (!id) {
+					failure = undefined;
+					for (const call of completed.values()) call.failed = true;
+					return true;
+				}
+				const key = "id:" + id;
 				if (active.has(key) || completed.has(key)) return false;
 				failure = undefined;
 				for (const call of completed.values()) call.failed = true;
@@ -56,20 +59,12 @@ export function createToolErrorWatch() {
 			const message = event.message as { role?: string; toolCallId?: string; toolName?: string; isError?: boolean; content?: Array<{ type?: string; text?: string }> } | undefined;
 			const result = event.type === "tool_result_end" || ((event.type === "message_end" || event.type === "message_start") && message?.role === "toolResult");
 			if (event.type !== "tool_execution_end" && !result) return false;
-			const id = message?.toolCallId ?? (typeof event.toolCallId === "string" ? event.toolCallId : undefined);
-			const toolName = message?.toolName ?? (typeof event.toolName === "string" ? event.toolName : undefined);
-			const pendingPair = id ? undefined : [...completed].find(([, call]) => call.tool === toolName && (
-				result ? (call.endSeen && !call.resultSeen) || (event.type === "message_end" && call.resultStartSeen) : call.resultSeen && !call.endSeen));
-			const key = id ? "id:" + id : pendingPair?.[0] ?? [...active].find(([, call]) => call.tool === toolName)?.[0] ?? [...completed].reverse().find(([, call]) => call.tool === toolName)?.[0];
-			const call = key ? active.get(key) ?? completed.get(key) : undefined;
+			const id = (typeof message?.toolCallId === "string" && message.toolCallId) || (typeof event.toolCallId === "string" && event.toolCallId);
+			if (!id) return false;
+			const key = "id:" + id;
+			const call = active.get(key) ?? completed.get(key);
 			if (!call) return false;
-			if (result) {
-				call.resultSeen = true;
-				if (event.type === "message_start") call.resultStartSeen = true;
-				if (event.type === "message_end") call.resultStartSeen = false;
-			}
-			else call.endSeen = true;
-			if (key && active.has(key)) {
+			if (active.has(key)) {
 				active.delete(key);
 				completed.set(key, call);
 				if (completed.size > 64) completed.delete(completed.keys().next().value!);

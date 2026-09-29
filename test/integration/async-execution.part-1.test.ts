@@ -41,6 +41,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 	installAsyncExecutionHooks();
 	it("bridges two identical failed invocations through the real async journal to one parent turn each", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		const resume = path.join(tempDir, "resume-async-failure-a");
+		const continueB = path.join(tempDir, "continue-async-failure-b");
 		const finish = path.join(tempDir, "finish-async-failure-b");
 		const id = `async-two-failures-${Date.now().toString(36)}`;
 		const failed = (call: string) => [
@@ -52,7 +53,8 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		mockPi.onCall({ steps: [
 			{ jsonl: failed("a") },
 			{ waitForPath: resume, jsonl: [{ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Continuing" }], stopReason: "pending" } }] },
-			{ jsonl: failed("b") },
+			{ jsonl: [failed("b")[0], failed("a")[2]] }, // A's late result cannot be attributed to B.
+			{ waitForPath: continueB, jsonl: failed("b").slice(1) },
 			{ waitForPath: finish, jsonl: [events.assistantMessage("Recovered")] },
 		] });
 		const launched = executeAsyncSingle(id, {
@@ -90,6 +92,10 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			assert.ok(((state.asyncJobs.get(id) as { controlEventCursor?: number } | undefined)?.controlEventCursor ?? 0) >= cursorTarget);
 			assert.equal(notices.length, 1, "journal replay does not create another parent turn");
 			fs.writeFileSync(resume, "continue");
+			await waitForAsyncState(id, (value) => (value.steps?.[0]?.toolCount ?? 0) >= 2 && !value.steps?.[0]?.attention);
+			await new Promise((resolve) => setTimeout(resolve, 600)); // Past the failure grace: the replay must not arm B.
+			assert.equal(notices.length, 1);
+			fs.writeFileSync(continueB, "continue");
 			await waitForAsyncState(id, (value) => value.steps?.[0]?.attention?.toolCallId === "b");
 			await waitNotices(2);
 			const live = inspectSubagentStatus({ id }, { asyncDirRoot: ASYNC_DIR, resultsDir: RESULTS_DIR });
@@ -114,7 +120,54 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			assert.equal(result.success, true, JSON.stringify({ error: result.error, results: result.results, state: result.state }));
 			assert.equal((await waitForAsyncState(id, (value) => value.state === "complete")).steps?.[0]?.attention, undefined);
 			assert.equal(notices.length, 2);
-		} finally { tracker.dispose(); if (!fs.existsSync(resume)) fs.writeFileSync(resume, "continue"); if (!fs.existsSync(finish)) fs.writeFileSync(finish, "continue"); }
+		} finally { tracker.dispose(); if (!fs.existsSync(resume)) fs.writeFileSync(resume, "continue"); if (!fs.existsSync(continueB)) fs.writeFileSync(continueB, "continue"); if (!fs.existsSync(finish)) fs.writeFileSync(finish, "continue"); }
+	});
+
+	it("uses generic idle rather than guessed tool identity for completely ID-less failures", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const finish = path.join(tempDir, "finish-idless-idle");
+		const id = `async-idless-idle-${Date.now().toString(36)}`;
+		mockPi.onCall({ steps: [
+			{ jsonl: [
+				{ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Trying exec" }], stopReason: "pending" } },
+				{ type: "tool_execution_start", toolName: "exec", args: {} },
+				{ type: "tool_execution_end", toolName: "exec", isError: true },
+				{ type: "tool_result_end", message: { role: "toolResult", toolName: "exec", isError: true, content: [{ type: "text", text: "denied" }] } },
+				{ type: "message_start", message: { role: "assistant", content: [], stopReason: "pending" } },
+			] },
+			{ waitForPath: finish, jsonl: [events.assistantMessage("Recovered")] },
+		] });
+		const launched = executeAsyncSingle(id, {
+			agent: "worker", task: "Recover", agentConfig: makeAgent("worker", { completionGuard: false }),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-idless-idle" },
+			controlConfig: resolveControlConfig(undefined, { needsAttentionAfterMs: 300 }),
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false, maxSubagentDepth: 2, acceptance: false,
+		});
+		assert.equal(launched.isError, undefined);
+		const notices: Array<{ reason?: string; toolCallId?: string }> = [];
+		const seen = new Set<string>();
+		const state = { baseCwd: tempDir, currentSessionId: "session-idless-idle", asyncJobs: new Map(), fleetJobs: new Map(), foregroundRuns: new Map(), foregroundControls: new Map(), cleanupTimers: new Map(), lastUiContext: null, poller: null, completionSeen: new Map(), watcher: null, watcherRestartTimer: null, resultFileCoalescer: { schedule: () => false, clear() {} } };
+		const pi = { events: { emit(channel: string, data: unknown) {
+			if (channel === SUBAGENT_CONTROL_EVENT) handleSubagentControlNotice({ pi: pi as never, state: state as never, visibleControlNotices: seen, details: data as never });
+		} }, sendMessage(message: { details: { event: typeof notices[number] } }, options: { triggerTurn?: boolean }) {
+			assert.equal(options.triggerTurn, true);
+			notices.push(message.details.event);
+		} };
+		const tracker = createAsyncJobTracker(pi as never, state as never, ASYNC_DIR, { pollIntervalMs: 20, platform: "linux" });
+		try {
+			await waitForAsyncState(id, (value) => value.steps?.[0]?.status === "running");
+			tracker.handleStarted({ id, asyncDir: path.join(ASYNC_DIR, id), agent: "worker", sessionId: "session-idless-idle" });
+			const status = await waitForAsyncState(id, (value) => value.steps?.[0]?.activityState === "needs_attention");
+			assert.equal(status.state, "running");
+			const deadline = Date.now() + 5000;
+			while (!notices.length && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 30));
+			assert.deepEqual(notices.map((event) => event.reason), ["idle"]);
+			assert.equal(notices[0]?.toolCallId, undefined);
+			assert.equal(fs.readFileSync(path.join(ASYNC_DIR, id, "events.jsonl"), "utf8").includes('"reason":"tool_error_stall"'), false);
+			fs.writeFileSync(finish, "continue");
+			assert.equal((await readAsyncPayload(id)).success, true);
+			assert.equal(notices.length, 1);
+		} finally { tracker.dispose(); if (!fs.existsSync(finish)) fs.writeFileSync(finish, "continue"); }
 	});
 
 	it("keeps a failed structured tool nonterminal with persisted attention until assistant recovery", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {

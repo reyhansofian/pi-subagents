@@ -39,47 +39,35 @@ it("correlates overlapping calls without sibling completion recovering a failure
  }
 });
 
-it("assigns bounded distinct fallback identities to ID-less invocations and pairs their results", () => {
- const watch = createToolErrorWatch();
- const seen = new Set<string>();
- const ids = new Set<string>();
- for (const [index, path] of ["/a", "/b"].entries()) {
-  watch.observe({ type: "tool_execution_start", toolName: "exec" }, index * 70_000, path);
-  watch.observe({ type: "tool_execution_end", toolName: "exec", isError: true }, index * 70_000 + 1);
-  watch.observe({ type: "tool_result_end", message: { role: "toolResult", toolName: "exec", isError: true, content: [{ type: "text", text: "denied" }] } }, index * 70_000 + 2);
-  const failure = watch.due(index * 70_000 + 60_002, 60_000);
-  assert.equal(failure?.path, path);
-  assert.match(failure?.failureId ?? "", /^fallback:[0-9a-f-]{36}$/);
-  ids.add(failure.failureId);
-  assert.equal(failure?.summary, "denied");
-  const event = buildControlEvent({ to: "needs_attention", reason: "tool_error_stall", runId: "run", agent: "worker", index: 0, failureId: failure.failureId, currentTool: failure.tool, recentFailureSummary: failure.summary });
-  assert.equal(claimControlNotification(resolveControlConfig(), event, seen), true);
-  assert.equal(claimControlNotification(resolveControlConfig(), event, seen), false);
- }
- assert.equal(ids.size, 2);
-});
-
-it("pairs an ID-less end with its result despite an active same-tool sibling", () => {
+it("does not arm invocation-specific attention from unidentified events", () => {
  const watch = createToolErrorWatch();
  watch.observe({ type: "tool_execution_start", toolName: "exec" }, 1, "/a");
- watch.observe({ type: "tool_execution_start", toolName: "exec" }, 2, "/b");
- watch.observe({ type: "tool_execution_end", toolName: "exec", isError: true }, 3);
- watch.observe({ type: "tool_result_end", message: { role: "toolResult", toolName: "exec", isError: true, content: [{ type: "text", text: "denied" }] } }, 4);
- assert.equal(watch.due(60_004, 60_000)?.path, "/a");
- assert.equal(watch.due(60_004, 60_000)?.summary, "denied");
- watch.observe({ type: "tool_execution_end", toolName: "exec", isError: false }, 5);
- assert.equal(watch.due(60_005, 60_000)?.path, "/a");
+ watch.observe({ type: "tool_execution_end", toolName: "exec", isError: true }, 2);
+ watch.observe({ type: "tool_result_end", message: { role: "toolResult", toolName: "exec", isError: true, content: [{ type: "text", text: "denied" }] } }, 3);
+ assert.equal(watch.due(100_000, 60_000), undefined);
 });
 
-it("does not assign an ID-less result message_end replay to an active sibling", () => {
+it("ignores unidentified results without corrupting a known call", () => {
  const watch = createToolErrorWatch();
- watch.observe({ type: "tool_execution_start", toolName: "exec" }, 1, "/a");
- watch.observe({ type: "message_start", message: { role: "toolResult", toolName: "exec", isError: true, content: [{ type: "text", text: "denied" }] } }, 2);
- watch.observe({ type: "tool_execution_start", toolName: "exec" }, 3, "/b");
- watch.observe({ type: "message_end", message: { role: "toolResult", toolName: "exec", isError: true, content: [{ type: "text", text: "denied" }] } }, 4);
+ watch.observe({ type: "tool_execution_start", toolName: "exec", toolCallId: "b" }, 1, "/b");
+ watch.observe({ type: "tool_result_end", message: { role: "toolResult", toolName: "exec", isError: true } }, 2);
  assert.equal(watch.due(100_000, 60_000), undefined);
- watch.observe({ type: "tool_execution_end", toolName: "exec", isError: false }, 5);
+ watch.observe({ type: "tool_execution_end", toolName: "exec", toolCallId: "b", isError: true }, 3);
+ assert.equal(watch.due(60_004, 60_000)?.failureId, "id:b");
+ assert.equal(watch.due(60_004, 60_000)?.path, "/b");
+});
+
+it("does not assign a late A result to a newly started same-tool B", () => {
+ const watch = createToolErrorWatch();
+ watch.observe({ type: "tool_execution_start", toolName: "exec", toolCallId: "a" }, 1, "/a");
+ watch.observe({ type: "tool_execution_end", toolName: "exec", toolCallId: "a", isError: true }, 2);
+ const result = { type: "tool_result_end", message: { role: "toolResult", toolName: "exec", toolCallId: "a", isError: true, content: [{ type: "text", text: "denied" }] } };
+ watch.observe(result, 3);
+ watch.observe({ type: "tool_execution_start", toolName: "exec", toolCallId: "b" }, 4, "/b");
+ watch.observe(result, 5);
  assert.equal(watch.due(100_000, 60_000), undefined);
+ watch.observe({ type: "tool_execution_end", toolName: "exec", toolCallId: "b", isError: true }, 6);
+ assert.equal(watch.due(60_007, 60_000)?.failureId, "id:b");
 });
 
 it("disarms pending failed-tool attention on compaction and agent settlement", () => {
@@ -217,4 +205,13 @@ it("accepted foreground detach disarms failed-tool attention without aborting th
  assert.equal(events.some((event) => event.reason === "tool_error_stall"), false);
  finish();
  await running;
+});
+
+it("treats an unidentified new start as recovery without rearming an old call", () => {
+ const watch = createToolErrorWatch();
+ watch.observe({ type: "tool_execution_start", toolName: "exec", toolCallId: "a" }, 1);
+ watch.observe({ type: "tool_execution_end", toolName: "exec", toolCallId: "a", isError: false }, 2);
+ watch.observe({ type: "tool_execution_start", toolName: "read" }, 3);
+ watch.observe({ type: "tool_result_end", message: { role: "toolResult", toolName: "exec", toolCallId: "a", isError: true } }, 4);
+ assert.equal(watch.due(100_000, 60_000), undefined);
 });
