@@ -49,6 +49,7 @@ interface AsyncRunStepSummary {
 	status: AsyncJobStep["status"];
 	runner?: AsyncJobStep["runner"];
 	activityState?: ActivityState;
+	attention?: AsyncJobStep["attention"];
 	lastActivityAt?: number;
 	currentTool?: string;
 	currentToolArgs?: string;
@@ -349,6 +350,7 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 			status: step.status,
 			...(step.runner ? { runner: step.runner } : {}),
 			...(stepActivityState ? { activityState: stepActivityState } : {}),
+			...(step.status === "running" && step.attention ? { attention: step.attention } : {}),
 			...(stepLastActivityAt ? { lastActivityAt: stepLastActivityAt } : {}),
 			...(step.currentTool ? { currentTool: step.currentTool } : {}),
 			...(step.currentToolArgs ? { currentToolArgs: step.currentToolArgs } : {}),

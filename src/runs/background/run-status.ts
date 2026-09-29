@@ -625,6 +625,7 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 				const phase = step.phase ? `[${step.phase}] ` : "";
 				lines.push(`${stepLineLabel(status, index)}: ${phase}${display} ${step.status}${modelText}${stepActivityText ? `, ${stepActivityText}` : ""}${steeringSuffix}${acceptanceText}${budgetText}${errorText}`);
 				const structuredOutputPreview = step.structuredOutput === undefined ? undefined : formatWorkflowJsonPreview(step.structuredOutput, 4_000);
+				if (step.status === "running" && step.attention) lines.push("  Attention: " + JSON.stringify(step.attention));
 				if (structuredOutputPreview !== undefined) lines.push(`  Structured output: ${structuredOutputPreview}`);
 				if (step.structuredOutputPath) lines.push(`  Structured output path: ${step.structuredOutputPath}`);
 				lines.push(...formatTimeoutRecoveryLines(step.timeoutRecovery, "  "));
@@ -704,7 +705,7 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 
 			const workflowChildren = parseWorkflowChildSummary(status.workflowChildren);
 			if (workflowChildren && workflowChildren.workflowRunId !== status.runId) throw new Error("workflowChildren.workflowRunId does not match async status runId.");
-			return { content: [{ type: "text", text: lines.join("\n") }], details: { mode: "single", results: [], ...(status.workflowReceiptPath ? { workflowReceiptPath: status.workflowReceiptPath } : {}), ...(status.preflight ? { preflight: status.preflight } : {}), ...(status.workflow?.preflightWarnings?.length ? { preflightWarnings: status.workflow.preflightWarnings } : {}), ...(workflowChildren ? { workflowChildren } : {}), ...(runFanoutBudget ? { runFanoutBudget } : {}), ...(processTerminal ? { lifecycleStatus: { processTerminal } } : {}) } };
+			return { content: [{ type: "text", text: lines.join("\n") }], details: { mode: "single", results: [], ...(status.steps?.some((step) => step.status === "running" && step.attention) ? { controlEvents: status.steps.flatMap((step) => step.status === "running" && step.attention ? [step.attention] : []) } : {}), ...(status.workflowReceiptPath ? { workflowReceiptPath: status.workflowReceiptPath } : {}), ...(status.preflight ? { preflight: status.preflight } : {}), ...(status.workflow?.preflightWarnings?.length ? { preflightWarnings: status.workflow.preflightWarnings } : {}), ...(workflowChildren ? { workflowChildren } : {}), ...(runFanoutBudget ? { runFanoutBudget } : {}), ...(processTerminal ? { lifecycleStatus: { processTerminal } } : {}) } };
 		}
 	}
 

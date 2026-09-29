@@ -20,6 +20,7 @@ import type { WorkflowReceipt } from "../../src/workflows/workflow-receipt.ts";
 import { resolveSubagentLaunchContract } from "../../src/api/preflight.ts";
 import { discoverAgents } from "../../src/agents/agents.ts";
 import { runSync } from "../../src/runs/foreground/execution.ts";
+import { resolveControlConfig } from "../../src/runs/shared/subagent-control.ts";
 import { ACTIVE_ASYNC_CAPACITY_DIR, acquireActiveAsyncCapacity, activeAsyncCapacitySessionKey, getActiveAsyncCapacitySnapshot } from "../../src/runs/background/active-async-capacity.ts";
 import { recordModelFailure } from "../../src/runs/shared/model-exclusions.ts";
 import type { AsyncExecutionResult, AsyncResultPayload, AsyncStatusPayload, MockPiCallRecord } from "../support/async-execution-fixture.ts";
@@ -33,6 +34,39 @@ import {
 
 describe("async execution utilities", { skip: !available ? "pi packages not available" : undefined }, () => {
 	installAsyncExecutionHooks();
+
+	it("keeps a failed structured tool nonterminal with persisted attention until assistant recovery", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const release = path.join(tempDir, "release-tool-error-stall");
+		const id = `async-tool-error-stall-${Date.now().toString(36)}`;
+		mockPi.onCall({ steps: [
+			{ jsonl: [
+				{ type: "tool_execution_start", toolName: "exec", toolCallId: "call-1", args: {} },
+				{ type: "tool_execution_end", toolName: "exec", toolCallId: "call-1", isError: true },
+				{ type: "message_start", message: { role: "toolResult", toolName: "exec", toolCallId: "call-1", isError: true, content: [{ type: "text", text: "denied" }] } },
+				{ type: "message_end", message: { role: "toolResult", toolName: "exec", toolCallId: "call-1", isError: true, content: [{ type: "text", text: "denied" }] } },
+			] },
+			{ waitForPath: release, jsonl: [events.assistantMessage("Recovered")] },
+		] });
+		const launched = executeAsyncSingle(id, {
+			agent: "worker", task: "Recover", agentConfig: makeAgent("worker", { completionGuard: false }),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-tool-error-stall" },
+			controlConfig: resolveControlConfig(undefined, { needsAttentionAfterMs: 300 }),
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false, maxSubagentDepth: 2, acceptance: false,
+		});
+		assert.equal(launched.isError, undefined);
+		try {
+			const status = await waitForAsyncState(id, (value) => value.steps?.[0]?.attention?.reason === "tool_error_stall");
+			assert.equal(status.state, "running");
+			assert.equal(status.steps?.[0]?.attention?.toolCallId, "call-1");
+			assert.equal(status.steps?.[0]?.attention?.recentFailureSummary, "denied");
+			fs.writeFileSync(release, "continue");
+			const result = await readAsyncPayload(id);
+			assert.equal(result.success, true, result.error);
+			const settled = await waitForAsyncState(id, (value) => value.state === "complete");
+			assert.equal(settled.steps?.[0]?.attention, undefined);
+		} finally { if (!fs.existsSync(release)) fs.writeFileSync(release, "continue"); }
+	});
 
 	it("executes a registered mixed background workflow with captured grants after disposal", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
 		const ctx = makeMinimalCtx(tempDir);

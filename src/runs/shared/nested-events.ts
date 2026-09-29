@@ -1035,6 +1035,7 @@ export function nestedSummaryFromAsyncStatus(status: AsyncStatus, asyncDir: stri
 			...(step.thinking ? { thinking: step.thinking } : {}),
 			...(step.sessionFile ? { sessionFile: step.sessionFile } : {}),
 			...(step.activityState ? { activityState: step.activityState } : {}),
+			...(step.status === "running" && step.attention ? { attention: step.attention } : {}),
 			...(step.lastActivityAt !== undefined ? { lastActivityAt: step.lastActivityAt } : {}),
 			...(step.currentTool ? { currentTool: step.currentTool } : {}),
 			...(step.currentToolStartedAt !== undefined ? { currentToolStartedAt: step.currentToolStartedAt } : {}),

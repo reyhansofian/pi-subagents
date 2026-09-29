@@ -114,6 +114,7 @@ import {
 	type ChildWatchdogStatusEvent,
 } from "../../watchdog/child-status.ts";
 import { buildInProcessChildLaunch, createReportedChildSessionInput } from "../shared/child-launch.ts";
+import { createToolErrorWatch } from "../shared/tool-error-watch.ts";
 import { childSessionFactory, collectCurrentLaunchToolEvidence, projectChildSessionEventForJson, type ChildSession, type ChildSessionEvent } from "../shared/child-session.ts";
 
 const artifactOutputByResult = new WeakMap<SingleResult, string>();
@@ -782,6 +783,7 @@ async function runSingleAttempt(
 		const finish = (code: number) => {
 			if (lifecycleFinished) return;
 			lifecycleFinished = true;
+			toolErrorWatch.clear();
 			clearFinalDrainTimers();
 			clearWatchdogTailTimer();
 			clearTimeoutTimers();
@@ -813,6 +815,8 @@ async function runSingleAttempt(
 		};
 
 		let activeLongRunningNotified = false;
+		const toolErrorWatch = createToolErrorWatch();
+		let toolErrorAttention = false;
 		let pendingToolResult: { tool: string; path?: string; mutates: boolean; startedAt?: number } | undefined;
 		type ActiveToolCall = { key: string; tool: string; args: string; startedAt: number; path?: string };
 		let activeToolSequence = 0;
@@ -875,8 +879,9 @@ async function runSingleAttempt(
 		const mutatingFailures = createMutatingFailureState();
 		const mutatingFailureWindowMs = 5 * 60_000;
 		const currentToolDurationMs = (now: number) => progress.currentToolStartedAt ? Math.max(0, now - progress.currentToolStartedAt) : undefined;
-		const emitNeedsAttention = (now: number, input: { message?: string; reason?: ControlEvent["reason"]; recentFailureSummary?: string; currentTool?: string; currentPath?: string; currentToolDurationMs?: number } = {}): boolean => {
+		const emitNeedsAttention = (now: number, input: { message?: string; reason?: ControlEvent["reason"]; recentFailureSummary?: string; currentTool?: string; toolCallId?: string; currentPath?: string; currentToolDurationMs?: number } = {}): boolean => {
 			if (!controlConfig.enabled) return false;
+			toolErrorAttention = input.reason === "tool_error_stall";
 			const previous = progress.activityState;
 			progress.activityState = "needs_attention";
 			const event = buildControlEvent({
@@ -894,6 +899,7 @@ async function runSingleAttempt(
 				tokens: progress.tokens,
 				toolCount: progress.toolCount,
 				currentTool: input.currentTool ?? progress.currentTool,
+				toolCallId: input.toolCallId,
 				currentToolDurationMs: input.currentToolDurationMs ?? currentToolDurationMs(now),
 				currentPath: input.currentPath ?? progress.currentPath,
 				recentFailureSummary: input.recentFailureSummary,
@@ -930,6 +936,12 @@ async function runSingleAttempt(
 		};
 		const updateActivityState = (now: number): boolean => {
 			if (!controlConfig.enabled) return false;
+			const stalled = toolErrorWatch.due(now, controlConfig.needsAttentionAfterMs);
+			if (stalled && progress.activityState !== "needs_attention") return emitNeedsAttention(now, {
+				message: `${agent.name} needs attention after failed tool '${stalled.tool}' without continuation`,
+				reason: "tool_error_stall", currentTool: stalled.tool, toolCallId: stalled.toolCallId,
+				currentPath: stalled.path, recentFailureSummary: stalled.summary,
+			});
 			const idleState = deriveActivityState({
 				config: controlConfig,
 				startedAt: startTime,
@@ -1052,6 +1064,11 @@ async function runSingleAttempt(
 			}
 
 			const now = Date.now();
+			if (evt.type === "tool_execution_start" || ((evt.type === "message_start" || evt.type === "message_update" || evt.type === "message_end") && evt.message?.role === "assistant")) {
+				if (toolErrorAttention) { progress.activityState = undefined; toolErrorAttention = false; }
+			}
+			if (evt.type === "tool_execution_start") toolErrorWatch.observe(evt, now, evt.toolName ? resolveCurrentPath(evt.toolName, evt.args && typeof evt.args === "object" && !Array.isArray(evt.args) ? evt.args as Record<string, unknown> : {}) : undefined);
+			else toolErrorWatch.observe(evt, now);
 			progress.durationMs = now - startTime;
 			progress.lastActivityAt = now;
 			updateActivityState(now);

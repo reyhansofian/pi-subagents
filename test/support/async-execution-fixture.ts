@@ -116,6 +116,7 @@ interface AsyncStatusPayload {
 		structured?: boolean;
 		skills?: string[];
 		activityState?: string;
+		attention?: { reason?: string; toolCallId?: string; recentFailureSummary?: string };
 		currentTool?: string;
 		status?: string;
 		exitCode?: number;
