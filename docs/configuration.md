@@ -237,6 +237,16 @@ Blocking `bg_wait({ id: "..." })` keeps the current tool call open until that ru
 
 This is different from `waitTool.enabled=false`, which returns immediately without registering any future wake. Provider items remain available only to blocking fleet-wide waits; non-blocking subscriptions require one async or remembered detached foreground run id.
 
+## `control`
+
+```json
+{"control":{"needsAttentionAfterMs":60000,"failedToolAttemptsBeforeAttention":3}}
+```
+
+Control is enabled by default. A failed *identified* tool invocation starts a recovery watch: if the child makes no substantive continuation for `needsAttentionAfterMs` (default 60,000 ms), it raises nonterminal `needs_attention` with reason `tool_error_stall`. An explicit `control.needsAttentionAfterMs`, including a per-call `control` override, replaces the default. This recovery grace is **never thinking-scaled**. Generic `idle` attention instead scales its *implicit* 60-second default for medium/high/xhigh/max thinking; an explicit override is not scaled. New tool execution (even without a call ID), nonempty assistant text/delta, or assistant tool-call content counts as continuation; an empty pending assistant start does not. ID-less failures have no invocation-specific watch and retain generic idle handling. This is distinct from `toolTimeoutMs` for a tool that remains open and `activeNoticeAfterMs` for open-tool attention.
+
+`failedToolAttemptsBeforeAttention` (default 3) governs the separate repeated *mutating* failure `tool_failures` notice. The watch does not abort, retry, steer, or stop a child: the parent decides how to respond, and independent lifecycle limits still apply. See [status and control](tool-reference.md#status-and-control-actions) for the optional structured identity and live attention fields.
+
 ## `resultScanLogging`
 
 ```json

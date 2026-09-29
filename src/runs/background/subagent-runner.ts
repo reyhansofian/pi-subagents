@@ -99,6 +99,7 @@ import type { InheritedChildRuntime } from "../shared/child-launch.ts";
 import { buildRunnerChildLaunch } from "./runner-child-launch.ts";
 import { normalizeExtensionBindings } from "../shared/extension-bindings.ts";
 import type { ChildSessionFactory } from "../shared/child-session.ts";
+import { createToolErrorWatch } from "../shared/tool-error-watch.ts";
 import { getSettledReadonlyChild, runChildSession, type ChildEvent, type RunChildSessionInput, type RunChildSessionResult, type StepSteerHandler } from "./run-child-session.ts";
 import { planReadonlyModelContinuation, READONLY_CONTINUATION_PROMPT, type LogicalRecoveryState } from "../shared/readonly-model-continuation.ts";
 import { getReadonlySessionEvidence } from "../shared/readonly-session-evidence.ts";
@@ -2412,6 +2413,7 @@ export async function runSubagent(
 		step.stopRequested = true;
 		step.stopRequestedAt = now;
 		delete step.activityState;
+		delete step.attention;
 		statusPayload.lastUpdate = now;
 		writeStatusPayload();
 		appendJsonl(eventsPath, JSON.stringify({ type: "subagent.step.stop_requested", ts: now, runId: id, stepIndex: index, childId, agent: step.agent }));
@@ -2428,6 +2430,7 @@ export async function runSubagent(
 		step.stopRequested = true;
 		step.stopRequestedAt = childStopRequests.get(index)?.requestedAt ?? step.stopRequestedAt ?? now;
 		delete step.activityState;
+		delete step.attention;
 		step.endedAt = now;
 		step.durationMs = step.startedAt ? now - step.startedAt : 0;
 		step.lastActivityAt = now;
@@ -2691,6 +2694,8 @@ export async function runSubagent(
 	const activeLongRunningSteps = new Set<number>();
 	const mutatingFailureStates = initialStatusSteps.map(() => createMutatingFailureState());
 	const pendingToolResults: Array<{ tool: string; path?: string; mutates: boolean; startedAt?: number } | undefined> = initialStatusSteps.map(() => undefined);
+	const toolErrorWatches = initialStatusSteps.map(() => createToolErrorWatch());
+	const toolErrorAttentionSteps = new Set<number>();
 	type ActiveToolCall = { key: string; tool: string; args: string; startedAt: number; path?: string; blocksSupervisor: boolean };
 	const activeToolCalls = initialStatusSteps.map(() => new Map<string, ActiveToolCall>());
 	const activeToolKeysByName = initialStatusSteps.map(() => new Map<string, string[]>());
@@ -3023,6 +3028,12 @@ export async function runSubagent(
 		if (!step) return;
 		const previousActivityState = step.activityState;
 		const now = Date.now();
+		const recovered = toolErrorWatches[flatIndex]?.observe(event, now, event.type === "tool_execution_start" && event.toolName ? resolveCurrentPath(event.toolName, event.args) : undefined);
+		if (recovered && toolErrorAttentionSteps.delete(flatIndex)) {
+			delete step.activityState;
+			delete step.attention;
+			syncAggregateActivityState();
+		}
 		statusPayload.currentStep = flatIndex;
 		if (isChildWatchdogStatusEvent(event)) {
 			const next = acceptChildWatchdogEvent({
@@ -3189,6 +3200,24 @@ export async function runSubagent(
 		for (let index = 0; index < statusPayload.steps.length; index++) {
 			const step = statusPayload.steps[index]!;
 			if (step.status !== "running") continue;
+			const stalled = toolErrorWatches[index]?.due(now, controlConfig.needsAttentionAfterMs);
+			if (stalled && !supervisorAttentionSteps.has(index)
+				&& !(step.activityState === "needs_attention" && shouldEscalateMutatingFailures(mutatingFailureStates[index]!, controlConfig.failedToolAttemptsBeforeAttention))
+				&& !toolErrorAttentionSteps.has(index)) {
+				const previous = step.activityState;
+				step.activityState = "needs_attention";
+				toolErrorAttentionSteps.add(index);
+				step.attention = buildControlEvent(omitUndefinedProperties({
+					from: previous, to: "needs_attention", runId: id, agent: step.agent, index, ts: now,
+					message: `${step.agent} needs attention after failed tool '${stalled.tool}' without continuation`,
+					reason: "tool_error_stall", currentTool: stalled.tool, toolCallId: stalled.toolCallId, failureId: stalled.failureId,
+					currentPath: stalled.path, recentFailureSummary: stalled.summary,
+					turns: step.turnCount, tokens: step.tokens?.total, toolCount: step.toolCount,
+				}));
+				appendControlEvent(step.attention);
+				changed = true;
+				continue;
+			}
 			const lastActivityAt = stepOutputActivityAt(index);
 			runLastActivityAt = Math.max(runLastActivityAt, lastActivityAt);
 			if (step.lastActivityAt !== lastActivityAt) {
@@ -3310,6 +3339,7 @@ export async function runSubagent(
 			if (step.status === "running") {
 				step.status = "paused";
 				delete step.activityState;
+				delete step.attention;
 				step.endedAt = now;
 				setOptionalProperty(step, "durationMs", step.startedAt ? now - step.startedAt : undefined);
 				step.lastActivityAt = now;
@@ -3340,6 +3370,7 @@ export async function runSubagent(
 			step.exitCode = 1;
 			step.stopped = true;
 			delete step.activityState;
+			delete step.attention;
 			step.endedAt = now;
 			step.durationMs = step.startedAt ? now - step.startedAt : 0;
 			step.lastActivityAt = now;
@@ -3372,6 +3403,7 @@ export async function runSubagent(
 			step.exitCode = 1;
 			step.timedOut = true;
 			delete step.activityState;
+			delete step.attention;
 			step.endedAt = now;
 			step.durationMs = step.startedAt ? now - step.startedAt : 0;
 			step.lastActivityAt = now;

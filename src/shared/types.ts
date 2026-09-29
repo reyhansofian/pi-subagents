@@ -379,12 +379,14 @@ export interface ControlEvent {
 	nestedRunId?: string;
 	nestingPath?: NestedRunAddress["path"];
 	message: string;
-	reason?: "idle" | "completion_guard" | "active_long_running" | "tool_failures" | "supervisor_request" | "time_threshold" | "turn_threshold" | "token_threshold" | "tool_open_threshold";
+	reason?: "idle" | "completion_guard" | "active_long_running" | "tool_failures" | "tool_error_stall" | "supervisor_request" | "time_threshold" | "turn_threshold" | "token_threshold" | "tool_open_threshold";
 	turns?: number;
 	tokens?: number;
 	toolCount?: number;
 	currentTool?: string;
 	toolCallId?: string;
+	/** Identified failed invocation only: id:<toolCallId>, scoped to its child/run. */
+	failureId?: string;
 	currentToolDurationMs?: number;
 	currentPath?: string;
 	elapsedMs?: number;
@@ -1410,6 +1412,8 @@ export interface AgentCapabilityRow {
 }
 
 export interface Details {
+	/** Bounded targeted status identity/attention proof for live child-scoped recovery. */
+	statusSteps?: Array<{ index: number; childId: string; runId?: string; workflowKey?: string; agent: string; status: string; attention?: ControlEvent }>;
 	mode: SubagentResultMode | "management";
 	workflowReceiptPath?: string;
 	runId?: string;
@@ -1588,6 +1592,7 @@ export interface NestedStepSummary {
 	/** Human-readable display name for the child session, when derived at launch. */
 	sessionName?: string;
 	status: "pending" | "running" | "complete" | "completed" | "failed" | "partial" | "paused" | "stopped" | "rejected";
+	attention?: ControlEvent;
 	model?: string;
 	thinking?: string;
 	sessionFile?: string;
@@ -1927,6 +1932,8 @@ export interface AsyncStatus {
 		transcriptPath?: string;
 		transcriptError?: string;
 		activityState?: ActivityState;
+		/** Current bounded nonterminal attention evidence; cleared on genuine recovery/settlement. */
+		attention?: ControlEvent;
 		lastActivityAt?: number;
 		currentTool?: string;
 		currentToolArgs?: string;

@@ -625,6 +625,7 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 				const phase = step.phase ? `[${step.phase}] ` : "";
 				lines.push(`${stepLineLabel(status, index)}: ${phase}${display} ${step.status}${modelText}${stepActivityText ? `, ${stepActivityText}` : ""}${steeringSuffix}${acceptanceText}${budgetText}${errorText}`);
 				const structuredOutputPreview = step.structuredOutput === undefined ? undefined : formatWorkflowJsonPreview(step.structuredOutput, 4_000);
+				if (step.status === "running" && step.attention) lines.push("  Attention: " + JSON.stringify(step.attention));
 				if (structuredOutputPreview !== undefined) lines.push(`  Structured output: ${structuredOutputPreview}`);
 				if (step.structuredOutputPath) lines.push(`  Structured output path: ${step.structuredOutputPath}`);
 				lines.push(...formatTimeoutRecoveryLines(step.timeoutRecovery, "  "));
@@ -704,7 +705,10 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 
 			const workflowChildren = parseWorkflowChildSummary(status.workflowChildren);
 			if (workflowChildren && workflowChildren.workflowRunId !== status.runId) throw new Error("workflowChildren.workflowRunId does not match async status runId.");
-			return { content: [{ type: "text", text: lines.join("\n") }], details: { mode: "single", results: [], ...(status.workflowReceiptPath ? { workflowReceiptPath: status.workflowReceiptPath } : {}), ...(status.preflight ? { preflight: status.preflight } : {}), ...(status.workflow?.preflightWarnings?.length ? { preflightWarnings: status.workflow.preflightWarnings } : {}), ...(workflowChildren ? { workflowChildren } : {}), ...(runFanoutBudget ? { runFanoutBudget } : {}), ...(processTerminal ? { lifecycleStatus: { processTerminal } } : {}) } };
+			const statusSteps = status.steps?.map((step, index) => ({ index, childId: step.childId ?? step.workflowKey ?? step.runId ?? `step:${index}`, runId: step.runId, workflowKey: step.workflowKey, agent: step.agent, status: step.status, attention: step.status === "running" ? step.attention : undefined }))
+				.sort((a, b) => Number(!!b.attention) - Number(!!a.attention) || a.index - b.index).slice(0, 64).sort((a, b) => a.index - b.index);
+			const controlEvents = statusSteps?.flatMap((step) => step.attention ? [step.attention] : []);
+			return { content: [{ type: "text", text: lines.join("\n") }], details: { mode: "single", results: [], ...(statusSteps ? { statusSteps } : {}), ...(controlEvents?.length ? { controlEvents } : {}), ...(status.workflowReceiptPath ? { workflowReceiptPath: status.workflowReceiptPath } : {}), ...(status.preflight ? { preflight: status.preflight } : {}), ...(status.workflow?.preflightWarnings?.length ? { preflightWarnings: status.workflow.preflightWarnings } : {}), ...(workflowChildren ? { workflowChildren } : {}), ...(runFanoutBudget ? { runFanoutBudget } : {}), ...(processTerminal ? { lifecycleStatus: { processTerminal } } : {}) } };
 		}
 	}
 

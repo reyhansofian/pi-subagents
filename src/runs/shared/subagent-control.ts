@@ -141,6 +141,7 @@ export function buildControlEvent(input: {
 	toolCount?: number;
 	currentTool?: string;
 	toolCallId?: string;
+	failureId?: string;
 	currentToolDurationMs?: number;
 	currentPath?: string;
 	elapsedMs?: number;
@@ -174,6 +175,7 @@ export function buildControlEvent(input: {
 		...(input.toolCount !== undefined ? { toolCount: input.toolCount } : {}),
 		...(input.currentTool ? { currentTool: input.currentTool } : {}),
 		...(input.toolCallId ? { toolCallId: input.toolCallId } : {}),
+		...(input.failureId ? { failureId: input.failureId } : {}),
 		...(input.currentToolDurationMs !== undefined ? { currentToolDurationMs: input.currentToolDurationMs } : {}),
 		...(input.currentPath ? { currentPath: input.currentPath } : {}),
 		...(elapsedMs !== undefined ? { elapsedMs } : {}),
@@ -191,6 +193,7 @@ export function shouldNotifyControlEvent(config: ResolvedControlConfig, event: C
 
 export function controlNotificationKey(event: ControlEvent, childIntercomTarget?: string): string {
 	const childKey = childIntercomTarget ?? (event.index !== undefined ? `${event.runId}:${event.index}` : event.runId);
+	if (event.reason === "tool_error_stall" && (event.failureId || event.toolCallId)) return `${childKey}:${event.type}:tool_error_stall:${event.failureId ?? event.toolCallId}`;
 	const contextHash = createHash("sha256").update(formatControlNudge(event)).digest("hex").slice(0, 8);
 	return `${childKey}:${event.type}:${event.reason ?? "idle"}:${contextHash}`;
 }

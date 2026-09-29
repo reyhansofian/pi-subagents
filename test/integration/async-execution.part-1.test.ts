@@ -20,6 +20,12 @@ import type { WorkflowReceipt } from "../../src/workflows/workflow-receipt.ts";
 import { resolveSubagentLaunchContract } from "../../src/api/preflight.ts";
 import { discoverAgents } from "../../src/agents/agents.ts";
 import { runSync } from "../../src/runs/foreground/execution.ts";
+import { resolveControlConfig } from "../../src/runs/shared/subagent-control.ts";
+import { createAsyncJobTracker } from "../../src/runs/background/async-job-tracker.ts";
+import { handleSubagentControlNotice } from "../../src/extension/control-notices.ts";
+import { SUBAGENT_CONTROL_EVENT } from "../../src/shared/types.ts";
+import { inspectSubagentStatus } from "../../src/runs/background/run-status.ts";
+import { deliverStopRequest } from "../../src/runs/background/control-channel.ts";
 import { ACTIVE_ASYNC_CAPACITY_DIR, acquireActiveAsyncCapacity, activeAsyncCapacitySessionKey, getActiveAsyncCapacitySnapshot } from "../../src/runs/background/active-async-capacity.ts";
 import { recordModelFailure } from "../../src/runs/shared/model-exclusions.ts";
 import type { AsyncExecutionResult, AsyncResultPayload, AsyncStatusPayload, MockPiCallRecord } from "../support/async-execution-fixture.ts";
@@ -33,6 +39,216 @@ import {
 
 describe("async execution utilities", { skip: !available ? "pi packages not available" : undefined }, () => {
 	installAsyncExecutionHooks();
+	it("bridges two identical failed invocations through the real async journal to one parent turn each", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const resume = path.join(tempDir, "resume-async-failure-a");
+		const continueB = path.join(tempDir, "continue-async-failure-b");
+		const finish = path.join(tempDir, "finish-async-failure-b");
+		const id = `async-two-failures-${Date.now().toString(36)}`;
+		const failed = (call: string) => [
+			{ type: "tool_execution_start", toolName: "exec", toolCallId: call, args: {} },
+			{ type: "tool_execution_end", toolName: "exec", toolCallId: call, isError: true },
+			{ type: "tool_result_end", message: { role: "toolResult", toolName: "exec", toolCallId: call, isError: true, content: [{ type: "text", text: "denied" }] } },
+			{ type: "message_start", message: { role: "assistant", content: [] } },
+		];
+		mockPi.onCall({ steps: [
+			{ jsonl: failed("a") },
+			{ waitForPath: resume, jsonl: [{ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Continuing" }], stopReason: "pending" } }] },
+			{ jsonl: [failed("b")[0], failed("a")[2]] }, // A's late result cannot be attributed to B.
+			{ waitForPath: continueB, jsonl: failed("b").slice(1) },
+			{ waitForPath: finish, jsonl: [events.assistantMessage("Recovered")] },
+		] });
+		const launched = executeAsyncSingle(id, {
+			agent: "worker", task: "Recover", agentConfig: makeAgent("worker", { completionGuard: false }),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-two-failures" },
+			controlConfig: resolveControlConfig(undefined, { needsAttentionAfterMs: 300 }),
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false, maxSubagentDepth: 2, acceptance: false,
+		});
+		assert.equal(launched.isError, undefined);
+		const notices: Array<{ event: { type: string; agent: string; currentTool?: string; recentFailureSummary?: string; toolCallId?: string; failureId?: string; reason?: string; runId: string; index?: number }; triggerTurn?: boolean; content: string }> = [];
+		const seen = new Set<string>();
+		const state = { baseCwd: tempDir, currentSessionId: "session-two-failures", asyncJobs: new Map(), fleetJobs: new Map(), foregroundRuns: new Map(), foregroundControls: new Map(), cleanupTimers: new Map(), lastUiContext: null, poller: null, completionSeen: new Map(), watcher: null, watcherRestartTimer: null, resultFileCoalescer: { schedule: () => false, clear() {} } };
+		const pi = { events: { emit(channel: string, data: unknown) {
+			if (channel === SUBAGENT_CONTROL_EVENT) handleSubagentControlNotice({ pi: pi as never, state: state as never, visibleControlNotices: seen, details: data as never });
+		} }, sendMessage(message: { content: string; details: { event: typeof notices[number]["event"] } }, options: { triggerTurn?: boolean }) { notices.push({ event: message.details.event, content: message.content, triggerTurn: options.triggerTurn }); } };
+		const tracker = createAsyncJobTracker(pi as never, state as never, ASYNC_DIR, { pollIntervalMs: 20, platform: "linux" });
+		const waitNotices = async (count: number) => {
+			const deadline = Date.now() + 8000;
+			while (notices.length < count && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 30));
+			assert.equal(notices.length, count);
+		};
+		try {
+			// A separate jiti runner must boot before this step starts; CI suite contention can exceed the default 10s status wait.
+			await waitForAsyncState(id, (value) => value.steps?.[0]?.status === "running", 30_000);
+			tracker.handleStarted({ id, asyncDir: path.join(ASYNC_DIR, id), agent: "worker", sessionId: "session-two-failures" });
+			await waitForAsyncState(id, (value) => value.steps?.[0]?.attention?.toolCallId === "a");
+			await waitNotices(1);
+			const journal = path.join(ASYNC_DIR, id, "events.jsonl");
+			const firstRecord = fs.readFileSync(journal, "utf8").split("\n").find((line) => line.includes('"type":"subagent.control"') && line.includes('"toolCallId":"a"'));
+			assert.ok(firstRecord);
+			fs.appendFileSync(journal, firstRecord + "\n");
+			const cursorTarget = fs.statSync(journal).size;
+			const cursorDeadline = Date.now() + 5000;
+			while (((state.asyncJobs.get(id) as { controlEventCursor?: number } | undefined)?.controlEventCursor ?? 0) < cursorTarget && Date.now() < cursorDeadline) await new Promise((resolve) => setTimeout(resolve, 30));
+			assert.ok(((state.asyncJobs.get(id) as { controlEventCursor?: number } | undefined)?.controlEventCursor ?? 0) >= cursorTarget);
+			assert.equal(notices.length, 1, "journal replay does not create another parent turn");
+			fs.writeFileSync(resume, "continue");
+			await waitForAsyncState(id, (value) => (value.steps?.[0]?.toolCount ?? 0) >= 2 && !value.steps?.[0]?.attention);
+			await new Promise((resolve) => setTimeout(resolve, 600)); // Past the failure grace: the replay must not arm B.
+			assert.equal(notices.length, 1);
+			fs.writeFileSync(continueB, "continue");
+			await waitForAsyncState(id, (value) => value.steps?.[0]?.attention?.toolCallId === "b");
+			await waitNotices(2);
+			const live = inspectSubagentStatus({ id }, { asyncDirRoot: ASYNC_DIR, resultsDir: RESULTS_DIR });
+			assert.equal(live.details?.statusSteps?.[0]?.status, "running");
+			assert.equal(live.details?.statusSteps?.[0]?.childId, "step:0");
+			assert.equal(live.details?.controlEvents?.[0]?.failureId, "id:b");
+			assert.deepEqual(notices.map((notice) => notice.event.toolCallId), ["a", "b"]);
+			for (const notice of notices) {
+				assert.equal(notice.triggerTurn, true);
+				assert.equal(notice.event.type, "needs_attention");
+				assert.equal(notice.event.agent, "worker");
+				assert.equal(notice.event.currentTool, "exec");
+				assert.equal(notice.event.recentFailureSummary, "denied");
+				assert.equal(notice.event.runId, id);
+				assert.equal(notice.event.index, 0);
+				assert.equal(notice.event.reason, "tool_error_stall");
+				assert.equal(notice.event.failureId, `id:${notice.event.toolCallId}`);
+				assert.match(notice.content, /Recent failures: denied/);
+			}
+			fs.writeFileSync(finish, "continue");
+			const result = await readAsyncPayload(id);
+			assert.equal(result.success, true, JSON.stringify({ error: result.error, results: result.results, state: result.state }));
+			assert.equal((await waitForAsyncState(id, (value) => value.state === "complete")).steps?.[0]?.attention, undefined);
+			assert.equal(notices.length, 2);
+		} finally { tracker.dispose(); if (!fs.existsSync(resume)) fs.writeFileSync(resume, "continue"); if (!fs.existsSync(continueB)) fs.writeFileSync(continueB, "continue"); if (!fs.existsSync(finish)) fs.writeFileSync(finish, "continue"); }
+	});
+
+	it("uses generic idle rather than guessed tool identity for completely ID-less failures", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const finish = path.join(tempDir, "finish-idless-idle");
+		const id = `async-idless-idle-${Date.now().toString(36)}`;
+		mockPi.onCall({ steps: [
+			{ jsonl: [
+				{ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Trying exec" }], stopReason: "pending" } },
+				{ type: "tool_execution_start", toolName: "exec", args: {} },
+				{ type: "tool_execution_end", toolName: "exec", isError: true },
+				{ type: "tool_result_end", message: { role: "toolResult", toolName: "exec", isError: true, content: [{ type: "text", text: "denied" }] } },
+				{ type: "message_start", message: { role: "assistant", content: [], stopReason: "pending" } },
+			] },
+			{ waitForPath: finish, jsonl: [events.assistantMessage("Recovered")] },
+		] });
+		const launched = executeAsyncSingle(id, {
+			agent: "worker", task: "Recover", agentConfig: makeAgent("worker", { completionGuard: false }),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-idless-idle" },
+			controlConfig: resolveControlConfig(undefined, { needsAttentionAfterMs: 300 }),
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false, maxSubagentDepth: 2, acceptance: false,
+		});
+		assert.equal(launched.isError, undefined);
+		const notices: Array<{ reason?: string; toolCallId?: string }> = [];
+		const seen = new Set<string>();
+		const state = { baseCwd: tempDir, currentSessionId: "session-idless-idle", asyncJobs: new Map(), fleetJobs: new Map(), foregroundRuns: new Map(), foregroundControls: new Map(), cleanupTimers: new Map(), lastUiContext: null, poller: null, completionSeen: new Map(), watcher: null, watcherRestartTimer: null, resultFileCoalescer: { schedule: () => false, clear() {} } };
+		const pi = { events: { emit(channel: string, data: unknown) {
+			if (channel === SUBAGENT_CONTROL_EVENT) handleSubagentControlNotice({ pi: pi as never, state: state as never, visibleControlNotices: seen, details: data as never });
+		} }, sendMessage(message: { details: { event: typeof notices[number] } }, options: { triggerTurn?: boolean }) {
+			assert.equal(options.triggerTurn, true);
+			notices.push(message.details.event);
+		} };
+		const tracker = createAsyncJobTracker(pi as never, state as never, ASYNC_DIR, { pollIntervalMs: 20, platform: "linux" });
+		try {
+			await waitForAsyncState(id, (value) => value.steps?.[0]?.status === "running");
+			tracker.handleStarted({ id, asyncDir: path.join(ASYNC_DIR, id), agent: "worker", sessionId: "session-idless-idle" });
+			const status = await waitForAsyncState(id, (value) => value.steps?.[0]?.activityState === "needs_attention");
+			assert.equal(status.state, "running");
+			const deadline = Date.now() + 5000;
+			while (!notices.length && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 30));
+			assert.deepEqual(notices.map((event) => event.reason), ["idle"]);
+			assert.equal(notices[0]?.toolCallId, undefined);
+			assert.equal(fs.readFileSync(path.join(ASYNC_DIR, id, "events.jsonl"), "utf8").includes('"reason":"tool_error_stall"'), false);
+			fs.writeFileSync(finish, "continue");
+			assert.equal((await readAsyncPayload(id)).success, true);
+			assert.equal(notices.length, 1);
+		} finally { tracker.dispose(); if (!fs.existsSync(finish)) fs.writeFileSync(finish, "continue"); }
+	});
+
+	it("keeps a failed structured tool nonterminal with persisted attention until assistant recovery", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const preRelease = path.join(tempDir, "release-before-tool-error-stall");
+		const release = path.join(tempDir, "release-tool-error-stall");
+		const id = `async-tool-error-stall-${Date.now().toString(36)}`;
+		mockPi.onCall({ steps: [
+			{ jsonl: [{ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Preflight complete" }], stopReason: "pending" } }] },
+			{ waitForPath: preRelease, jsonl: [
+				{ type: "tool_execution_start", toolName: "exec", toolCallId: "call-1", args: {} },
+				{ type: "tool_execution_end", toolName: "exec", toolCallId: "call-1", isError: true },
+				{ type: "message_start", message: { role: "toolResult", toolName: "exec", toolCallId: "call-1", isError: true, content: [{ type: "text", text: "denied" }] } },
+				{ type: "message_end", message: { role: "toolResult", toolName: "exec", toolCallId: "call-1", isError: true, content: [{ type: "text", text: "denied" }] } },
+				{ type: "message_start", message: { role: "assistant", content: [], stopReason: "pending" } },
+			] },
+			{ waitForPath: release, jsonl: [events.assistantMessage("Recovered")] },
+		] });
+		const launched = executeAsyncSingle(id, {
+			agent: "worker", task: "Recover", agentConfig: makeAgent("worker", { completionGuard: false }),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-tool-error-stall" },
+			controlConfig: resolveControlConfig(undefined, { needsAttentionAfterMs: 300 }),
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false, maxSubagentDepth: 2, acceptance: false,
+		});
+		assert.equal(launched.isError, undefined);
+		try {
+			await waitForAsyncState(id, (value) => value.steps?.[0]?.activityState === "needs_attention");
+			fs.writeFileSync(preRelease, "continue");
+			const status = await waitForAsyncState(id, (value) => value.steps?.[0]?.attention?.reason === "tool_error_stall");
+			assert.equal(status.state, "running");
+			assert.equal(status.steps?.[0]?.attention?.toolCallId, "call-1");
+			assert.equal(status.steps?.[0]?.attention?.recentFailureSummary, "denied");
+			fs.writeFileSync(release, "continue");
+			const result = await readAsyncPayload(id);
+			assert.equal(result.success, true, result.error);
+			const settled = await waitForAsyncState(id, (value) => value.state === "complete");
+			assert.equal(settled.steps?.[0]?.attention, undefined);
+		} finally {
+			if (!fs.existsSync(preRelease)) fs.writeFileSync(preRelease, "continue");
+			if (!fs.existsSync(release)) fs.writeFileSync(release, "continue");
+		}
+	});
+
+	it("does not publish late tool-error attention after targeted stop and disposal", { skip: !isAsyncAvailable() || process.platform === "win32" ? "async stop unavailable" : undefined }, async () => {
+		const release = path.join(tempDir, "release-stopped-tool-error");
+		const id = `async-tool-stop-${Date.now().toString(36)}`;
+		mockPi.onCall({ steps: [
+			{ jsonl: [
+				{ type: "tool_execution_start", toolName: "exec", toolCallId: "call-stop", args: {} },
+				{ type: "tool_execution_end", toolName: "exec", toolCallId: "call-stop", isError: true },
+				{ type: "message_end", message: { role: "toolResult", toolName: "exec", toolCallId: "call-stop", isError: true, content: [{ type: "text", text: "denied" }] } },
+			] },
+			{ waitForPath: release, jsonl: [events.assistantMessage("late")] },
+		] });
+		executeAsyncSingle(id, {
+			agent: "worker", task: "Wait", agentConfig: makeAgent("worker", { completionGuard: false }),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-tool-stop" },
+			controlConfig: resolveControlConfig(undefined, { needsAttentionAfterMs: 1200 }),
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false, maxSubagentDepth: 2, acceptance: false,
+		});
+		try {
+			await waitForMockPiCall(mockPi, 0);
+			const dir = path.join(ASYNC_DIR, id);
+			const running = await waitForAsyncState(id, (value) => value.steps?.[0]?.status === "running" && typeof value.pid === "number");
+			deliverStopRequest({ asyncDir: dir, pid: running.pid!, source: "test", targetIndex: 0, childId: "step:0" });
+			await waitForAsyncResultFile(id, 10_000);
+			const settled = await waitForAsyncState(id, (value) => value.state !== "running");
+			assert.equal(settled.steps?.[0]?.status, "stopped");
+			const journal = path.join(dir, "events.jsonl");
+			const count = () => fs.readFileSync(journal, "utf-8").split("\n").filter((line) => line.includes('"reason":"tool_error_stall"')).length;
+			const before = count();
+			await new Promise((resolve) => setTimeout(resolve, 1500));
+			assert.equal(count(), before);
+			assert.equal(count(), 0);
+			assert.equal(JSON.parse(fs.readFileSync(path.join(dir, "status.json"), "utf-8")).steps?.[0]?.attention, undefined);
+		} finally {
+			if (!fs.existsSync(release)) fs.writeFileSync(release, "continue");
+		}
+	});
 
 	it("executes a registered mixed background workflow with captured grants after disposal", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
 		const ctx = makeMinimalCtx(tempDir);

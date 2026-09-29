@@ -12,7 +12,7 @@ const assistant = (text = "Recovered"): ChildSessionEvent => ({ type: "message_e
 	role: "assistant", content: [{ type: "text", text }], stopReason: "toolUse",
 } });
 
-function session() {
+function session(disposeGate?: Promise<void>) {
 	let emit: (event: ChildSessionEvent) => void = () => {};
 	let finishPrompt: () => void = () => {};
 	let aborts = 0;
@@ -27,7 +27,7 @@ function session() {
 			return {
 				subscribe(listener) { emit = listener; return () => { emit = () => {}; }; },
 			prompt() { prompts++; return new Promise<void>((resolve) => { finishPrompt = resolve; }); },
-			async abort() { aborts++; }, async dispose() { disposals++; }, async steer() {}, async followUp() {},
+			async abort() { aborts++; }, async dispose() { disposals++; await disposeGate; }, async steer() {}, async followUp() {},
 			messages: [], sessionId: "scripted", sessionFile: undefined, modelId: undefined,
 		};
 		},
@@ -44,9 +44,33 @@ function session() {
 		get aborts() { return aborts; }, get disposals() { return disposals; }, get prompts() { return prompts; } };
 }
 
-async function ready() { const child = session(); await Promise.resolve(); await Promise.resolve(); assert.equal(child.prompts, 1); return child; }
+async function ready(disposeGate?: Promise<void>) { const child = session(disposeGate); await Promise.resolve(); await Promise.resolve(); assert.equal(child.prompts, 1); return child; }
 
 describe("ordinary tool failure recovery without an implicit deadline", () => {
+	it("does not publish a stopped child result before delayed session disposal", async () => {
+		let release: () => void = () => {};
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const child = await ready(gate);
+		let settled = false;
+		void child.run.then(() => { settled = true; });
+		child.stop();
+		child.finish();
+		await Promise.resolve();
+		await Promise.resolve();
+		assert.equal(settled, false);
+		release();
+		assert.equal((await child.run).stopped, true);
+		assert.equal(child.disposals, 1);
+	});
+
+	it("interruption after a structured failure disposes the original child once", async () => {
+		const child = await ready();
+		child.send(failure());
+		child.interrupt();
+		child.finish();
+		assert.equal((await child.run).interrupted, true);
+		assert.equal(child.disposals, 1);
+	});
 	it("leaves a failed tool and quiet thinking alive past the former two-minute ceiling", async (t) => {
 		t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
 		const child = await ready();

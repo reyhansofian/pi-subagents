@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- Flag an identified failed tool call that stalls without child continuation as nonterminal attention, with scoped invocation identity and live targeted status for the parent to inspect; ID-less failures retain generic idle handling.
+
 ## [0.66.0] - 2026-09-06
 
 ### Highlights

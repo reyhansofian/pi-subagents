@@ -5600,6 +5600,11 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 										if (!progress || !step || step.stopped) return;
 										step.status = progress.status === "completed" ? "completed" : progress.status === "failed" ? "failed" : "running";
 										step.activityState = progress.activityState;
+										if (progress.activityState !== "needs_attention" || step.status !== "running") delete step.attention;
+										else {
+											const attention = update.details.controlEvents?.find((event) => event.reason === "tool_error_stall");
+											if (attention) step.attention = { ...attention, index: status.steps?.indexOf(step) ?? 0 };
+										}
 										step.lastActivityAt = progress.lastActivityAt;
 										step.currentTool = progress.currentTool;
 										step.currentToolArgs = progress.currentToolArgs;

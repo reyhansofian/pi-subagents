@@ -114,6 +114,7 @@ import {
 	type ChildWatchdogStatusEvent,
 } from "../../watchdog/child-status.ts";
 import { buildInProcessChildLaunch, createReportedChildSessionInput } from "../shared/child-launch.ts";
+import { createToolErrorWatch, isAssistantProgress } from "../shared/tool-error-watch.ts";
 import { childSessionFactory, collectCurrentLaunchToolEvidence, projectChildSessionEventForJson, type ChildSession, type ChildSessionEvent } from "../shared/child-session.ts";
 
 const artifactOutputByResult = new WeakMap<SingleResult, string>();
@@ -676,6 +677,8 @@ async function runSingleAttempt(
 			}
 			if (!accepted) return false;
 			detached = true;
+			toolErrorWatch.clear();
+			toolErrorAttention = false;
 			timeoutTimer?.unref?.();
 			timeoutHardFinishTimer?.unref?.();
 			if (session) session.detached = true;
@@ -782,6 +785,7 @@ async function runSingleAttempt(
 		const finish = (code: number) => {
 			if (lifecycleFinished) return;
 			lifecycleFinished = true;
+			toolErrorWatch.clear();
 			clearFinalDrainTimers();
 			clearWatchdogTailTimer();
 			clearTimeoutTimers();
@@ -813,6 +817,9 @@ async function runSingleAttempt(
 		};
 
 		let activeLongRunningNotified = false;
+		const toolErrorWatch = createToolErrorWatch();
+		let toolErrorAttention = false;
+		let lastAttentionReason: ControlEvent["reason"] | undefined;
 		let pendingToolResult: { tool: string; path?: string; mutates: boolean; startedAt?: number } | undefined;
 		type ActiveToolCall = { key: string; tool: string; args: string; startedAt: number; path?: string };
 		let activeToolSequence = 0;
@@ -875,8 +882,10 @@ async function runSingleAttempt(
 		const mutatingFailures = createMutatingFailureState();
 		const mutatingFailureWindowMs = 5 * 60_000;
 		const currentToolDurationMs = (now: number) => progress.currentToolStartedAt ? Math.max(0, now - progress.currentToolStartedAt) : undefined;
-		const emitNeedsAttention = (now: number, input: { message?: string; reason?: ControlEvent["reason"]; recentFailureSummary?: string; currentTool?: string; currentPath?: string; currentToolDurationMs?: number } = {}): boolean => {
+		const emitNeedsAttention = (now: number, input: { message?: string; reason?: ControlEvent["reason"]; recentFailureSummary?: string; currentTool?: string; toolCallId?: string; failureId?: string; currentPath?: string; currentToolDurationMs?: number } = {}): boolean => {
 			if (!controlConfig.enabled) return false;
+			toolErrorAttention = input.reason === "tool_error_stall";
+			lastAttentionReason = input.reason ?? "idle";
 			const previous = progress.activityState;
 			progress.activityState = "needs_attention";
 			const event = buildControlEvent({
@@ -894,6 +903,8 @@ async function runSingleAttempt(
 				tokens: progress.tokens,
 				toolCount: progress.toolCount,
 				currentTool: input.currentTool ?? progress.currentTool,
+				toolCallId: input.toolCallId,
+				failureId: input.failureId,
 				currentToolDurationMs: input.currentToolDurationMs ?? currentToolDurationMs(now),
 				currentPath: input.currentPath ?? progress.currentPath,
 				recentFailureSummary: input.recentFailureSummary,
@@ -929,7 +940,14 @@ async function runSingleAttempt(
 			return true;
 		};
 		const updateActivityState = (now: number): boolean => {
-			if (!controlConfig.enabled) return false;
+			if (!controlConfig.enabled || detached) return false;
+			const stalled = toolErrorWatch.due(now, controlConfig.needsAttentionAfterMs);
+			if (stalled && (!lastAttentionReason || !["tool_failures", "supervisor_request"].includes(lastAttentionReason))
+				&& (!toolErrorAttention || progress.activityState !== "needs_attention")) return emitNeedsAttention(now, {
+				message: `${agent.name} needs attention after failed tool '${stalled.tool}' without continuation`,
+				reason: "tool_error_stall", currentTool: stalled.tool, toolCallId: stalled.toolCallId, failureId: stalled.failureId,
+				currentPath: stalled.path, recentFailureSummary: stalled.summary,
+			});
 			const idleState = deriveActivityState({
 				config: controlConfig,
 				startedAt: startTime,
@@ -1052,6 +1070,15 @@ async function runSingleAttempt(
 			}
 
 			const now = Date.now();
+			let recovered = false;
+			if (!detached) {
+				if (evt.type === "tool_execution_start") recovered = toolErrorWatch.observe(evt, now, evt.toolName ? resolveCurrentPath(evt.toolName, evt.args && typeof evt.args === "object" && !Array.isArray(evt.args) ? evt.args as Record<string, unknown> : {}) : undefined);
+				else recovered = toolErrorWatch.observe(evt, now);
+			}
+			if (recovered) {
+				if (toolErrorAttention) { progress.activityState = undefined; toolErrorAttention = false; }
+				lastAttentionReason = undefined;
+			}
 			progress.durationMs = now - startTime;
 			progress.lastActivityAt = now;
 			updateActivityState(now);
