@@ -22,7 +22,9 @@ it("tracks structured failure in either completion order, but never treats resul
   assert.deepEqual(watch.due(60_004, 60_000), { tool: "exec", toolCallId: "a", path: "/tmp/file", failedAt: 2, summary: "access denied" });
   watch.observe(result, 61_000); // duplicate delivery cannot extend the grace
   assert.equal(watch.due(61_000, 60_000)?.failedAt, 2);
-  watch.observe({ type: "message_start", message: { role: "assistant" } }, 61_001);
+  watch.observe({ type: "message_start", message: { role: "assistant", content: [] } }, 61_001);
+  assert.equal(watch.due(61_001, 60_000)?.toolCallId, "a", "empty pending assistant start is not recovery");
+  watch.observe({ type: "message_update", message: { role: "assistant", content: [] }, assistantMessageEvent: { type: "text_delta", delta: "Investigating" } }, 61_002);
   watch.observe(result, 61_002); // late duplicate cannot rearm
   assert.equal(watch.due(200_000, 60_000), undefined);
  }
@@ -79,13 +81,22 @@ it("reports a structured exec failure followed by silence without aborting the c
   childSessionFactory: factory, onUpdate: (update) => { events.push(...(update.details?.controlEvents ?? [])); },
  });
  await started;
+ send({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Considering next step" }] } });
+ t.mock.timers.tick(61_000);
+ assert.equal(events.filter((event) => event.reason === "idle").length, 1, "prior generic attention is independent");
  send({ type: "tool_execution_start", toolName: "exec", toolCallId: "call-1", args: { cmd: "false" } });
  send({ type: "tool_result_end", toolName: "exec", toolCallId: "call-1", message: { role: "toolResult", toolName: "exec", toolCallId: "call-1", isError: true, content: [{ type: "text", text: "permission denied" }] } });
  send({ type: "tool_execution_end", toolName: "exec", toolCallId: "call-1", isError: true });
+ send({ type: "message_start", message: { role: "assistant", content: [], stopReason: "pending" } });
  t.mock.timers.tick(61_000);
  assert.equal(aborts, 0);
  assert.equal(events.filter((event) => event.reason === "tool_error_stall").length, 1);
  assert.equal(events.find((event) => event.reason === "tool_error_stall")?.toolCallId, "call-1");
  finish();
  await run;
+ const prior = new Set(events.filter((event) => event.reason === "tool_error_stall")
+  .map((event) => JSON.stringify(event)));
+ t.mock.timers.tick(180_000);
+ assert.deepEqual(new Set(events.filter((event) => event.reason === "tool_error_stall")
+  .map((event) => JSON.stringify(event))), prior, "terminal disposal must not publish new attention");
 });

@@ -99,7 +99,7 @@ import type { InheritedChildRuntime } from "../shared/child-launch.ts";
 import { buildRunnerChildLaunch } from "./runner-child-launch.ts";
 import { normalizeExtensionBindings } from "../shared/extension-bindings.ts";
 import type { ChildSessionFactory } from "../shared/child-session.ts";
-import { createToolErrorWatch } from "../shared/tool-error-watch.ts";
+import { createToolErrorWatch, isAssistantProgress } from "../shared/tool-error-watch.ts";
 import { getSettledReadonlyChild, runChildSession, type ChildEvent, type RunChildSessionInput, type RunChildSessionResult, type StepSteerHandler } from "./run-child-session.ts";
 import { planReadonlyModelContinuation, READONLY_CONTINUATION_PROMPT, type LogicalRecoveryState } from "../shared/readonly-model-continuation.ts";
 import { getReadonlySessionEvidence } from "../shared/readonly-session-evidence.ts";
@@ -3028,7 +3028,7 @@ export async function runSubagent(
 		if (!step) return;
 		const previousActivityState = step.activityState;
 		const now = Date.now();
-		const recovered = event.type === "tool_execution_start" || ((event.type === "message_start" || event.type === "message_update" || event.type === "message_end") && event.message?.role === "assistant");
+		const recovered = event.type === "tool_execution_start" || isAssistantProgress(event);
 		if (recovered && toolErrorAttentionSteps.delete(flatIndex)) {
 			delete step.activityState;
 			delete step.attention;
@@ -3202,7 +3202,9 @@ export async function runSubagent(
 			const step = statusPayload.steps[index]!;
 			if (step.status !== "running") continue;
 			const stalled = toolErrorWatches[index]?.due(now, controlConfig.needsAttentionAfterMs);
-			if (stalled && step.activityState !== "needs_attention") {
+			if (stalled && !supervisorAttentionSteps.has(index)
+				&& !(step.activityState === "needs_attention" && shouldEscalateMutatingFailures(mutatingFailureStates[index]!, controlConfig.failedToolAttemptsBeforeAttention))
+				&& !toolErrorAttentionSteps.has(index)) {
 				const previous = step.activityState;
 				step.activityState = "needs_attention";
 				toolErrorAttentionSteps.add(index);

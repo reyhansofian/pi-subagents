@@ -114,7 +114,7 @@ import {
 	type ChildWatchdogStatusEvent,
 } from "../../watchdog/child-status.ts";
 import { buildInProcessChildLaunch, createReportedChildSessionInput } from "../shared/child-launch.ts";
-import { createToolErrorWatch } from "../shared/tool-error-watch.ts";
+import { createToolErrorWatch, isAssistantProgress } from "../shared/tool-error-watch.ts";
 import { childSessionFactory, collectCurrentLaunchToolEvidence, projectChildSessionEventForJson, type ChildSession, type ChildSessionEvent } from "../shared/child-session.ts";
 
 const artifactOutputByResult = new WeakMap<SingleResult, string>();
@@ -817,6 +817,7 @@ async function runSingleAttempt(
 		let activeLongRunningNotified = false;
 		const toolErrorWatch = createToolErrorWatch();
 		let toolErrorAttention = false;
+		let lastAttentionReason: ControlEvent["reason"] | undefined;
 		let pendingToolResult: { tool: string; path?: string; mutates: boolean; startedAt?: number } | undefined;
 		type ActiveToolCall = { key: string; tool: string; args: string; startedAt: number; path?: string };
 		let activeToolSequence = 0;
@@ -882,6 +883,7 @@ async function runSingleAttempt(
 		const emitNeedsAttention = (now: number, input: { message?: string; reason?: ControlEvent["reason"]; recentFailureSummary?: string; currentTool?: string; toolCallId?: string; currentPath?: string; currentToolDurationMs?: number } = {}): boolean => {
 			if (!controlConfig.enabled) return false;
 			toolErrorAttention = input.reason === "tool_error_stall";
+			lastAttentionReason = input.reason ?? "idle";
 			const previous = progress.activityState;
 			progress.activityState = "needs_attention";
 			const event = buildControlEvent({
@@ -937,7 +939,8 @@ async function runSingleAttempt(
 		const updateActivityState = (now: number): boolean => {
 			if (!controlConfig.enabled) return false;
 			const stalled = toolErrorWatch.due(now, controlConfig.needsAttentionAfterMs);
-			if (stalled && progress.activityState !== "needs_attention") return emitNeedsAttention(now, {
+			if (stalled && (!lastAttentionReason || !["tool_failures", "supervisor_request"].includes(lastAttentionReason))
+				&& (!toolErrorAttention || progress.activityState !== "needs_attention")) return emitNeedsAttention(now, {
 				message: `${agent.name} needs attention after failed tool '${stalled.tool}' without continuation`,
 				reason: "tool_error_stall", currentTool: stalled.tool, toolCallId: stalled.toolCallId,
 				currentPath: stalled.path, recentFailureSummary: stalled.summary,
@@ -1064,8 +1067,9 @@ async function runSingleAttempt(
 			}
 
 			const now = Date.now();
-			if (evt.type === "tool_execution_start" || ((evt.type === "message_start" || evt.type === "message_update" || evt.type === "message_end") && evt.message?.role === "assistant")) {
+			if (evt.type === "tool_execution_start" || isAssistantProgress(evt)) {
 				if (toolErrorAttention) { progress.activityState = undefined; toolErrorAttention = false; }
+				lastAttentionReason = undefined;
 			}
 			if (evt.type === "tool_execution_start") toolErrorWatch.observe(evt, now, evt.toolName ? resolveCurrentPath(evt.toolName, evt.args && typeof evt.args === "object" && !Array.isArray(evt.args) ? evt.args as Record<string, unknown> : {}) : undefined);
 			else toolErrorWatch.observe(evt, now);

@@ -36,14 +36,17 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 	installAsyncExecutionHooks();
 
 	it("keeps a failed structured tool nonterminal with persisted attention until assistant recovery", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const preRelease = path.join(tempDir, "release-before-tool-error-stall");
 		const release = path.join(tempDir, "release-tool-error-stall");
 		const id = `async-tool-error-stall-${Date.now().toString(36)}`;
 		mockPi.onCall({ steps: [
-			{ jsonl: [
+			{ jsonl: [{ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Preflight complete" }], stopReason: "pending" } }] },
+			{ waitForPath: preRelease, jsonl: [
 				{ type: "tool_execution_start", toolName: "exec", toolCallId: "call-1", args: {} },
 				{ type: "tool_execution_end", toolName: "exec", toolCallId: "call-1", isError: true },
 				{ type: "message_start", message: { role: "toolResult", toolName: "exec", toolCallId: "call-1", isError: true, content: [{ type: "text", text: "denied" }] } },
 				{ type: "message_end", message: { role: "toolResult", toolName: "exec", toolCallId: "call-1", isError: true, content: [{ type: "text", text: "denied" }] } },
+				{ type: "message_start", message: { role: "assistant", content: [], stopReason: "pending" } },
 			] },
 			{ waitForPath: release, jsonl: [events.assistantMessage("Recovered")] },
 		] });
@@ -56,6 +59,8 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		});
 		assert.equal(launched.isError, undefined);
 		try {
+			await waitForAsyncState(id, (value) => value.steps?.[0]?.activityState === "needs_attention");
+			fs.writeFileSync(preRelease, "continue");
 			const status = await waitForAsyncState(id, (value) => value.steps?.[0]?.attention?.reason === "tool_error_stall");
 			assert.equal(status.state, "running");
 			assert.equal(status.steps?.[0]?.attention?.toolCallId, "call-1");
@@ -65,7 +70,10 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			assert.equal(result.success, true, result.error);
 			const settled = await waitForAsyncState(id, (value) => value.state === "complete");
 			assert.equal(settled.steps?.[0]?.attention, undefined);
-		} finally { if (!fs.existsSync(release)) fs.writeFileSync(release, "continue"); }
+		} finally {
+			if (!fs.existsSync(preRelease)) fs.writeFileSync(preRelease, "continue");
+			if (!fs.existsSync(release)) fs.writeFileSync(release, "continue");
+		}
 	});
 
 	it("executes a registered mixed background workflow with captured grants after disposal", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {

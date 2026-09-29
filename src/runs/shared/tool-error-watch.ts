@@ -1,4 +1,14 @@
-type ToolEvent = { type?: string; toolName?: unknown; toolCallId?: unknown; isError?: unknown; message?: unknown };
+type ToolEvent = { type?: string; toolName?: unknown; toolCallId?: unknown; isError?: unknown; message?: unknown; assistantMessageEvent?: unknown };
+
+/** A pending empty assistant stream is initialization, not model continuation. */
+export function isAssistantProgress(event: ToolEvent): boolean {
+	if (!["message_start", "message_update", "message_end"].includes(event.type ?? "")) return false;
+	const message = event.message as { role?: string; content?: Array<{ type?: string; text?: string }> } | undefined;
+	if (message?.role !== "assistant") return false;
+	if (message.content?.some((part) => part.type === "toolCall" || (typeof part.text === "string" && part.text.length > 0))) return true;
+	const delta = event.assistantMessageEvent as { type?: string; delta?: unknown } | undefined;
+	return event.type === "message_update" && typeof delta?.delta === "string" && delta.delta.length > 0;
+}
 
 export interface FailedToolCall {
 	tool: string;
@@ -21,7 +31,7 @@ export function createToolErrorWatch() {
 				current = { tool: typeof event.toolName === "string" ? event.toolName : "tool", id: typeof event.toolCallId === "string" ? event.toolCallId : undefined, path };
 				return;
 			}
-			if ((event.type === "message_start" || event.type === "message_update" || event.type === "message_end") && (event.message as { role?: string } | undefined)?.role === "assistant") {
+			if (isAssistantProgress(event)) {
 				failure = undefined;
 				eligible = false;
 				return;
