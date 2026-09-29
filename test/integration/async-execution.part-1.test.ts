@@ -21,6 +21,7 @@ import { resolveSubagentLaunchContract } from "../../src/api/preflight.ts";
 import { discoverAgents } from "../../src/agents/agents.ts";
 import { runSync } from "../../src/runs/foreground/execution.ts";
 import { resolveControlConfig } from "../../src/runs/shared/subagent-control.ts";
+import { deliverStopRequest } from "../../src/runs/background/control-channel.ts";
 import { ACTIVE_ASYNC_CAPACITY_DIR, acquireActiveAsyncCapacity, activeAsyncCapacitySessionKey, getActiveAsyncCapacitySnapshot } from "../../src/runs/background/active-async-capacity.ts";
 import { recordModelFailure } from "../../src/runs/shared/model-exclusions.ts";
 import type { AsyncExecutionResult, AsyncResultPayload, AsyncStatusPayload, MockPiCallRecord } from "../support/async-execution-fixture.ts";
@@ -72,6 +73,44 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			assert.equal(settled.steps?.[0]?.attention, undefined);
 		} finally {
 			if (!fs.existsSync(preRelease)) fs.writeFileSync(preRelease, "continue");
+			if (!fs.existsSync(release)) fs.writeFileSync(release, "continue");
+		}
+	});
+
+	it("does not publish late tool-error attention after targeted stop and disposal", { skip: !isAsyncAvailable() || process.platform === "win32" ? "async stop unavailable" : undefined }, async () => {
+		const release = path.join(tempDir, "release-stopped-tool-error");
+		const id = `async-tool-stop-${Date.now().toString(36)}`;
+		mockPi.onCall({ steps: [
+			{ jsonl: [
+				{ type: "tool_execution_start", toolName: "exec", toolCallId: "call-stop", args: {} },
+				{ type: "tool_execution_end", toolName: "exec", toolCallId: "call-stop", isError: true },
+				{ type: "message_end", message: { role: "toolResult", toolName: "exec", toolCallId: "call-stop", isError: true, content: [{ type: "text", text: "denied" }] } },
+			] },
+			{ waitForPath: release, jsonl: [events.assistantMessage("late")] },
+		] });
+		executeAsyncSingle(id, {
+			agent: "worker", task: "Wait", agentConfig: makeAgent("worker", { completionGuard: false }),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-tool-stop" },
+			controlConfig: resolveControlConfig(undefined, { needsAttentionAfterMs: 1200 }),
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false, maxSubagentDepth: 2, acceptance: false,
+		});
+		try {
+			await waitForMockPiCall(mockPi, 0);
+			const dir = path.join(ASYNC_DIR, id);
+			const running = await waitForAsyncState(id, (value) => value.steps?.[0]?.status === "running" && typeof value.pid === "number");
+			deliverStopRequest({ asyncDir: dir, pid: running.pid!, source: "test", targetIndex: 0, childId: "step:0" });
+			await waitForAsyncResultFile(id, 10_000);
+			const settled = await waitForAsyncState(id, (value) => value.state !== "running");
+			assert.equal(settled.steps?.[0]?.status, "stopped");
+			const journal = path.join(dir, "events.jsonl");
+			const count = () => fs.readFileSync(journal, "utf-8").split("\n").filter((line) => line.includes('"reason":"tool_error_stall"')).length;
+			const before = count();
+			await new Promise((resolve) => setTimeout(resolve, 1500));
+			assert.equal(count(), before);
+			assert.equal(count(), 0);
+			assert.equal(JSON.parse(fs.readFileSync(path.join(dir, "status.json"), "utf-8")).steps?.[0]?.attention, undefined);
+		} finally {
 			if (!fs.existsSync(release)) fs.writeFileSync(release, "continue");
 		}
 	});
