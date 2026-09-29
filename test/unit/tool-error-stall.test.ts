@@ -3,6 +3,10 @@ import { it } from "node:test";
 import type { ChildSessionEvent, ChildSessionFactory } from "../../src/runs/shared/child-session.ts";
 import { runSync } from "../../src/runs/foreground/execution.ts";
 import { makeAgent } from "../support/helpers.ts";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { inspectSubagentStatus } from "../../src/runs/background/run-status.ts";
 import { createToolErrorWatch } from "../../src/runs/shared/tool-error-watch.ts";
 
 it("tracks structured failure in either completion order, but never treats result delivery as recovery", () => {
@@ -36,6 +40,25 @@ it("clears on new tool start, success, and terminal cleanup without rearming old
  }
  watch.clear();
  assert.equal(watch.due(999_999, 60_000), undefined);
+});
+
+it("targeted status preserves bounded child attention and exact workflow identity", () => {
+ const root = mkdtempSync(join(tmpdir(), "tool-error-status-"));
+ try {
+  const run = join(root, "async", "run-1");
+  mkdirSync(run, { recursive: true });
+  const attention = { type: "needs_attention", to: "needs_attention", ts: 61_000, runId: "child-1",
+   agent: "worker", index: 0, message: "tool failed", reason: "tool_error_stall",
+   currentTool: "exec", toolCallId: "call-1", recentFailureSummary: "denied" };
+  writeFileSync(join(run, "status.json"), JSON.stringify({ runId: "run-1", state: "running", mode: "workflow",
+   startedAt: 1, lastUpdate: 61_000, steps: [{ agent: "worker", workflowKey: "write", runId: "child-1",
+    status: "running", activityState: "needs_attention", attention }] }));
+  const inspected = inspectSubagentStatus({ id: "run-1" }, { asyncDirRoot: join(root, "async"), resultsDir: join(root, "results") });
+  assert.equal(inspected.details?.statusSteps?.[0]?.attention?.reason, "tool_error_stall");
+  assert.equal(inspected.details?.statusSteps?.[0]?.childId, "write");
+  assert.equal(inspected.details?.controlEvents?.[0]?.toolCallId, "call-1");
+  assert.match(inspected.content[0]?.text ?? "", /Attention: .*tool_error_stall/);
+ } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 it("reports a structured exec failure followed by silence without aborting the child", async (t) => {

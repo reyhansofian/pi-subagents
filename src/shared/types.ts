@@ -1410,6 +1410,8 @@ export interface AgentCapabilityRow {
 }
 
 export interface Details {
+	/** Bounded targeted status identity/attention proof for live child-scoped recovery. */
+	statusSteps?: Array<{ index: number; childId: string; runId?: string; workflowKey?: string; agent: string; status: string; attention?: ControlEvent }>;
 	mode: SubagentResultMode | "management";
 	workflowReceiptPath?: string;
 	runId?: string;
