@@ -100,3 +100,32 @@ it("reports a structured exec failure followed by silence without aborting the c
  assert.deepEqual(new Set(events.filter((event) => event.reason === "tool_error_stall")
   .map((event) => JSON.stringify(event))), prior, "terminal disposal must not publish new attention");
 });
+
+it("accepted foreground detach disarms failed-tool attention without aborting the child", async (t) => {
+ t.mock.timers.enable({ apis: ["Date","setInterval","setTimeout"], now: 0 });
+ let emit: (event: ChildSessionEvent) => void = () => {};
+ let finish: () => void = () => {};
+ let detach: (reason?: string) => boolean = () => false;
+ let ready: () => void = () => {};
+ const started = new Promise<void>((resolve) => { ready = resolve; });
+ const factory: ChildSessionFactory = { async create() { return {
+  subscribe(listener) { emit = listener; return () => { emit = () => {}; }; },
+  prompt() { ready(); return new Promise<void>((resolve) => { finish = resolve; }); },
+  async abort() { assert.fail("detaching does not abort"); }, async dispose() {}, async steer() {}, async followUp() {},
+  messages: [], sessionId: "detach", modelId: undefined,
+ }; }, async dispose() {} };
+ const events: Array<{ reason?: string }> = [];
+ const running = runSync(process.cwd(), [makeAgent("worker")], "worker", "Recover", {
+  childSessionFactory: factory, onDetachReady: (value) => { detach = value; },
+  onDetachReceipt: () => true,
+  onUpdate: (value) => events.push(...(value.details?.controlEvents ?? [])),
+ });
+ await started;
+ emit({ type: "tool_execution_start", toolName: "exec", toolCallId: "call-1", args: {} });
+ emit({ type: "tool_execution_end", toolName: "exec", toolCallId: "call-1", isError: true });
+ assert.equal(detach(), true);
+ t.mock.timers.tick(120_000);
+ assert.equal(events.some((event) => event.reason === "tool_error_stall"), false);
+ finish();
+ await running;
+});

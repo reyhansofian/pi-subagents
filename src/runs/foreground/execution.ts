@@ -677,6 +677,8 @@ async function runSingleAttempt(
 			}
 			if (!accepted) return false;
 			detached = true;
+			toolErrorWatch.clear();
+			toolErrorAttention = false;
 			timeoutTimer?.unref?.();
 			timeoutHardFinishTimer?.unref?.();
 			if (session) session.detached = true;
@@ -937,7 +939,7 @@ async function runSingleAttempt(
 			return true;
 		};
 		const updateActivityState = (now: number): boolean => {
-			if (!controlConfig.enabled) return false;
+			if (!controlConfig.enabled || detached) return false;
 			const stalled = toolErrorWatch.due(now, controlConfig.needsAttentionAfterMs);
 			if (stalled && (!lastAttentionReason || !["tool_failures", "supervisor_request"].includes(lastAttentionReason))
 				&& (!toolErrorAttention || progress.activityState !== "needs_attention")) return emitNeedsAttention(now, {
@@ -1071,8 +1073,10 @@ async function runSingleAttempt(
 				if (toolErrorAttention) { progress.activityState = undefined; toolErrorAttention = false; }
 				lastAttentionReason = undefined;
 			}
-			if (evt.type === "tool_execution_start") toolErrorWatch.observe(evt, now, evt.toolName ? resolveCurrentPath(evt.toolName, evt.args && typeof evt.args === "object" && !Array.isArray(evt.args) ? evt.args as Record<string, unknown> : {}) : undefined);
-			else toolErrorWatch.observe(evt, now);
+			if (!detached) {
+				if (evt.type === "tool_execution_start") toolErrorWatch.observe(evt, now, evt.toolName ? resolveCurrentPath(evt.toolName, evt.args && typeof evt.args === "object" && !Array.isArray(evt.args) ? evt.args as Record<string, unknown> : {}) : undefined);
+				else toolErrorWatch.observe(evt, now);
+			}
 			progress.durationMs = now - startTime;
 			progress.lastActivityAt = now;
 			updateActivityState(now);
