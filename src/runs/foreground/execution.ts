@@ -882,7 +882,7 @@ async function runSingleAttempt(
 		const mutatingFailures = createMutatingFailureState();
 		const mutatingFailureWindowMs = 5 * 60_000;
 		const currentToolDurationMs = (now: number) => progress.currentToolStartedAt ? Math.max(0, now - progress.currentToolStartedAt) : undefined;
-		const emitNeedsAttention = (now: number, input: { message?: string; reason?: ControlEvent["reason"]; recentFailureSummary?: string; currentTool?: string; toolCallId?: string; currentPath?: string; currentToolDurationMs?: number } = {}): boolean => {
+		const emitNeedsAttention = (now: number, input: { message?: string; reason?: ControlEvent["reason"]; recentFailureSummary?: string; currentTool?: string; toolCallId?: string; failureId?: string; currentPath?: string; currentToolDurationMs?: number } = {}): boolean => {
 			if (!controlConfig.enabled) return false;
 			toolErrorAttention = input.reason === "tool_error_stall";
 			lastAttentionReason = input.reason ?? "idle";
@@ -904,6 +904,7 @@ async function runSingleAttempt(
 				toolCount: progress.toolCount,
 				currentTool: input.currentTool ?? progress.currentTool,
 				toolCallId: input.toolCallId,
+				failureId: input.failureId,
 				currentToolDurationMs: input.currentToolDurationMs ?? currentToolDurationMs(now),
 				currentPath: input.currentPath ?? progress.currentPath,
 				recentFailureSummary: input.recentFailureSummary,
@@ -944,7 +945,7 @@ async function runSingleAttempt(
 			if (stalled && (!lastAttentionReason || !["tool_failures", "supervisor_request"].includes(lastAttentionReason))
 				&& (!toolErrorAttention || progress.activityState !== "needs_attention")) return emitNeedsAttention(now, {
 				message: `${agent.name} needs attention after failed tool '${stalled.tool}' without continuation`,
-				reason: "tool_error_stall", currentTool: stalled.tool, toolCallId: stalled.toolCallId,
+				reason: "tool_error_stall", currentTool: stalled.tool, toolCallId: stalled.toolCallId, failureId: stalled.failureId,
 				currentPath: stalled.path, recentFailureSummary: stalled.summary,
 			});
 			const idleState = deriveActivityState({
@@ -1069,13 +1070,14 @@ async function runSingleAttempt(
 			}
 
 			const now = Date.now();
-			if (evt.type === "tool_execution_start" || isAssistantProgress(evt)) {
+			let recovered = false;
+			if (!detached) {
+				if (evt.type === "tool_execution_start") recovered = toolErrorWatch.observe(evt, now, evt.toolName ? resolveCurrentPath(evt.toolName, evt.args && typeof evt.args === "object" && !Array.isArray(evt.args) ? evt.args as Record<string, unknown> : {}) : undefined);
+				else recovered = toolErrorWatch.observe(evt, now);
+			}
+			if (recovered) {
 				if (toolErrorAttention) { progress.activityState = undefined; toolErrorAttention = false; }
 				lastAttentionReason = undefined;
-			}
-			if (!detached) {
-				if (evt.type === "tool_execution_start") toolErrorWatch.observe(evt, now, evt.toolName ? resolveCurrentPath(evt.toolName, evt.args && typeof evt.args === "object" && !Array.isArray(evt.args) ? evt.args as Record<string, unknown> : {}) : undefined);
-				else toolErrorWatch.observe(evt, now);
 			}
 			progress.durationMs = now - startTime;
 			progress.lastActivityAt = now;

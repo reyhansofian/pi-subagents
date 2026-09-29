@@ -99,7 +99,7 @@ import type { InheritedChildRuntime } from "../shared/child-launch.ts";
 import { buildRunnerChildLaunch } from "./runner-child-launch.ts";
 import { normalizeExtensionBindings } from "../shared/extension-bindings.ts";
 import type { ChildSessionFactory } from "../shared/child-session.ts";
-import { createToolErrorWatch, isAssistantProgress } from "../shared/tool-error-watch.ts";
+import { createToolErrorWatch } from "../shared/tool-error-watch.ts";
 import { getSettledReadonlyChild, runChildSession, type ChildEvent, type RunChildSessionInput, type RunChildSessionResult, type StepSteerHandler } from "./run-child-session.ts";
 import { planReadonlyModelContinuation, READONLY_CONTINUATION_PROMPT, type LogicalRecoveryState } from "../shared/readonly-model-continuation.ts";
 import { getReadonlySessionEvidence } from "../shared/readonly-session-evidence.ts";
@@ -3028,13 +3028,12 @@ export async function runSubagent(
 		if (!step) return;
 		const previousActivityState = step.activityState;
 		const now = Date.now();
-		const recovered = event.type === "tool_execution_start" || isAssistantProgress(event);
+		const recovered = toolErrorWatches[flatIndex]?.observe(event, now, event.type === "tool_execution_start" && event.toolName ? resolveCurrentPath(event.toolName, event.args) : undefined);
 		if (recovered && toolErrorAttentionSteps.delete(flatIndex)) {
 			delete step.activityState;
 			delete step.attention;
 			syncAggregateActivityState();
 		}
-		toolErrorWatches[flatIndex]?.observe(event, now, event.type === "tool_execution_start" && event.toolName ? resolveCurrentPath(event.toolName, event.args) : undefined);
 		statusPayload.currentStep = flatIndex;
 		if (isChildWatchdogStatusEvent(event)) {
 			const next = acceptChildWatchdogEvent({
@@ -3211,7 +3210,7 @@ export async function runSubagent(
 				step.attention = buildControlEvent(omitUndefinedProperties({
 					from: previous, to: "needs_attention", runId: id, agent: step.agent, index, ts: now,
 					message: `${step.agent} needs attention after failed tool '${stalled.tool}' without continuation`,
-					reason: "tool_error_stall", currentTool: stalled.tool, toolCallId: stalled.toolCallId,
+					reason: "tool_error_stall", currentTool: stalled.tool, toolCallId: stalled.toolCallId, failureId: stalled.failureId,
 					currentPath: stalled.path, recentFailureSummary: stalled.summary,
 					turns: step.turnCount, tokens: step.tokens?.total, toolCount: step.toolCount,
 				}));
