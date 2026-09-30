@@ -1635,8 +1635,22 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 			const rejected = await run("v1-tool-execution-end-" + name, event);
 			assert.equal(rejected.exitCode, 1);
 			assert.equal(rejected.acceptance?.runtimeChecks[0]?.status, "failed");
-			if (name === "error") assert.match(rejected.error ?? "", /Available launch tools: none/);
+			if (name === "error") assert.match(rejected.error ?? "", /Available launch tools: ambient \(inventory unknown\)/);
 		}
+		const ambientSchema = await runSync(tempDir, [agent], "scout", "Inspect the repository", {
+			runId: "v1-ambient-schema-tool-evidence",
+			agentContract: { version: 1 },
+			outputSchema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] },
+			acceptance: { toolEvidence: ["read"] },
+		});
+		assert.match(ambientSchema.error ?? "", /Available launch tools: ambient \(inventory unknown\)/);
+		mockPi.onCall({ jsonl: [events.assistantMessage("Done without current read")] });
+		const emptyTools = await runSync(tempDir, [makeAgent("scout", { tools: [], completionGuard: false })], "scout", "Inspect the repository", {
+			runId: "v1-explicit-empty-tool-evidence",
+			agentContract: { version: 1 },
+			acceptance: { toolEvidence: ["read"] },
+		});
+		assert.match(emptyTools.error ?? "", /Available launch tools: none/);
 
 		const legacy = await run("v1-tool-result-end-legacy", events.toolResult("read", "legacy result"));
 		assert.equal(legacy.exitCode, 0, legacy.error);

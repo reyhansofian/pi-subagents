@@ -1065,7 +1065,7 @@ export async function runSingleStepInner(
 	let finalRequiredOutputMissing: boolean | undefined;
 	const eventsPath = path.join(path.dirname(ctx.outputFile), "events.jsonl");
 	let finalResult: RunChildSessionResult | undefined;
-	let finalAvailableTools: string[] = [];
+	let finalAvailableTools: string[] | undefined;
 	let cumulativeMutationAttemptObserved = false;
 	let finalOutputSnapshot: SingleOutputSnapshot | undefined;
 	let structuredAcceptanceReport: unknown;
@@ -1157,7 +1157,7 @@ export async function runSingleStepInner(
 			failContinuationLaunch(candidate, error);
 			break modelAttemptsLoop;
 		}
-		if (step.effectiveAcceptance?.toolEvidence.length) finalAvailableTools = launch.toolPlan.effectiveToolAllowlist;
+		if (step.effectiveAcceptance?.toolEvidence.length) finalAvailableTools = launch.toolPlan.explicitToolAllowlist ? launch.toolPlan.effectiveToolAllowlist : undefined;
 		if (effectiveStructuredOutput && launch.config.structuredOutput) {
 			// The runner reads the value back from the runtime's files after the run.
 			launch.config.structuredOutput.capture = createStructuredOutputFileCapture(effectiveStructuredOutput);

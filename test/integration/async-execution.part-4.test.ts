@@ -653,6 +653,24 @@ setTimeout(() => process.exit(90), 15000).unref();
 		assert.equal(successful.success, true);
 		assert.equal(successful.results[0]?.acceptance?.runtimeChecks[0]?.status, "passed");
 
+		const schemaId = "async-ambient-schema-evidence-" + Date.now().toString(36);
+		mockPi.onCall({ jsonl: [events.assistantMessage("Done without current read")], structuredOutput: { ok: true } });
+		executeAsyncSingle(schemaId, {
+			agent: "scout",
+			task: "Inspect the repository",
+			agentConfig: makeAgent("scout", { completionGuard: false }),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			acceptance: { toolEvidence: ["read"] },
+			structuredOutputSchema: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+		});
+		const schemaResult = JSON.parse(fs.readFileSync(await waitForAsyncResultFile(schemaId, 10_000), "utf-8")) as AsyncResultPayload;
+		assert.equal(schemaResult.results[0]?.acceptance?.runtimeChecks[0]?.status, "failed");
+		assert.match(schemaResult.results[0]?.acceptance?.runtimeChecks[0]?.message ?? "", /Available launch tools: ambient \(inventory unknown\)/);
+
 		for (const [name, event] of [
 			["error", { type: "tool_execution_end", toolCallId: "read-error", toolName: "read", result: {}, isError: true }],
 			["missing-status", { type: "tool_execution_end", toolCallId: "read-missing-status", toolName: "read", result: {} }],
@@ -664,7 +682,7 @@ setTimeout(() => process.exit(90), 15000).unref();
 			const rejected = await run(name, event);
 			assert.equal(rejected.success, false);
 			assert.equal(rejected.results[0]?.acceptance?.runtimeChecks[0]?.status, "failed");
-			if (name === "error") assert.match(rejected.results[0]?.error ?? "", /Available launch tools: none/);
+			if (name === "error") assert.match(rejected.results[0]?.error ?? "", /Available launch tools: ambient \(inventory unknown\)/);
 		}
 
 		const legacy = await run("legacy", events.toolResult("read", "legacy result"));

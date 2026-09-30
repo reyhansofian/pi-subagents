@@ -119,7 +119,7 @@ import { childSessionFactory, collectCurrentLaunchToolEvidence, projectChildSess
 
 const artifactOutputByResult = new WeakMap<SingleResult, string>();
 const acceptanceOutputByResult = new WeakMap<SingleResult, string>();
-const toolEvidenceByResult = new WeakMap<SingleResult, { toolResults: Message[]; availableTools: string[] }>();
+const toolEvidenceByResult = new WeakMap<SingleResult, { toolResults: Message[]; availableTools?: string[] }>();
 
 function emptyUsage(): Usage {
 	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
@@ -534,7 +534,7 @@ async function runSingleAttempt(
 	}, options.context);
 	const currentLaunchToolResults = shared.collectToolEvidence ? [] as Message[] : undefined;
 	const toolResultIndexesByCallId = new Map<string, { index: number; failed: boolean }>();
-	if (currentLaunchToolResults) toolEvidenceByResult.set(result, { toolResults: currentLaunchToolResults, availableTools: toolPlan.effectiveToolAllowlist });
+	if (currentLaunchToolResults) toolEvidenceByResult.set(result, { toolResults: currentLaunchToolResults, availableTools: toolPlan.explicitToolAllowlist ? toolPlan.effectiveToolAllowlist : undefined });
 	const startTime = Date.now();
 	const controlConfig = options.controlConfig ?? DEFAULT_CONTROL_CONFIG;
 	let interruptedByControl = false;

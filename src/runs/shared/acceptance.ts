@@ -1405,7 +1405,7 @@ export async function evaluateAcceptance(input: {
 		verifyRuns: [],
 	};
 	if (acceptance.toolEvidence.length > 0) {
-		const available = unique([...(input.availableTools ?? [])]).sort();
+		const available = input.availableTools === undefined ? "ambient (inventory unknown)" : unique([...input.availableTools]).sort().join(", ") || "none";
 		const matched = (input.toolResults ?? []).some((message) =>
 			message.role === "toolResult"
 			&& message.isError === false
@@ -1417,7 +1417,7 @@ export async function evaluateAcceptance(input: {
 			status: matched ? "passed" : "failed",
 			message: matched
 				? "Observed a successful result from a required tool: " + required.join(", ") + "."
-				: "Expected at least one successful result from required tools: " + required.join(", ") + ". Available launch tools: " + (available.join(", ") || "none") + ".",
+				: "Expected at least one successful result from required tools: " + required.join(", ") + ". Available launch tools: " + available + ".",
 		});
 		if (!matched) {
 			ledger.status = "rejected";

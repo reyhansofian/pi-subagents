@@ -125,6 +125,11 @@ describe("acceptance gates", () => {
 		const inheritedHistory = [{ role: "toolResult", toolName: "read", isError: false, content: [] } as unknown as Message];
 		const historical = await evaluate([], inheritedHistory);
 		assert.equal(historical.status, "rejected", "inherited historical tool result must not satisfy current-launch evidence");
+		const ambient = await evaluateAcceptance({ acceptance, output: "done", cwd: process.cwd(), toolResults: [] });
+		assert.equal(ambient.status, "rejected");
+		assert.match(ambient.runtimeChecks[0]?.message ?? "", /Available launch tools: ambient \(inventory unknown\)/);
+		const explicitlyEmpty = await evaluateAcceptance({ acceptance, output: "done", cwd: process.cwd(), availableTools: [] });
+		assert.match(explicitlyEmpty.runtimeChecks[0]?.message ?? "", /Available launch tools: none/);
 
 		const noOptIn = await evaluateAcceptance({
 			acceptance: resolveEffectiveAcceptance({ agentName: "scout", task: "Inspect" }),
