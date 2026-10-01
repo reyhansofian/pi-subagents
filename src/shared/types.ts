@@ -384,7 +384,7 @@ export interface ControlEvent {
 	nestedRunId?: string;
 	nestingPath?: NestedRunAddress["path"];
 	message: string;
-	reason?: "idle" | "active_long_running" | "tool_failures" | "supervisor_request" | "time_threshold" | "turn_threshold" | "token_threshold" | "tool_open_threshold";
+	reason?: "idle" | "active_long_running" | "tool_failures" | "tool_error_stall" | "supervisor_request" | "time_threshold" | "turn_threshold" | "token_threshold" | "tool_open_threshold";
 	turns?: number;
 	tokens?: number;
 	toolCount?: number;
@@ -1065,6 +1065,8 @@ export interface AcceptanceReviewGate {
 
 export interface AcceptanceConfig {
 	level?: AcceptanceLevel;
+	/** Exact tool names; at least one must succeed during this child launch. */
+	toolEvidence?: string[];
 	report?: "on" | "off";
 	/** Preserve an intentional launch-time staged index, while rejecting any terminal index change. */
 	preserveStagedIndex?: true;
@@ -1088,6 +1090,7 @@ export interface ResolvedAcceptanceGate extends AcceptanceGate {
 
 export interface ResolvedAcceptanceConfig {
 	level: Exclude<AcceptanceLevel, "auto">;
+	toolEvidence: string[];
 	explicit: boolean;
 	inferredReason: string[];
 	criteria: ResolvedAcceptanceGate[];

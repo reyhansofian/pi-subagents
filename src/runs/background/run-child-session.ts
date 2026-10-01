@@ -24,7 +24,7 @@ import { formatChildModelResolutionDiagnostic, isChildModelResolutionFailure } f
 import { isMutatingTool, resolveCurrentPath } from "../shared/long-running-guard.ts";
 import { effectiveToolTimeoutMs, formatToolTimeoutMessage, toolTimeoutCallKey } from "../shared/tool-timeout.ts";
 import { createReportedChildSessionInput, type InProcessChildLaunch } from "../shared/child-launch.ts";
-import { childSessionHasQueuedMessages, projectChildSessionEventForJson, type ChildSession, type ChildSessionEvent, type ChildSessionFactory } from "../shared/child-session.ts";
+import { childSessionHasQueuedMessages, createToolEvidenceCollector, projectChildSessionEventForJson, type ChildSession, type ChildSessionEvent, type ChildSessionFactory } from "../shared/child-session.ts";
 import { reconcileAttemptUsage } from "../shared/usage-reconciliation.ts";
 import { formatSteerMessage } from "../shared/subagent-prompt-runtime.ts";
 import type { SteerDeliveryStatus, SteerRequest } from "./control-channel.ts";
@@ -105,6 +105,7 @@ export interface RunChildSessionInput {
 
 export interface RunChildSessionResult {
 	exitCode: number;
+	toolNames?: string[];
 	messages: Message[];
 	usage: Usage;
 	toolCount: number;
@@ -169,6 +170,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 	return new Promise((resolve) => {
 		const startedAt = Date.now();
 		const messages: Message[] = [];
+		const toolEvidence = createToolEvidenceCollector();
 		const usage = emptyUsage();
 		let model: string | undefined;
 		let error: string | undefined;
@@ -411,6 +413,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 
 		const processEvent = (raw: ChildSessionEvent): void => {
 			if (settled) return;
+			toolEvidence.observe(raw);
 			const event = raw as ChildSessionEvent & ChildEvent;
 			appendChildEvent(projectChildSessionEventForJson(raw) as Record<string, unknown>);
 			input.transcriptWriter?.writeChildEvent(projectChildSessionEventForJson(raw) as ChildEvent);
@@ -607,6 +610,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 			void closed.then(() => {
 				const result: RunChildSessionResult = omitUndefined({
 					exitCode,
+					toolNames: toolEvidence.successfulNames(),
 					messages,
 					usage: terminalUsage,
 					toolCount,

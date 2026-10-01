@@ -221,6 +221,18 @@ describe("extractChildWrittenOutput", () => {
 		toolResult(id),
 	];
 
+	it("attributes a native codemode nested write from the paired successful result", () => {
+		const nested = (complete: boolean, status: string, parentError = false): Message[] => [
+			toolCall("outer", "codemode", { code: "await tools.write(...)" }),
+			{ ...toolResult("outer", parentError), toolName: "codemode", nestedCalls: { complete, calls: [{ id: "outer/1", name: "write", status, arguments: { path: "out.md", content: "nested report" } }] } } as Message,
+		];
+		assert.equal(extractChildWrittenOutput(nested(true, "ok"), "/repo/out.md", "/repo"), "nested report");
+		assert.equal(extractChildWrittenOutput(nested(false, "ok"), "/repo/out.md", "/repo"), undefined);
+		assert.equal(extractChildWrittenOutput(nested(true, "error"), "/repo/out.md", "/repo"), undefined);
+		assert.equal(extractChildWrittenOutput(nested(true, "ok", true), "/repo/out.md", "/repo"), undefined);
+		assert.equal(extractChildWrittenOutput([nested(true, "ok")[1]!], "/repo/out.md", "/repo"), undefined);
+	});
+
 	it("returns the last successfully written content for the configured path", () => {
 		const messages = [
 			...completedWrite("w1", "/tmp/out.md", "draft"),

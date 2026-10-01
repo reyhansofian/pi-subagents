@@ -2,9 +2,11 @@
  * Core execution logic for running subagents
  */
 
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
 import type { Message } from "@earendil-works/pi-ai";
+import { createToolEvidenceCollector } from "../shared/child-session.ts";
+import { createToolErrorWatch } from "../shared/tool-error-watch.ts";
 import { discoverAgents, formatUnknownAgentError, unknownAgentDiagnosticContext, type AgentConfig } from "../../agents/agents.ts";
 import { alignForkedSessionCwd } from "../../shared/fork-session-cwd.ts";
 import { buildEffectiveSystemPrompt } from "../shared/effective-system-prompt.ts";
@@ -353,10 +355,12 @@ async function runSingleAttempt(
 		transcriptWriter?: ChildTranscriptWriter;
 		attemptNotes: string[];
 		outputSnapshot?: SingleOutputSnapshot;
+		retainedAuthoredOutput?: string;
 		originalTask?: string;
 		orcaProgressTab?: OrcaProgressTab;
 		launchWarnings: { emitted: boolean };
 		verifyModel: boolean;
+		onToolEvidence: (names: string[], available?: string[]) => void;
 	},
 ): Promise<SingleResult> {
 	const effectiveThinking = options.thinkingOverride ?? agent.thinking;
@@ -566,6 +570,7 @@ async function runSingleAttempt(
 		}
 	}
 	const childSessions = options.childSessionFactory ?? childSessionFactory();
+	const toolEvidence = createToolEvidenceCollector();
 	const exitCode = await new Promise<number>((resolve) => {
 		const jsonlWriter = createJsonlWriter(shared.jsonlPath, { pause() {}, resume() {} });
 		let session: ChildSession | undefined;
@@ -845,9 +850,11 @@ async function runSingleAttempt(
 			.filter((active) => shouldEmitOpenToolAttention({ config: controlConfig, currentTool: active.tool, currentToolStartedAt: active.startedAt, now }))
 			.sort((left, right) => left.startedAt - right.startedAt)[0];
 		const mutatingFailures = createMutatingFailureState();
+		const toolErrorWatch = createToolErrorWatch();
+		let failedToolAttentionId: string | undefined;
 		const mutatingFailureWindowMs = 5 * 60_000;
 		const currentToolDurationMs = (now: number) => progress.currentToolStartedAt ? Math.max(0, now - progress.currentToolStartedAt) : undefined;
-		const emitNeedsAttention = (now: number, input: { message?: string; reason?: ControlEvent["reason"]; recentFailureSummary?: string; currentTool?: string; currentPath?: string; currentToolDurationMs?: number } = {}): boolean => {
+		const emitNeedsAttention = (now: number, input: { message?: string; reason?: ControlEvent["reason"]; recentFailureSummary?: string; currentTool?: string; toolCallId?: string; currentPath?: string; currentToolDurationMs?: number } = {}): boolean => {
 			if (!controlConfig.enabled) return false;
 			const previous = progress.activityState;
 			progress.activityState = "needs_attention";
@@ -866,6 +873,7 @@ async function runSingleAttempt(
 				tokens: progress.tokens,
 				toolCount: progress.toolCount,
 				currentTool: input.currentTool ?? progress.currentTool,
+				toolCallId: input.toolCallId,
 				currentToolDurationMs: input.currentToolDurationMs ?? currentToolDurationMs(now),
 				currentPath: input.currentPath ?? progress.currentPath,
 				recentFailureSummary: input.recentFailureSummary,
@@ -902,6 +910,11 @@ async function runSingleAttempt(
 		};
 		const updateActivityState = (now: number): boolean => {
 			if (!controlConfig.enabled) return false;
+			const failedCall = toolErrorWatch.due(now, controlConfig.needsAttentionAfterMs);
+			if (failedCall && failedToolAttentionId !== failedCall.toolCallId) {
+				failedToolAttentionId = failedCall.toolCallId;
+				return emitNeedsAttention(now, { message: agent.name + " needs attention after failed tool '" + failedCall.tool + "' without continuation", reason: "tool_error_stall", currentTool: failedCall.tool, toolCallId: failedCall.toolCallId, currentPath: failedCall.path, recentFailureSummary: failedCall.summary });
+			}
 			const idleState = deriveActivityState({
 				config: controlConfig,
 				startedAt: startTime,
@@ -965,6 +978,7 @@ async function runSingleAttempt(
 
 		const processEvent = (evt: ChildSessionEvent & { message?: Message; toolName?: string; toolCallId?: string; args?: unknown; willRetry?: unknown }) => {
 			if (lifecycleFinished) return;
+			toolEvidence.observe(evt);
 			jsonlWriter.writeLine(JSON.stringify(projectChildSessionEventForJson(evt)));
 			shared.transcriptWriter?.writeChildEvent(evt);
 			shared.orcaProgressTab?.event(evt);
@@ -1027,6 +1041,11 @@ async function runSingleAttempt(
 			}
 
 			const now = Date.now();
+			toolErrorWatch.observe(evt, now, evt.type === "tool_execution_start" && evt.toolName && evt.args && typeof evt.args === "object" && !Array.isArray(evt.args) ? resolveCurrentPath(evt.toolName, evt.args as Record<string, unknown>) : undefined);
+			if (failedToolAttentionId && !toolErrorWatch.due(now, 0)) {
+				failedToolAttentionId = undefined;
+				if (progress.activityState === "needs_attention") progress.activityState = undefined;
+			}
 			progress.durationMs = now - startTime;
 			progress.lastActivityAt = now;
 			updateActivityState(now);
@@ -1421,6 +1440,7 @@ async function runSingleAttempt(
 		})();
 	});
 	result.exitCode = exitCode;
+	shared.onToolEvidence(toolEvidence.successfulNames(), launch.session.tools);
 	if (afterCompactionSettlement) {
 		(result as AbortRecoverySingleResult)[AFTER_COMPACTION_SETTLEMENT] = true;
 	}
@@ -1545,7 +1565,10 @@ async function runSingleAttempt(
 			: `${timeoutMessage}\n\n${result.timeoutRecovery.message}`;
 	}
 		if (options.outputPath && result.exitCode === 0) {
-			const resolvedOutput = resolveSingleOutput(options.outputPath, fullOutput, shared.outputSnapshot, options.outputClaimPath);
+			const retainedOutputIntact = options.outputMode === "file-only" && shared.retainedAuthoredOutput !== undefined
+				&& (() => { try { return readFileSync(options.outputPath!, "utf-8") === shared.retainedAuthoredOutput; } catch { return false; } })();
+			// A verified prior attempt wrote this same report; a resumed receipt must not replace it.
+			const resolvedOutput = resolveSingleOutput(options.outputPath, fullOutput, retainedOutputIntact ? { exists: false } : shared.outputSnapshot, options.outputClaimPath);
 			fullOutput = stripAcceptanceReport(resolvedOutput.fullOutput);
 			result.savedOutputPath = resolvedOutput.savedPath;
 			result.outputSaveError = resolvedOutput.saveError;
@@ -1841,7 +1864,10 @@ async function runSyncCompletionInner(
 	const candidate = selectedModel;
 	const verifyModel = Boolean(candidate) && !options.modelOverrideFromParent;
 	let lastResult: SingleResult | undefined;
+	let toolNames: string[] = [];
+	let availableTools: string[] | undefined;
 	let recoveryPrompt = task;
+	let retainedAuthoredOutput: string | undefined;
 	let stagedIndexBaseline: string | undefined;
 	if (effectiveAcceptance.preserveStagedIndex) {
 		try {
@@ -1859,6 +1885,8 @@ async function runSyncCompletionInner(
 		}
 	}
 	for (let attemptIndex = 0; attemptIndex < 2; attemptIndex++) {
+		toolNames = [];
+		availableTools = undefined;
 		const outputSnapshot = captureSingleOutputSnapshot(options.outputPath);
 		const attemptResult = await runSingleAttempt(runtimeCwd, agent, recoveryPrompt, candidate, attemptOptions, {
 			sessionEnabled,
@@ -1871,10 +1899,12 @@ async function runSyncCompletionInner(
 			transcriptWriter,
 			attemptNotes,
 			outputSnapshot,
+			retainedAuthoredOutput,
 			originalTask: task,
 			orcaProgressTab,
 			launchWarnings,
 			verifyModel,
+			onToolEvidence: (names, available) => { toolNames = names; availableTools = available; },
 		});
 		lastResult = attemptResult;
 		sumUsage(aggregateUsage, attemptResult.usage);
@@ -1898,6 +1928,10 @@ async function runSyncCompletionInner(
 			afterCompactionSettlement: (attemptResult as AbortRecoverySingleResult)[AFTER_COMPACTION_SETTLEMENT],
 		});
 		if (recovery.action === "resume") {
+			if (options.outputMode === "file-only" && options.outputPath) {
+				const authored = extractChildWrittenOutput(attemptResult.messages, options.outputPath, options.cwd ?? runtimeCwd);
+				if (authored !== undefined) retainedAuthoredOutput = authored;
+			}
 			recoveryPrompt = recovery.prompt;
 			attemptNotes.push("[abort-recovery] compaction abort after useful progress; resuming the retained child session once on the same model.");
 			continue;
@@ -1965,8 +1999,12 @@ async function runSyncCompletionInner(
 		if (sessionFile) result.sessionFile = sessionFile;
 	}
 
+	const retainedReportOnDisk = retainedAuthoredOutput !== undefined && result.savedOutputPath && options.outputPath
+		? (() => { try { return readFileSync(options.outputPath!, "utf-8") === retainedAuthoredOutput; } catch { return false; } })()
+		: false;
 	const childWrittenOutput = options.outputPath
 		? extractChildWrittenOutput(result.messages, options.outputPath, options.cwd ?? runtimeCwd)
+			?? (retainedReportOnDisk ? retainedAuthoredOutput : undefined)
 		: undefined;
 	try {
 		if (result.interrupted && detachedReason === "user request") {
@@ -1981,6 +2019,8 @@ async function runSyncCompletionInner(
 		} else {
 			result.acceptance = await evaluateAcceptance({
 				acceptance: effectiveAcceptance,
+				toolNames,
+				availableTools,
 				output: acceptanceOutputByResult.get(result) ?? result.finalOutput ?? "",
 				report: (result as SingleResult & { structuredAcceptanceReport?: import("../../shared/types.ts").AcceptanceReport; structuredAcceptanceReportError?: string }).structuredAcceptanceReport,
 				reportError: (result as SingleResult & { structuredAcceptanceReport?: import("../../shared/types.ts").AcceptanceReport; structuredAcceptanceReportError?: string }).structuredAcceptanceReportError,
@@ -2007,7 +2047,7 @@ async function runSyncCompletionInner(
 	if (typedGate && result.structuredOutput === undefined && !acceptanceFailure && result.exitCode === 0) {
 		result.structuredOutput = typedGate.value;
 	}
-	if (acceptanceFailure && result.acceptance.explicit && result.exitCode === 0 && !result.interrupted && !result.timedOut && !isAgentContract(options.agentContract)) {
+	if (acceptanceFailure && result.acceptance.explicit && result.exitCode === 0 && !result.interrupted && !result.timedOut && (!isAgentContract(options.agentContract) || effectiveAcceptance.toolEvidence.length > 0)) {
 		result.exitCode = 1;
 		if (result.savedOutputPath) {
 			result.finalOutput = finalizeSingleOutput({

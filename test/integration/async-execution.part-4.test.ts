@@ -1259,6 +1259,47 @@ setTimeout(() => process.exit(90), 15000).unref();
 		}
 	});
 
+	it("reports one background failed-tool stall with the current child identity", { skip: !isAsyncAvailable() ? "jiti not available" : undefined, timeout: 20_000 }, async () => {
+		mockPi.onCall({ steps: [
+			{ jsonl: [
+				{ type: "tool_execution_start", toolCallId: "outer/1", parentToolCallId: "outer", toolName: "read", args: { path: "sample.ts" } },
+				{ type: "tool_execution_end", toolCallId: "outer/1", parentToolCallId: "outer", toolName: "read", isError: true },
+				{ type: "tool_result_end", message: { role: "toolResult", toolCallId: "outer/1", toolName: "read", isError: true, content: [{ type: "text", text: "denied" }] } },
+			] },
+			{ delay: 2200, jsonl: [events.assistantMessage("Investigated alternate source.")] },
+		] });
+		const id = "async-failed-tool-" + Date.now().toString(36);
+		const asyncDir = path.join(ASYNC_DIR, id);
+		const eventsPath = path.join(asyncDir, "events.jsonl");
+		executeAsyncSingle(id, {
+			agent: "scout", task: "Investigate behavior", agentConfig: makeAgent("scout"),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false, sessionRoot: path.join(tempDir, "sessions"), maxSubagentDepth: 2,
+			controlConfig: { enabled: true, needsAttentionAfterMs: 1, activeNoticeAfterMs: 999_999, notifyOn: ["needs_attention"], notifyChannels: ["event", "async"] },
+		});
+		const statusPath = path.join(asyncDir, "status.json");
+		const deadline = Date.now() + 10_000;
+		let attentionSeen = false;
+		while (Date.now() < deadline) {
+			if (fs.existsSync(statusPath)) {
+				const status = JSON.parse(fs.readFileSync(statusPath, "utf8")) as AsyncStatusPayload;
+				if (status.activityState === "needs_attention" && status.steps?.[0]?.activityState === "needs_attention") { attentionSeen = true; break; }
+			}
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+		assert.equal(attentionSeen, true, "live runner status must expose failed-tool attention");
+		const payload = await readAsyncPayload(id);
+		const lines = fs.readFileSync(eventsPath, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line) as { type?: string; event?: { reason?: string; toolCallId?: string; index?: number } });
+		const notices = lines.filter((line) => line.type === "subagent.control" && line.event?.reason === "tool_error_stall");
+		assert.equal(notices.length, 1);
+		assert.equal(notices[0]?.event?.toolCallId, "outer/1");
+		assert.equal(notices[0]?.event?.index, 0);
+		assert.equal(payload.success, true);
+		const terminalStatus = JSON.parse(fs.readFileSync(statusPath, "utf8")) as AsyncStatusPayload;
+		assert.notEqual(terminalStatus.steps?.[0]?.activityState, "needs_attention", "continuation clears live failed-tool attention");
+	});
+
 	it("does not flag a delayed active tool as idle attention", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({
 			steps: [

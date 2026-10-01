@@ -189,7 +189,7 @@ export function shouldNotifyControlEvent(config: ResolvedControlConfig, event: C
 
 export function controlNotificationKey(event: ControlEvent, childIntercomTarget?: string): string {
 	const childKey = childIntercomTarget ?? (event.index !== undefined ? `${event.runId}:${event.index}` : event.runId);
-	const contextHash = createHash("sha256").update(formatControlNudge(event)).digest("hex").slice(0, 8);
+	const contextHash = createHash("sha256").update(formatControlNudge(event) + (event.reason === "tool_error_stall" ? event.toolCallId ?? "" : "")).digest("hex").slice(0, 8);
 	return `${childKey}:${event.type}:${event.reason ?? "idle"}:${contextHash}`;
 }
 

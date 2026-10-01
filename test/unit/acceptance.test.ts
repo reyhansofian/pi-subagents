@@ -65,6 +65,25 @@ function tempGitRepo(): string {
 }
 
 describe("acceptance gates", () => {
+	it("requires current-launch tool execution even with a valid report or an agent contract", async () => {
+		const explicit = { level: "checked" as const, toolEvidence: ["read", "tools.read"] };
+		assert.deepEqual(validateAcceptanceInput(explicit), []);
+		const acceptance = resolveEffectiveAcceptance({ agentName: "worker", explicit, agentContract: { version: 1 } });
+		const rejected = await evaluateAcceptance({ acceptance, output: report(), cwd: process.cwd(), reportOptional: true, availableTools: [] });
+		assert.equal(rejected.status, "rejected");
+		assert.match(acceptanceFailureMessage(rejected) ?? "", /Available launch tools: none/);
+		const passed = await evaluateAcceptance({ acceptance, output: report(), cwd: process.cwd(), toolNames: ["tools.read"] });
+		assert.notEqual(passed.status, "rejected");
+	});
+	it("rejects malformed toolEvidence and distinguishes unknown from empty inventory", async () => {
+		for (const names of [[], [""], [" read"], [["read"]], [17]]) assert.notDeepEqual(validateAcceptanceInput({ level: "checked", toolEvidence: names }), []);
+		const acceptance = resolveEffectiveAcceptance({ agentName: "worker", explicit: { level: "checked", toolEvidence: ["read"] } });
+		for (const [inventory, expected] of [[undefined, "inventory unknown"], [[], "none"]] as const) {
+			const ledger = await evaluateAcceptance({ acceptance, output: report(), cwd: process.cwd(), availableTools: inventory });
+			assert.equal(ledger.status, "rejected");
+			assert.match(acceptanceFailureMessage(ledger) ?? "", new RegExp(expected));
+		}
+	});
 	it("applies checked acceptance to declared builtin writer profiles", () => {
 		const builtins = discoverAgentsAll(tempRepo()).builtin;
 		const writerNames = ["worker", "claude-code-writer", "codex-exec-writer", "cursor-agent-writer"];

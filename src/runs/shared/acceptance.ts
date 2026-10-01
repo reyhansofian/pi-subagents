@@ -51,7 +51,7 @@ const VALID_EVIDENCE_KINDS: AcceptanceEvidenceKind[] = [
 const VALID_EVIDENCE = new Set<AcceptanceEvidenceKind>(VALID_EVIDENCE_KINDS);
 const ACCEPTANCE_EVIDENCE_HELP = `Supported evidence kinds: ${VALID_EVIDENCE_KINDS.join(", ")}. Example: { level: "checked", evidence: ["commands-run", "changed-files"] }.`;
 const ACCEPTANCE_OBJECT_EXAMPLE = "Example: { level: \"checked\", evidence: [\"commands-run\", \"changed-files\"] }.";
-const ACCEPTANCE_CONFIG_KEYS = new Set(["level", "report", "preserveStagedIndex", "criteria", "evidence", "verify", "review", "stopRules", "reason"]);
+const ACCEPTANCE_CONFIG_KEYS = new Set(["level", "report", "preserveStagedIndex", "criteria", "evidence", "toolEvidence", "verify", "review", "stopRules", "reason"]);
 const ACCEPTANCE_GATE_KEYS = new Set(["id", "must", "evidence", "severity"]);
 const ACCEPTANCE_VERIFY_KEYS = new Set(["id", "command", "timeoutMs", "cwd", "env", "allowFailure", "output", "schema"]);
 const ACCEPTANCE_REVIEW_KEYS = new Set(["agent", "focus", "required"]);
@@ -333,6 +333,12 @@ export function validateAcceptanceInput(input: unknown, pathLabel = "acceptance"
 	} else if (value.evidence !== undefined) {
 		errors.push(`${pathLabel}.evidence must be an array. ${ACCEPTANCE_EVIDENCE_HELP}`);
 	}
+	if (value.toolEvidence !== undefined) {
+		if (!Array.isArray(value.toolEvidence) || value.toolEvidence.length === 0) errors.push(pathLabel + ".toolEvidence must be a non-empty array.");
+		else for (const [index, name] of value.toolEvidence.entries()) {
+			if (typeof name !== "string" || !name || name !== name.trim()) errors.push(pathLabel + ".toolEvidence[" + index + "] must be an exact non-blank tool name.");
+		}
+	}
 	if (value.level === "verified" && (!Array.isArray(value.verify) || value.verify.length === 0)) {
 		errors.push(`${pathLabel}.verify must contain at least one runtime command when level is verified. Use level "checked" or provide a non-empty acceptance.verify array.`);
 	} else if (value.verify !== undefined && !Array.isArray(value.verify)) {
@@ -494,6 +500,7 @@ export function resolveEffectiveAcceptance(input: {
 			inferredReason: [],
 			criteria,
 			evidence,
+			toolEvidence: unique(explicit.toolEvidence ?? []),
 			preserveStagedIndex: explicit.preserveStagedIndex,
 			verify: explicit.verify ?? [],
 			review: explicit.review,
@@ -520,6 +527,7 @@ export function resolveEffectiveAcceptance(input: {
 		inferredReason: inferred.reasons,
 		criteria: level === "none" ? [] : criteria,
 		evidence: level === "none" ? [] : evidence,
+		toolEvidence: unique(explicit.toolEvidence ?? []),
 		preserveStagedIndex: explicit.preserveStagedIndex,
 		verify: explicit.verify ?? [],
 		review,
@@ -539,8 +547,10 @@ export function formatReviewGateLabel(review: AcceptanceReviewGate): string {
 }
 
 export function formatAcceptancePrompt(acceptance: ResolvedAcceptanceConfig, options: { reportOptional?: boolean; structuredOutput?: boolean } = {}): string {
-	if (acceptance.level === "none") return "";
-	if (options.reportOptional && !acceptanceRequiresChildReport(acceptance)) return "";
+	const toolHint = acceptance.toolEvidence.length > 0
+		? "Execute at least one of these tools successfully in this child launch: " + acceptance.toolEvidence.join(", ") + ". Declaring tools or describing a read does not count."
+		: "";
+	if (acceptance.level === "none" || (options.reportOptional && !acceptanceRequiresChildReport(acceptance))) return toolHint;
 	const lines = [
 		"",
 		"## Acceptance Contract",
@@ -552,6 +562,7 @@ export function formatAcceptancePrompt(acceptance: ResolvedAcceptanceConfig, opt
 		"",
 		`Required evidence: ${acceptance.evidence.join(", ") || "none"}`,
 	];
+	if (toolHint) lines.push(toolHint);
 	if (acceptance.preserveStagedIndex) {
 		lines.push("The host will verify that the staged index is unchanged from launch; report noStagedFiles truthfully even when the preserved index is non-empty.");
 	}
@@ -1477,6 +1488,10 @@ export async function evaluateAcceptance(input: {
 	acceptance: ResolvedAcceptanceConfig;
 	output: string;
 	cwd: string;
+	/** Successful native tool names from this child launch only. */
+	toolNames?: readonly string[];
+	/** Undefined means ambient inventory is unknown; [] means explicitly empty. */
+	availableTools?: readonly string[];
 	/** Host-captured launch index tree; required by preserveStagedIndex. */
 	stagedIndexBaseline?: string;
 	/**
@@ -1508,6 +1523,20 @@ export async function evaluateAcceptance(input: {
 		runtimeChecks: [],
 		verifyRuns: [],
 	};
+	if (acceptance.toolEvidence.length > 0) {
+		const available = input.availableTools === undefined ? "ambient (inventory unknown)" : [...new Set(input.availableTools)].sort().join(", ") || "none";
+		const matched = acceptance.toolEvidence.some((name) => input.toolNames?.includes(name));
+		ledger.runtimeChecks.push({
+			id: "required-tool-evidence",
+			status: matched ? "passed" : "failed",
+			message: matched ? "Required tool executed successfully." : "Expected at least one successful result from required tools: " + acceptance.toolEvidence.join(", ") + ". Available launch tools: " + available + ".",
+		});
+		if (!matched) {
+			ledger.status = "rejected";
+			ledger.evidenceStatus = "rejected";
+			return ledger;
+		}
+	}
 	if (acceptance.level === "none") return ledger;
 
 	if (input.watchdog) {

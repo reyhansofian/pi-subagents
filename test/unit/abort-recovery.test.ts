@@ -95,6 +95,18 @@ describe("planAbortRecovery", () => {
 		assert.deepEqual(planAbortRecovery(base({ messages: inFlight, currentTool: undefined })), { action: "settle", reason: "unresolved tool call remains in transcript" });
 	});
 
+	it("does not automatically replay an unknown write outcome after compaction", () => {
+		const pendingWrite = messages(
+			progress,
+			{ role: "assistant", content: [{ type: "toolCall", id: "mutation-1", name: "write", arguments: { path: "report.md", content: "possibly persisted" } }] },
+			aborted,
+		);
+		assert.deepEqual(planAbortRecovery(base({ messages: pendingWrite, afterCompactionSettlement: true })), {
+			action: "settle", reason: "unresolved tool call remains in transcript",
+			diagnostic: "Compaction-induced child abort could not be resumed safely: unresolved tool call remains in transcript.",
+		});
+	});
+
 	it("names the exact blocker when compaction abort recovery is unsafe", () => {
 		assert.deepEqual(planAbortRecovery(base({ sessionAvailable: false, afterCompactionSettlement: true })), {
 			action: "settle",

@@ -25,6 +25,35 @@ export interface ChildSessionEvent {
 	[key: string]: unknown;
 }
 
+/** Launch-local native Pi tool completions; retain identities, not tool arguments or results. */
+export function createToolEvidenceCollector() {
+	const calls = new Map<string, { name: string; parent?: string; started: boolean; successful: boolean; failed: boolean }>();
+	return {
+		observe(event: ChildSessionEvent): void {
+			if (event.type !== "tool_execution_start" && event.type !== "tool_execution_end" && event.type !== "tool_result_end") return;
+			const result = event.type === "tool_result_end" ? event.message as Record<string, unknown> | undefined : undefined;
+			const id = result?.toolCallId ?? event.toolCallId;
+			const name = result?.toolName ?? event.toolName;
+			if (typeof id !== "string" || !id || typeof name !== "string" || !name) return;
+			const previous = calls.get(id);
+			const parent = result?.parentToolCallId ?? event.parentToolCallId;
+			const parentMismatch = previous !== undefined && parent !== undefined && previous.parent !== parent;
+			const envelopeMismatch = event.type === "tool_result_end" && ((event.toolCallId !== undefined && event.toolCallId !== id) || (event.toolName !== undefined && event.toolName !== name));
+			if (event.type === "tool_execution_start") {
+				calls.set(id, { name, parent: typeof parent === "string" ? parent : undefined, started: true, successful: previous?.successful === true, failed: previous?.failed === true || previous !== undefined });
+				return;
+			}
+			const failed = event.type === "tool_execution_end"
+				? event.isError !== false
+				: result?.role !== "toolResult" || result.isError !== false;
+			calls.set(id, { name, parent: previous?.parent, started: previous?.started === true, successful: !failed || previous?.successful === true, failed: failed || previous?.failed === true || (previous !== undefined && previous.name !== name) || parentMismatch || envelopeMismatch });
+		},
+		successfulNames(): string[] {
+			return [...new Set([...calls.values()].filter((call) => call.started && call.successful && !call.failed).map((call) => call.name))];
+		},
+	};
+}
+
 /** Mirror pi's JSON event projection: `message_update` drops the partial message. */
 export function projectChildSessionEventForJson(event: ChildSessionEvent): unknown {
 	if (event.type !== "message_update") return event;
@@ -364,6 +393,10 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 		async create(launch) {
 			const disposalsAtStart = disposals;
 			const pi = await loadPiCodingAgent();
+			const createCodemodeExtension = (pi as PiCodingAgentModule & { createCodemodeExtension?: () => ChildHookExtension["factory"] }).createCodemodeExtension;
+			if (launch.tools?.includes("codemode") && typeof createCodemodeExtension !== "function") {
+				throw new Error("This Pi host does not support native codemode; use direct tools or upgrade Pi. An allowlist entry does not install codemode.");
+			}
 			const builtinMcpTools = launch.builtinMcpTools ?? [];
 			const builtinMcp = builtinMcpTools.length ? selectedBuiltinMcpExtension(pi, builtinMcpTools) : undefined;
 			const modelRuntime = launch.parentProviderRegistry
@@ -380,7 +413,6 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 			// SDK sessions do not install Pi's CLI built-ins. Use the host's own
 			// codemode factory only when this child can select it; older Pi hosts
 			// without that factory retain the strict missing-tool diagnostic.
-			const createCodemodeExtension = (pi as PiCodingAgentModule & { createCodemodeExtension?: () => ChildHookExtension["factory"] }).createCodemodeExtension;
 			const codemode = typeof createCodemodeExtension === "function" &&
 				!launch.runtime.capabilityCeiling?.denyExtensions &&
 				(launch.tools === undefined || launch.tools.includes("codemode")) &&

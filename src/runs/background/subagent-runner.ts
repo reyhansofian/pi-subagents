@@ -100,6 +100,7 @@ import { currentPidNamespaceScope } from "./pid-namespace.ts";
 import { createSteeringStatus, recordSteeringRequest, steeringStatus, terminalSteeringNoticeState, unconsumedSteerReason, updateSteeringTarget } from "./steering.ts";
 import { PROMPT_REDACTED, detectSubagentError, extractTextFromContent, extractToolArgsPreview, formatEmptyTerminalAssistantResponseError, getAgentDir, getFinalOutput, hasEmptyTerminalAssistantResponse, readStatus } from "../../shared/utils.ts";
 import { planAbortRecovery } from "../shared/abort-recovery.ts";
+import { createToolErrorWatch } from "../shared/tool-error-watch.ts";
 import {
 	createMutatingFailureState,
 	didMutatingToolFail,
@@ -1435,6 +1436,8 @@ export async function runSingleStepInner(
 		? await evaluateAcceptance(omitUndefinedProperties({
 			acceptance: step.effectiveAcceptance,
 			output: outputForAcceptance,
+			toolNames: finalResult?.toolNames,
+			availableTools: resolvedTaskToolPlan?.explicitToolAllowlist ? resolvedTaskToolPlan.effectiveToolAllowlist : undefined,
 			report: structuredAcceptanceReport as import("../../shared/types.ts").AcceptanceReport | undefined,
 			reportError: structuredAcceptanceReportError,
 			fileOutput: childWrittenOutput !== undefined && step.outputPath
@@ -1460,7 +1463,7 @@ export async function runSingleStepInner(
 				: acceptance
 		: undefined;
 	const acceptanceFailure = effectiveAcceptance ? acceptanceFailureMessage(effectiveAcceptance) : undefined;
-	const acceptanceCanFailRun = acceptanceFailure && effectiveAcceptance?.explicit && (finalResult?.exitCode ?? 1) === 0 && !finalResult?.interrupted && !timedOutAfterAcceptance && !stoppedAfterAcceptance && !isAgentContract(step.agentContract);
+	const acceptanceCanFailRun = acceptanceFailure && effectiveAcceptance?.explicit && (finalResult?.exitCode ?? 1) === 0 && !finalResult?.interrupted && !timedOutAfterAcceptance && !stoppedAfterAcceptance && (!isAgentContract(step.agentContract) || (step.effectiveAcceptance?.toolEvidence.length ?? 0) > 0);
 	const effectiveFinalExitCode = timedOutAfterAcceptance || stoppedAfterAcceptance ? 1 : acceptanceCanFailRun ? 1 : finalResult?.exitCode ?? 1;
 	// A passing typed gate supplies the structured output for runs that have no
 	// outputSchema of their own; preflight rejects the combination.
@@ -2534,6 +2537,8 @@ export async function runSubagent(
 			pendingAppends,
 		});
 		mutatingFailureStates.push(...Array.from({ length: added.addedFlatSteps }, () => createMutatingFailureState()));
+		toolErrorWatches.push(...Array.from({ length: added.addedFlatSteps }, () => createToolErrorWatch()));
+		failedToolAttentionIds.push(...Array.from({ length: added.addedFlatSteps }, () => undefined));
 		pendingToolResults.push(...Array.from({ length: added.addedFlatSteps }, () => undefined));
 		if (config.childIntercomTargets) {
 			config.childIntercomTargets = statusPayload.steps.map((statusStep, index) => resolveSubagentIntercomTarget(id, statusStep.agent, index));
@@ -2631,6 +2636,8 @@ export async function runSubagent(
 	const emittedControlEventKeys = new Set<string>();
 	const activeLongRunningSteps = new Set<number>();
 	const mutatingFailureStates = initialStatusSteps.map(() => createMutatingFailureState());
+	const toolErrorWatches = initialStatusSteps.map(() => createToolErrorWatch());
+	const failedToolAttentionIds: Array<string | undefined> = initialStatusSteps.map(() => undefined);
 	const pendingToolResults: Array<{ tool: string; path?: string; mutates: boolean; startedAt?: number } | undefined> = initialStatusSteps.map(() => undefined);
 	type ActiveToolCall = { key: string; tool: string; args: string; startedAt: number; path?: string; blocksSupervisor: boolean };
 	const activeToolCalls = initialStatusSteps.map(() => new Map<string, ActiveToolCall>());
@@ -2967,6 +2974,15 @@ export async function runSubagent(
 		if (!step) return;
 		const previousActivityState = step.activityState;
 		const now = Date.now();
+		const errorWatch = toolErrorWatches[flatIndex];
+		errorWatch?.observe(event, now, event.type === "tool_execution_start" && event.toolName ? resolveCurrentPath(event.toolName, event.args) : undefined);
+		if (failedToolAttentionIds[flatIndex] && !errorWatch?.due(now, 0)) {
+			failedToolAttentionIds[flatIndex] = undefined;
+			if (step.activityState === "needs_attention") {
+				delete step.activityState;
+				syncAggregateActivityState();
+			}
+		}
 		statusPayload.currentStep = flatIndex;
 		if (isChildWatchdogStatusEvent(event)) {
 			const next = acceptChildWatchdogEvent({
@@ -3133,6 +3149,14 @@ export async function runSubagent(
 		for (let index = 0; index < statusPayload.steps.length; index++) {
 			const step = statusPayload.steps[index]!;
 			if (step.status !== "running") continue;
+			const failure = toolErrorWatches[index]?.due(now, controlConfig.needsAttentionAfterMs);
+			if (failure && failedToolAttentionIds[index] !== failure.toolCallId) {
+				failedToolAttentionIds[index] = failure.toolCallId;
+				const previous = step.activityState;
+				step.activityState = "needs_attention";
+				appendControlEvent(buildControlEvent({ to: "needs_attention", from: previous, runId: id, agent: step.agent, index, ts: now, reason: "tool_error_stall", message: step.agent + " needs attention after failed tool '" + failure.tool + "' without continuation", currentTool: failure.tool, toolCallId: failure.toolCallId, currentPath: failure.path, recentFailureSummary: failure.summary }));
+				changed = true;
+			}
 			const lastActivityAt = stepOutputActivityAt(index);
 			runLastActivityAt = Math.max(runLastActivityAt, lastActivityAt);
 			if (step.lastActivityAt !== lastActivityAt) {
@@ -3532,7 +3556,7 @@ export async function runSubagent(
 				const groupTimedOut = !groupStopped && (timedOut || timeoutAbortController.signal.aborted);
 				const effectiveGroupAcceptance = groupTimedOut || groupStopped ? undefined : groupAcceptance;
 				if (placeholder && effectiveGroupAcceptance) placeholder.acceptance = effectiveGroupAcceptance;
-				const groupAcceptanceFailure = effectiveGroupAcceptance && (!isAgentContract(step.agentContract) || step.gateOn === "acceptance") ? acceptanceFailureMessage(effectiveGroupAcceptance) : undefined;
+				const groupAcceptanceFailure = effectiveGroupAcceptance && (!isAgentContract(step.agentContract) || step.gateOn === "acceptance" || effectiveDynamicGroupAcceptance.toolEvidence.length > 0) ? acceptanceFailureMessage(effectiveGroupAcceptance) : undefined;
 				if (groupTimedOut || groupStopped || groupAcceptanceFailure) {
 					const errorMessage = groupStopped ? stopMessage : groupTimedOut ? timeoutMessage ?? "Subagent timed out." : groupAcceptanceFailure!;
 					statusPayload.state = groupStopped ? "stopped" : "failed";
@@ -3626,6 +3650,8 @@ export async function runSubagent(
 				config.childIntercomTargets = statusPayload.steps.map((statusStep, index) => resolveSubagentIntercomTarget(id, statusStep.agent, index));
 			}
 			mutatingFailureStates.splice(groupStartFlatIndex, 1, ...dynamicStatusSteps.map(() => createMutatingFailureState()));
+			toolErrorWatches.splice(groupStartFlatIndex, 1, ...dynamicStatusSteps.map(() => createToolErrorWatch()));
+			failedToolAttentionIds.splice(groupStartFlatIndex, 1, ...dynamicStatusSteps.map(() => undefined));
 			pendingToolResults.splice(groupStartFlatIndex, 1, ...dynamicStatusSteps.map(() => undefined));
 			const materializedDelta = dynamicStatusSteps.length - 1;
 			for (const group of statusPayload.parallelGroups) {
@@ -3902,7 +3928,7 @@ export async function runSubagent(
 					const groupStopped = stopped || stopAbortController.signal.aborted;
 					const groupTimedOut = !groupStopped && (timedOut || timeoutAbortController.signal.aborted);
 					const effectiveGroupAcceptance = groupTimedOut || groupStopped ? undefined : groupAcceptance;
-					const groupAcceptanceFailure = effectiveDynamicGroupAcceptance.explicit && effectiveGroupAcceptance && (!isAgentContract(step.agentContract) || step.gateOn === "acceptance") ? acceptanceFailureMessage(effectiveGroupAcceptance) : undefined;
+					const groupAcceptanceFailure = effectiveDynamicGroupAcceptance.explicit && effectiveGroupAcceptance && (!isAgentContract(step.agentContract) || step.gateOn === "acceptance" || effectiveDynamicGroupAcceptance.toolEvidence.length > 0) ? acceptanceFailureMessage(effectiveGroupAcceptance) : undefined;
 					const groupError = groupStopped ? stopMessage : groupTimedOut ? timeoutMessage ?? "Subagent timed out." : groupAcceptanceFailure;
 					markDynamicGraphGroup(stepIndex, groupError ? groupStopped ? "stopped" : "failed" : "completed", groupError, effectiveGroupAcceptance);
 					if (groupError) {

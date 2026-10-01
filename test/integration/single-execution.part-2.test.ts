@@ -1593,6 +1593,59 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		assert.match(result.acceptance.runtimeChecks?.[0]?.message ?? "", /not-satisfied/);
 	});
 
+	it("workflow runs.run retains an explicit tool gate with structured output and agent contract", async () => {
+		const workflowScript = 'return runs.run("scout", { agent: "echo", task: "Read source", agentContract: { version: 1 }, acceptance: { level: "checked", toolEvidence: ["read", "mcp__docs__read"] }, outputSchema: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } } });';
+		mockPi.onCall({ jsonl: [
+			{ type: "tool_execution_start", toolCallId: "structured", toolName: "structured_output", args: { value: { ok: true } } },
+			{ type: "tool_execution_end", toolCallId: "structured", toolName: "structured_output", isError: false },
+		], structuredOutputCapture: { ok: true }, output: "done" });
+		const result = await makeExecutor([makeAgent("echo")]).execute("workflow-tool-evidence", {
+			async: false,
+			workflowScript,
+		}, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		const child = result.details.results[0];
+		assert.equal(result.isError, true);
+		assert.equal(child.acceptance?.status, "rejected");
+		assert.equal(child.acceptance?.runtimeChecks?.find((check) => check.id === "required-tool-evidence")?.status, "failed");
+		assert.equal(mockPi.callCount(), 1);
+		mockPi.onCall({ jsonl: [
+			{ type: "tool_execution_start", toolCallId: "nested/1", parentToolCallId: "codemode", toolName: "read" },
+			{ type: "tool_execution_end", toolCallId: "nested/1", parentToolCallId: "codemode", toolName: "read", isError: false },
+			{ type: "tool_execution_start", toolCallId: "structured", toolName: "structured_output", args: { value: { ok: true } } },
+			{ type: "tool_execution_end", toolCallId: "structured", toolName: "structured_output", isError: false },
+		], structuredOutputCapture: { ok: true }, output: "done" });
+		const accepted = await makeExecutor([makeAgent("echo")]).execute("workflow-tool-evidence-success", { async: false, workflowScript }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		assert.equal(accepted.isError, undefined, accepted.content[0]?.text);
+		assert.equal(accepted.details.results[0]?.acceptance?.status, "checked");
+		assert.equal(mockPi.callCount(), 2);
+	});
+
+	it("a resumed workflow child cannot borrow its earlier read or relaunch a completed sibling", async () => {
+		mockPi.onCall({ jsonl: [
+			{ type: "tool_execution_start", toolCallId: "first-read", toolName: "read" },
+			{ type: "tool_execution_end", toolCallId: "first-read", toolName: "read", isError: false },
+			events.assistantMessage("Read source"),
+		] });
+		mockPi.onCall({ output: "Completed sibling" });
+		mockPi.onCall({ output: "Continued without new read" });
+		const result = await makeExecutor([makeAgent("echo")]).execute("resume-evidence-isolation", {
+			async: false,
+			workflowScript: `const first = await runs.run("first", { agent: "echo", task: "Read", agentContract: { version: 1 }, acceptance: { level: "checked", toolEvidence: ["read"] }, output: false }); const sibling = await runs.run("sibling", { agent: "echo", task: "Other", acceptance: false, output: false }); return runs.run("resumed", { resume: first.runId, task: "Continue", agentContract: { version: 1 }, acceptance: { level: "checked", toolEvidence: ["read"] }, output: false });`,
+		}, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		assert.equal(mockPi.callCount(), 3, result.content[0]?.text ?? "the completed sibling is not relaunched");
+		const [first, sibling, resumed] = result.details.results;
+		assert.equal(first.acceptance?.status, "checked");
+		assert.equal(sibling.exitCode, 0);
+		assert.equal(resumed.acceptance?.status, "rejected");
+		assert.equal(resumed.acceptance?.runtimeChecks?.find((check) => check.id === "required-tool-evidence")?.status, "failed");
+		const entries = result.details.workflow!.receipt!.entries;
+		assert.ok(entries.first.latestRunId);
+		assert.ok(entries.sibling.latestRunId);
+		assert.ok(entries.resumed.latestRunId);
+		assert.notEqual(entries.first.latestRunId, entries.resumed.latestRunId);
+		assert.notEqual(entries.sibling.latestRunId, entries.resumed.latestRunId);
+	});
+
 	it("direct single tool calls support outputSchema", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		mockPi.onCall({
 			stdoutRaw: [
@@ -2456,6 +2509,26 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		assert.equal(controlEvents[0]?.turns, 2);
 		assert.equal(result.controlEvents?.[0]?.type, "active_long_running");
 		assert.equal(result.progress.activityState, "active_long_running");
+	});
+
+	it("reports an identified failed nested call stalled without continuation and clears live attention on recovery", { timeout: 12_000 }, async () => {
+		const controlEvents: NonNullable<RunSyncResult["controlEvents"]> = [];
+		mockPi.onCall({ steps: [
+			{ jsonl: [
+				{ type: "tool_execution_start", toolCallId: "outer/1", parentToolCallId: "outer", toolName: "read", args: { path: "sample.ts" } },
+				{ type: "tool_execution_end", toolCallId: "outer/1", parentToolCallId: "outer", toolName: "read", isError: true },
+				{ type: "tool_result_end", message: { role: "toolResult", toolCallId: "outer/1", toolName: "read", isError: true, content: [{ type: "text", text: "denied" }] } },
+			] },
+			{ delay: 2200, jsonl: [events.assistantMessage("Investigated alternate source.")] },
+		] });
+		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Investigate source", {
+			runId: "failed-tool-attention", controlConfig: { enabled: true, needsAttentionAfterMs: 1, activeNoticeAfterMs: 999_999, notifyOn: ["needs_attention"] },
+			onControlEvent: (event: NonNullable<RunSyncResult["controlEvents"]>[number]) => controlEvents.push(event),
+		});
+		assert.equal(result.exitCode, 0);
+		assert.equal(controlEvents.filter((event) => event.reason === "tool_error_stall").length, 1);
+		assert.equal(controlEvents.find((event) => event.reason === "tool_error_stall")?.toolCallId, "outer/1");
+		assert.equal(result.progress.activityState, undefined);
 	});
 
 	it("escalates repeated mutating tool failures to needs attention", async () => {

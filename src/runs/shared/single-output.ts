@@ -47,14 +47,30 @@ export function extractChildWrittenOutput(
 	if (!messages?.length || !outputPath) return undefined;
 	const resolvedTarget = path.resolve(cwd ?? ".", outputPath);
 	const comparableTarget = process.platform === "win32" ? resolvedTarget.toLowerCase() : resolvedTarget;
+	const codemodeCalls = new Set<string>();
 	const successfulCallIds = new Set<string>();
 	for (const message of messages) {
+		if (message.role === "assistant") {
+			for (const part of message.content) if (part.type === "toolCall" && part.name === "codemode") codemodeCalls.add(part.id);
+		}
 		if (message.role === "toolResult" && message.isError === false && typeof message.toolCallId === "string") {
 			successfulCallIds.add(message.toolCallId);
 		}
 	}
 	let content: string | undefined;
 	for (const message of messages) {
+		if (message.role === "toolResult" && message.toolName === "codemode" && message.isError === false && codemodeCalls.has(message.toolCallId)) {
+			const nested = (message as typeof message & { nestedCalls?: { complete?: boolean; calls?: Array<{ name?: string; status?: string; arguments?: unknown }> } }).nestedCalls;
+			if (nested?.complete === true) for (const call of nested.calls ?? []) {
+				if (call.name !== "write" || call.status !== "ok") continue;
+				const args = call.arguments;
+				if (!args || typeof args !== "object" || Array.isArray(args)) continue;
+				const { path: writePath, content: written } = args as Record<string, unknown>;
+				if (typeof writePath !== "string" || typeof written !== "string") continue;
+				const resolvedWritePath = path.resolve(cwd ?? ".", writePath);
+				if ((process.platform === "win32" ? resolvedWritePath.toLowerCase() : resolvedWritePath) === comparableTarget) content = written;
+			}
+		}
 		if (message.role !== "assistant") continue;
 		for (const part of message.content) {
 			if (part.type !== "toolCall" || part.name !== "write" || !successfulCallIds.has(part.id)) continue;

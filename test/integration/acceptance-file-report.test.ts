@@ -38,6 +38,7 @@ interface ExecutionModule {
 		options: Record<string, unknown>,
 	): Promise<{
 		exitCode: number;
+		structuredOutput?: unknown;
 		error?: string;
 		finalOutput?: string;
 		savedOutputPath?: string;
@@ -413,6 +414,20 @@ describe("acceptance file reports", { skip: !runSync ? "pi packages not availabl
 	}
 
 	describe("foreground runSync", () => {
+		it("requires native nested execution rather than a wrapper or a valid report", async () => {
+			for (const [call, accepted] of [
+				[{ type: "tool_execution_end", toolCallId: "wrapper", toolName: "codemode", isError: false }, false],
+				[{ type: "tool_execution_end", toolCallId: "wrapper/1", parentToolCallId: "wrapper", toolName: "read", isError: true }, false],
+				[{ type: "tool_execution_end", toolCallId: "wrapper/1", parentToolCallId: "wrapper", toolName: "read", isError: false }, true],
+			] as const) {
+				mockPi.onCall({ jsonl: [{ type: "tool_execution_start", toolCallId: call.toolCallId, ...(call.toolCallId.startsWith("wrapper/") ? { parentToolCallId: "wrapper" } : {}), toolName: call.toolName }, call, events.assistantMessage(acceptanceReport("satisfied", "child report"))] });
+				const result = await runSync!(tempDir, makeAgentConfigs(["worker"]), "worker", "Read source", {
+					runId: "tool-evidence-foreground", acceptance: { level: "checked", toolEvidence: ["read"] },
+				});
+				assert.equal(result.acceptance?.status === "checked", accepted);
+				assert.equal(result.exitCode === 0, accepted);
+			}
+		});
 		it("file-only mode accepts from the child-written file when the text report fails", async () => {
 			const outputPath = path.join(tempDir, "report.md");
 			conflictingReportsCall(outputPath, "satisfied", "not-satisfied");
@@ -427,6 +442,87 @@ describe("acceptance file reports", { skip: !runSync ? "pi packages not availabl
 			assert.equal(result.acceptance?.status, "checked");
 			assert.equal(result.exitCode, 0);
 			assert.equal(result.savedOutputPath, outputPath);
+		});
+
+		it("keeps requested JSON separate from a child-authored file-only report", async () => {
+			const outputPath = path.join(tempDir, "structured-review.md");
+			const fileReport = "# Review\n" + acceptanceReport("satisfied", "separate report");
+			mockPi.onCall({ jsonl: [
+				...events.completedWrite(outputPath, fileReport),
+				{ type: "tool_execution_start", toolCallId: "json-result", toolName: "structured_output", args: { value: { ok: true } } },
+				{ type: "tool_execution_end", toolCallId: "json-result", toolName: "structured_output", isError: false },
+				events.assistantMessage("Output saved to the configured file."),
+			], writeFiles: [{ path: outputPath, content: fileReport }], structuredOutputCapture: { ok: true } });
+			const result = await runSync!(tempDir, makeAgentConfigs(["worker"]), "worker", "Write review and JSON", {
+				runId: "acceptance-structured-separate", outputPath, outputMode: "file-only",
+				structuredOutput: { schema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] }, outputPath: path.join(tempDir, "result.json") },
+				acceptance: { level: "checked", criteria: ["Report the findings"] },
+			});
+			assert.equal(result.exitCode, 0, result.error);
+			assert.equal(result.acceptance?.status, "checked");
+			assert.equal(result.acceptance?.childReport?.criteriaSatisfied?.[0]?.evidence, "separate report");
+			assert.deepEqual(result.structuredOutput, { ok: true });
+			assert.equal(fs.readFileSync(outputPath, "utf-8"), fileReport);
+		});
+
+		it("does not treat a stale or sibling-written file as this child's authored report", async () => {
+			for (const siblingWrite of [false, true]) {
+				const outputPath = path.join(tempDir, siblingWrite ? "sibling.md" : "stale.md");
+				const fileReport = "# Other child\n" + acceptanceReport("satisfied", "not authored");
+				if (!siblingWrite) fs.writeFileSync(outputPath, fileReport);
+				mockPi.onCall({ jsonl: [events.assistantMessage(acceptanceReport("not-satisfied", "current child"))], ...(siblingWrite ? { writeFiles: [{ path: outputPath, content: fileReport }] } : {}) });
+				const result = await runSync!(tempDir, makeAgentConfigs(["worker"]), "worker", "Review", {
+					runId: siblingWrite ? "sibling-not-authored" : "stale-not-authored", outputPath, outputMode: "file-only",
+					acceptance: { level: "checked", criteria: ["Report the findings"] },
+				});
+				assert.equal(result.acceptance?.status, "rejected");
+				assert.equal(result.acceptance?.childReport?.criteriaSatisfied?.[0]?.evidence, "current child");
+			}
+		});
+
+		it("retains an authored valid report across a compaction recovery receipt", async () => {
+			const outputPath = path.join(tempDir, "retained-review.md");
+			const sessionFile = path.join(tempDir, "retained-session.jsonl");
+			const fileReport = "# Retained review\n" + acceptanceReport("satisfied", "retained first attempt");
+			mockPi.onCall({
+				jsonl: [
+					...events.completedWrite(outputPath, fileReport),
+					{ type: "message_end", message: { role: "assistant", content: [], model: "mock/test-model", stopReason: "error", errorMessage: "This operation was aborted", usage: { input: 10, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } },
+					{ type: "agent_settled" }, { type: "compaction_start" },
+				], omitImplicitFinalEvents: true,
+				writeFiles: [{ path: outputPath, content: fileReport }, { path: sessionFile, content: "{}\n" }],
+			});
+			mockPi.onCall({ output: "Output saved to the configured file." });
+			const result = await runSync!(tempDir, makeAgentConfigs(["worker"]), "worker", "Write findings", {
+				runId: "retained-report-recovery", sessionFile, outputPath, outputMode: "file-only",
+				acceptance: { level: "checked", criteria: ["Report the findings"] },
+			});
+			assert.equal(mockPi.callCount(), 2, result.error);
+			assert.equal(fs.readFileSync(outputPath, "utf-8"), fileReport, "the receipt must not truncate the retained report");
+			assert.equal(result.acceptance?.status, "checked", result.error);
+			assert.equal(result.acceptance?.childReport?.criteriaSatisfied?.[0]?.evidence, "retained first attempt");
+		});
+
+		it("does not borrow a pre-compaction read for the recovered launch tool gate", async () => {
+			const outputPath = path.join(tempDir, "recovered-gate.md");
+			const sessionFile = path.join(tempDir, "recovered-gate.jsonl");
+			const report = acceptanceReport("satisfied", "old report");
+			mockPi.onCall({ jsonl: [
+				{ type: "tool_execution_start", toolCallId: "old-read", toolName: "read" },
+				{ type: "tool_execution_end", toolCallId: "old-read", toolName: "read", isError: false },
+				...events.completedWrite(outputPath, report),
+				{ type: "message_end", message: { role: "assistant", content: [], model: "mock/test-model", stopReason: "error", errorMessage: "This operation was aborted", usage: { input: 10, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } },
+				{ type: "agent_settled" }, { type: "compaction_start" },
+			], omitImplicitFinalEvents: true, writeFiles: [{ path: outputPath, content: report }, { path: sessionFile, content: "{}\n" }] });
+			mockPi.onCall({ output: "Output saved to the configured file." });
+			const result = await runSync!(tempDir, makeAgentConfigs(["worker"]), "worker", "Continue", {
+				runId: "recovered-gate", sessionFile, outputPath, outputMode: "file-only",
+				acceptance: { level: "checked", criteria: ["Report the findings"], toolEvidence: ["read"] },
+			});
+			assert.equal(mockPi.callCount(), 2);
+			assert.equal(fs.readFileSync(outputPath, "utf-8"), report);
+			assert.equal(result.acceptance?.status, "rejected");
+			assert.equal(result.acceptance?.runtimeChecks?.find((check) => check.id === "required-tool-evidence")?.status, "failed");
 		});
 
 		it("retains the file-only report in the diagnostic artifact when acceptance rejects it", async () => {
@@ -696,7 +792,7 @@ describe("acceptance file reports", { skip: !runSync ? "pi packages not availabl
 	});
 
 	describe("background runner", { skip: isAsyncAvailable && !isAsyncAvailable() ? "jiti not available" : undefined }, () => {
-		function runAsyncSingle(id: string, outputPath: string, outputMode: "inline" | "file-only", artifactConfig = DISABLED_ARTIFACTS, disableCompileCache = false) {
+		function runAsyncSingle(id: string, outputPath: string, outputMode: "inline" | "file-only", artifactConfig = DISABLED_ARTIFACTS, disableCompileCache = false, toolEvidence?: string[]) {
 			const originalFactoryModule = childSessionFactoryModule();
 			assert.ok(originalFactoryModule, "expected the installed scripted runner factory");
 			const factoryPath = path.join(tempDir, "acceptance-exit-phases.mjs");
@@ -760,13 +856,24 @@ export default function() {
 					maxSubagentDepth: 2,
 					output: outputPath,
 					outputMode,
-					acceptance: { level: "checked", criteria: ["Report the findings"] },
+					acceptance: { level: "checked", criteria: ["Report the findings"], ...(toolEvidence ? { toolEvidence } : {}) },
 				}));
 			} finally {
 				// Launch captures the module path synchronously; restoring it does not release owned fixtures.
 				setChildSessionFactoryModule(originalFactoryModule);
 			}
 		}
+
+		it("rejects valid background report without a successful nested read", async () => {
+			const outputPath = path.join(tempDir, "async-evidence.md");
+			const report = acceptanceReport("satisfied", "child report");
+			mockPi.onCall({ jsonl: [events.assistantMessage(report)] });
+			const id = "async-tool-evidence-" + Date.now().toString(36);
+			runAsyncSingle(id, outputPath, "inline", DISABLED_ARTIFACTS, false, ["read"]);
+			const payload = await waitForAsyncResult(id);
+			assert.equal(payload.results[0]?.acceptance?.status, "rejected");
+			assert.equal(payload.success, false);
+		});
 
 		it("file-only mode accepts from the child-written file when the text report fails", async () => {
 			const outputPath = path.join(tempDir, "async-report.md");
