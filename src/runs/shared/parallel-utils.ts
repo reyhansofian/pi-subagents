@@ -10,6 +10,10 @@ export interface RunnerSubagentStep {
 	sessionName?: string;
 	task: string;
 	runner?: ResolvedRunnerConfig;
+	/** Herdr saved machine this external-cli step runs on; `cwd` is then the directory on that machine. */
+	machine?: import("../../shared/types.ts").HerdrMachineReference;
+	remoteReads?: string[] | false;
+	machineEnv?: Record<string, string>;
 	externalJobFollowUp?: {
 		sourceRunId: string;
 		sourceStepIndex: number;
@@ -37,7 +41,7 @@ export interface RunnerSubagentStep {
 	fast?: boolean;
 	thinking?: string;
 	thinkingCeiling?: import("../../shared/model-info.ts").ThinkingLevel;
-	modelCandidates?: string[];
+	requestedModel?: string;
 	/** The primary model is inherited from the parent session and should not be verified against the child-reported active registry model. */
 	skipPrimaryModelVerification?: boolean;
 	modelVerificationRegistry?: Array<{ provider: string; id: string; fullId: string; contextWindow?: number }>;
@@ -45,11 +49,16 @@ export interface RunnerSubagentStep {
 	tools?: string[];
 	excludeTools?: string[];
 	allowNestedSubagents?: boolean;
+	/** Resolved selected-agent policy for launches made by this child. */
+	allowedAgents?: string[];
 	extensions?: string[];
 	subagentOnlyExtensions?: string[];
+	/** Private immutable host policy snapshot serialized to the native runner. */
+	requiredExtensions?: import("../../shared/required-child-extensions.ts").RequiredChildExtensionSnapshot;
 	mcpDirectTools?: string[];
+	/** The parent's resolution of `mcpDirectTools` against Pi's built-in MCP; the runner has no host to repeat it. */
+	builtinMcpTools?: import("./mcp-direct-tool-grant.ts").ResolvedMcpDirectToolSelection[];
 	mutationTools?: string[];
-	completionGuard?: boolean;
 	systemPrompt?: string | null;
 	systemPromptMode?: "append" | "replace";
 	inheritProjectContext: boolean;
@@ -237,7 +246,6 @@ export interface ParallelTaskResult {
 	error?: string;
 	timedOut?: boolean;
 	model?: string;
-	attemptedModels?: string[];
 	outputTargetPath?: string;
 	outputTargetExists?: boolean;
 }

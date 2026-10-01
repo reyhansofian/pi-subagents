@@ -10,7 +10,6 @@ import type {
 	ParallelHandoffLaneBinding,
 	ParallelHandoffMergeEvidence,
 	ParallelHandoffSupersessionEvidence,
-	RetainedMutationIdentity,
 	SubagentResultStatus,
 	WorkflowLaneMetadata,
 } from "../../shared/types.ts";
@@ -160,11 +159,7 @@ function pathInside(root: string, candidate: string): boolean {
 	return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
-export function resolveRetainedWorktreeAllocation(
-	manifestPath: string,
-	runId: string,
-	childIndex: number,
-): Exclude<RetainedMutationIdentity["managedWorktree"], null> | undefined {
+export function resolveRetainedWorktreeCwd(manifestPath: string, runId: string, childIndex: number): string | undefined {
 	const manifest = readParallelHandoffManifest(manifestPath);
 	if (!manifest) return undefined;
 	if (manifest.runId !== runId) throw new Error(`Managed worktree handoff belongs to run '${manifest.runId}', not '${runId}'.`);
@@ -190,11 +185,7 @@ export function resolveRetainedWorktreeAllocation(
 		throw new Error(`Async run '${runId}' required managed worktree cwd is missing: ${requiredCwd}`, { cause: error instanceof Error ? error : undefined });
 	}
 	if (!pathInside(worktreeRoot, resolvedRequiredCwd)) throw new Error(`Async run '${runId}' has an invalid managed worktree cwd.`);
-	return { runId: manifest.runId, index: match.child.index, cwd: resolvedRequiredCwd };
-}
-
-export function resolveRetainedWorktreeCwd(manifestPath: string, runId: string, childIndex: number): string | undefined {
-	return resolveRetainedWorktreeAllocation(manifestPath, runId, childIndex)?.cwd;
+	return requiredCwd;
 }
 
 function referenceFor(manifestPath: string, manifest: ParallelHandoffManifest): ParallelHandoffReference {

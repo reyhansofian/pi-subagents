@@ -29,6 +29,7 @@ export interface SubagentCapabilityAudit {
 	effectiveMcpTools: string[];
 	agentAllowed: boolean;
 	agentRestrictionSources?: string[];
+	/** Builtin tools declared but unavailable on the host runtime. */
 }
 
 export interface RegisterSubagentCapabilityCeilingOptions {
@@ -60,6 +61,10 @@ function validateText(value: unknown, field: string): string {
 		throw new Error(`Invalid capability ceiling ${field}; expected a non-empty string without control characters (max 256 UTF-8 bytes).`);
 	}
 	return value.trim();
+}
+
+export function normalizeCapabilityCeilingAllowedAgents(values: unknown): string[] {
+	return normalizeCeiling({ allowedAgents: values } as SubagentCapabilityCeiling).allowedAgents!;
 }
 
 function normalizeCeiling(ceiling: SubagentCapabilityCeiling): ResolvedSubagentCapabilityCeiling {

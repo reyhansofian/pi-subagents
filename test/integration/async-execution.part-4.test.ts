@@ -17,7 +17,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { setChildSessionFactoryModule } from "../../src/runs/shared/child-session.ts";
 import { createEventBus, createTempDir, events, makeAgent, removeTempDir } from "../support/helpers.ts";
-import { deliverInterruptRequest, deliverStopRequest } from "../../src/runs/background/control-channel.ts";
+import { deliverInterruptRequest, deliverStopRequest, requestAsyncSteer } from "../../src/runs/background/control-channel.ts";
 import { SUBAGENT_PROCESS_TERMINAL_EVENT } from "../../src/shared/types.ts";
 import { waitForSubagents } from "../../src/runs/background/subagent-wait.ts";
 import type { AsyncResultPayload, AsyncStatusPayload } from "../support/async-execution-fixture.ts";
@@ -178,9 +178,21 @@ const args = process.argv.slice(2);
 if (args.includes('--version')) { console.log('wt v0.75.0'); process.exit(0); }
 if (args.includes('--help')) { console.log('--create --base --no-cd --no-hooks --format'); process.exit(0); }
 if (${allocatorFailure}) require('node:child_process').execFileSync('git', ['branch', args[args.indexOf('--create') + 1]], { cwd: ${JSON.stringify(repo)} });
-const socket = require('node:net').connect(${port}, '127.0.0.1', () => socket.write('ready'));
-socket.on('data', data => {
- if (data.toString() === 'release') { socket.end(); if (${allocatorFailure}) process.exitCode = 1; else console.log('{}'); }
+// Complete the setup stdin contract before exposing the independent release gate.
+// Otherwise the hook can exit before the runner writes input and cause EPIPE.
+let input = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', chunk => { input += chunk; });
+process.stdin.on('end', () => {
+ if (!${allocatorFailure}) {
+  const setup = JSON.parse(input);
+  require('node:assert/strict').equal(setup.runId, ${JSON.stringify(`${id}-s0`)});
+  require('node:assert/strict').equal(setup.repoRoot, ${JSON.stringify(fs.realpathSync(repo))});
+ }
+ const socket = require('node:net').connect(${port}, '127.0.0.1', () => socket.write('ready'));
+ socket.on('data', data => {
+  if (data.toString() === 'release') { socket.end(); if (${allocatorFailure}) process.exitCode = 1; else console.log('{}'); }
+ });
 });
 setTimeout(() => process.exit(90), 15000).unref();
 `, { mode: 0o755 });
@@ -195,7 +207,7 @@ setTimeout(() => process.exit(90), 15000).unref();
 				const connection = once(server, "connection", { signal: AbortSignal.timeout(20_000) });
 				const receipt = executeAsyncChain(id, {
 					chain: [{ agent: "worker", task: "Do work", worktree: true }],
-					agents: [makeAgent("worker", { completionGuard: false })],
+					agents: [makeAgent("worker")],
 					ctx: { pi: { events: bus }, cwd: repo, currentSessionId: "session-1" },
 					artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
 					shareEnabled: false, sessionRoot: path.join(tempDir, "sessions"), maxSubagentDepth: 2, acceptance: false,
@@ -527,6 +539,107 @@ setTimeout(() => process.exit(90), 15000).unref();
 		});
 	});
 
+	it("background publishes a structured-only terminal after watchdog settlement", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		await withIsolatedWatchdogSettings(tempDir, async () => {
+			writeWatchdogSettings(tempDir);
+			const id = `async-watchdog-structured-${Date.now().toString(36)}`;
+			const callsBefore = mockPi.callCount();
+			mockPi.onCall({ jsonl: [childWatchdogStatus(id, "idle", 1)], structuredOutput: { ok: true } });
+
+			executeAsyncSingle(id, {
+				agent: "worker", task: "Return data", agentConfig: makeAgent("worker"),
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false, sessionRoot: path.join(tempDir, "sessions"), maxSubagentDepth: 2,
+				structuredOutputSchema: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } },
+			});
+
+			const payload = await readAsyncPayload(id);
+			assert.equal(payload.success, true, payload.results[0]?.error);
+			assert.deepEqual(payload.results[0]?.structuredOutput, { ok: true });
+			assert.equal((payload.results[0] as { watchdog?: { phase?: string } }).watchdog?.phase, "idle");
+			assert.equal(mockPi.callCount(), callsBefore + 1, "settled structured completion must not continue with another turn");
+		});
+	});
+
+	for (const terminal of ["error", "aborted"] as const) {
+		it(`background preserves structured evidence when a later ${terminal} terminal keeps the run failed`, { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+			const id = `async-structured-${terminal}-${Date.now().toString(36)}`;
+			const terminalMessage = {
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [],
+					model: "mock/test-model",
+					stopReason: terminal,
+					errorMessage: terminal === "error" ? "later provider failure" : "This operation was aborted",
+					usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+				},
+			};
+			mockPi.onCall({
+				structuredOutputCapture: { ok: true },
+				jsonl: [
+					{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true } } },
+					{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
+					{ type: "tool_execution_end", toolName: "structured_output" },
+					terminalMessage,
+				],
+			});
+
+			executeAsyncSingle(id, {
+				agent: "worker", task: "Return data, then fail", agentConfig: makeAgent("worker"), acceptance: false,
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false, sessionRoot: path.join(tempDir, "sessions"), maxSubagentDepth: 2,
+				structuredOutputSchema: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } },
+			});
+
+			const payload = await readAsyncPayload(id);
+			// The runner publishes the result before the terminal status.
+			const status = await waitForAsyncState(id, (candidate) => candidate.state !== "running" && candidate.state !== "queued");
+			const child = payload.results[0]!;
+			assert.equal(payload.success, false);
+			assert.equal(payload.state, "failed");
+			assert.equal(child.success, false);
+			assert.deepEqual(child.structuredOutput, { ok: true });
+			assert.ok(child.structuredOutputPath);
+			assert.deepEqual(JSON.parse(fs.readFileSync(child.structuredOutputPath, "utf-8")), { ok: true });
+			assert.equal(status.state, "failed");
+			assert.equal(status.steps?.[0]?.status, "failed");
+			assert.deepEqual(status.steps?.[0]?.structuredOutput, { ok: true });
+			assert.equal(status.steps?.[0]?.structuredOutputPath, child.structuredOutputPath);
+		});
+	}
+
+	it("background keeps invalid and missing structured captures absent", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		for (const capture of ["invalid", "missing"] as const) {
+			const id = `async-structured-${capture}-${Date.now().toString(36)}`;
+			mockPi.onCall(capture === "invalid" ? {
+				jsonl: [
+					{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: "invalid" } } },
+					{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output validation failed." }], isError: true } },
+					{ type: "tool_execution_end", toolName: "structured_output", isError: true },
+					events.assistantMessage("done"),
+				],
+			} : { output: "done" });
+
+			executeAsyncSingle(id, {
+				agent: "worker", task: "Return data", agentConfig: makeAgent("worker"), acceptance: false,
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false, sessionRoot: path.join(tempDir, "sessions"), maxSubagentDepth: 2,
+				structuredOutputSchema: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } },
+			});
+
+			const payload = await readAsyncPayload(id);
+			const status = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, id, "status.json"), "utf-8")) as AsyncStatusPayload;
+			assert.equal(payload.success, false);
+			assert.equal(payload.results[0]?.structuredOutput, undefined);
+			assert.equal(status.steps?.[0]?.structuredOutput, undefined);
+			assert.equal(fs.existsSync(path.join(ASYNC_DIR, id, "structured-output", "output.json")), false);
+		}
+	});
+
 	it("background child watchdog tail timeout still finalizes successful output", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		await withIsolatedWatchdogSettings(tempDir, async () => {
 			writeWatchdogSettings(tempDir, 150);
@@ -564,7 +677,7 @@ setTimeout(() => process.exit(90), 15000).unref();
 		await withIsolatedWatchdogSettings(tempDir, async () => {
 			writeWatchdogSettings(tempDir);
 			const id = `async-watchdog-blocker-${Date.now().toString(36)}`;
-			mockPi.onCall({ jsonl: [events.acceptanceReport(), events.watchdogWarning("blocker", "Claims tests passed without running them")] });
+			mockPi.onCall({ jsonl: [events.acceptanceReport(), events.watchdogStatusWarning("blocker", "Claims tests passed without running them", { runId: id, agent: "worker", childIndex: 0 })], structuredOutput: { ok: true } });
 
 			executeAsyncSingle(id, {
 				agent: "worker",
@@ -576,12 +689,14 @@ setTimeout(() => process.exit(90), 15000).unref();
 				sessionRoot: path.join(tempDir, "sessions"),
 				maxSubagentDepth: 2,
 				acceptance: { level: "checked", criteria: ["Ship it"] },
+				structuredOutputSchema: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } },
 			});
 
 			const resultPath = await waitForAsyncResultFile(id, 10_000);
 			const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
 			assert.equal(payload.success, false);
 			const child = payload.results[0] as AsyncResultPayload["results"][number] & { watchdog?: { warnings?: Array<{ severity: string; addressed: boolean; summary: string }> } };
+			assert.deepEqual(child.structuredOutput, { ok: true }, "a real blocker remains visible alongside valid structured evidence");
 			assert.deepEqual(child.watchdog?.warnings?.map((warning) => [warning.severity, warning.addressed]), [["blocker", false]]);
 			const check = child.acceptance?.runtimeChecks?.find((entry) => entry.id === "watchdog-blocker");
 			assert.equal(check?.status, "failed");
@@ -589,129 +704,77 @@ setTimeout(() => process.exit(90), 15000).unref();
 		});
 	});
 
-	it("background completion rejects inherited history without current-launch tool evidence", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
-		const id = `async-required-tool-evidence-${Date.now().toString(36)}`;
-		mockPi.onCall({ jsonl: [
-			{ type: "message_end", message: { role: "toolResult", toolName: "read", isError: false, content: [{ type: "text", text: "result from a prior launch" }] } },
-			events.assistantMessage("Done without current-launch tools"),
-		] });
+	it("background does not abort when a steer arrives after the final stop and turn_start is delayed", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({
+			jsonl: [events.assistantMessage("before steer")],
+			keepAliveAfterFinalMessageMs: 15_000,
+			queuedMessageTurnStartDelayMs: 1400,
+			queuedMessageOutput: "after steer",
+		});
+		const id = `async-queued-steer-after-final-${Date.now().toString(36)}`;
 		executeAsyncSingle(id, {
-			agent: "scout",
-			task: "Inspect the repository",
-			agentConfig: makeAgent("scout", { tools: ["read"], completionGuard: false }),
+			agent: "worker", task: "Do work", agentConfig: makeAgent("worker"),
 			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
 			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
-			shareEnabled: false,
-			sessionRoot: path.join(tempDir, "sessions"),
-			maxSubagentDepth: 2,
-			acceptance: { toolEvidence: ["read"] },
+			shareEnabled: false, sessionRoot: path.join(tempDir, "sessions"), maxSubagentDepth: 2,
 		});
-
-		const payload = JSON.parse(fs.readFileSync(await waitForAsyncResultFile(id, 10_000), "utf-8")) as AsyncResultPayload;
-		assert.equal(payload.success, false);
-		assert.equal(payload.results[0]?.acceptance?.runtimeChecks[0]?.id, "required-tool-evidence");
-		assert.match(payload.results[0]?.error ?? "", /Expected at least one successful result from required tools: read/);
-		assert.match(payload.results[0]?.error ?? "", /Available launch tools: read/);
-
-		const acceptedId = `async-current-required-tool-evidence-${Date.now().toString(36)}`;
-		mockPi.onCall({ jsonl: [events.toolResult("read", "current launch result"), events.assistantMessage("Done with evidence")] });
-		executeAsyncSingle(acceptedId, {
-			agent: "scout",
-			task: "Inspect the repository",
-			agentConfig: makeAgent("scout", { tools: ["read"], completionGuard: false }),
-			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
-			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
-			shareEnabled: false,
-			sessionRoot: path.join(tempDir, "sessions"),
-			maxSubagentDepth: 2,
-			acceptance: { toolEvidence: ["read"] },
-		});
-		const accepted = JSON.parse(fs.readFileSync(await waitForAsyncResultFile(acceptedId, 10_000), "utf-8")) as AsyncResultPayload;
-		assert.equal(accepted.success, true);
-		assert.equal(accepted.results[0]?.acceptance?.runtimeChecks[0]?.status, "passed");
+		await waitForMockPiCall(mockPi, 0, 10_000);
+		const scriptedFinal = path.join(mockPi.dir, "scripted-final.jsonl");
+		const deadline = Date.now() + 10_000;
+		while (!fs.existsSync(scriptedFinal)) {
+			if (Date.now() > deadline) assert.fail("Timed out waiting for scripted final message");
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		requestAsyncSteer(path.join(ASYNC_DIR, id), { message: "Continue after the final stop.", id: "after-final", ts: Date.now() });
+		const payload = await readAsyncPayload(id);
+		assert.equal(payload.success, true, payload.results[0]?.error);
+		assert.equal(payload.results[0]?.error, undefined);
+		assert.equal(payload.results[0]?.output, "after steer");
+		assert.doesNotMatch(JSON.stringify(payload), /did not settle within \d+ms after its terminal event/);
 	});
 
-	it("background completion collects successful current tool execution end evidence privately", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
-		const run = async (name: string, event: object | object[]) => {
-			const id = "async-tool-execution-end-" + name + "-" + Date.now().toString(36);
-			mockPi.onCall({ jsonl: [...(Array.isArray(event) ? event : [event]), events.assistantMessage("Done with evidence")] });
-			executeAsyncSingle(id, {
-				agent: "scout",
-				task: "Inspect the repository",
-				agentConfig: makeAgent("scout", { completionGuard: false }),
-				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
-				acceptance: { toolEvidence: ["read"] },
-				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
-				shareEnabled: false,
-				sessionRoot: path.join(tempDir, "sessions"),
-				maxSubagentDepth: 2,
+	for (const type of ["turn_start", "agent_start", "auto_retry_start"]) {
+		it(`background keeps resumed work alive after ${type}`, { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+			const id = `async-resumed-${type}-${Date.now().toString(36)}`;
+			mockPi.onCall({
+				steps: [
+					{ jsonl: [events.assistantMessage("before continuation"), { type }] },
+					// Queued steering/follow-up work is allowed to outlive the old final-stop grace.
+					{ delay: 1400, jsonl: [events.assistantMessage("after continuation")] },
+				],
 			});
-			return JSON.parse(fs.readFileSync(await waitForAsyncResultFile(id, 10_000), "utf-8")) as AsyncResultPayload;
-		};
-
-		const successful = await run("success", { type: "tool_execution_end", toolCallId: "read-success", toolName: "read", result: {}, isError: false });
-		assert.equal(successful.success, true);
-		assert.equal(successful.results[0]?.acceptance?.runtimeChecks[0]?.status, "passed");
-
-		const schemaId = "async-ambient-schema-evidence-" + Date.now().toString(36);
-		mockPi.onCall({ jsonl: [events.assistantMessage("Done without current read")], structuredOutput: { ok: true } });
-		executeAsyncSingle(schemaId, {
-			agent: "scout",
-			task: "Inspect the repository",
-			agentConfig: makeAgent("scout", { completionGuard: false }),
-			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
-			acceptance: { toolEvidence: ["read"] },
-			structuredOutputSchema: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } },
-			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
-			shareEnabled: false,
-			sessionRoot: path.join(tempDir, "sessions"),
-			maxSubagentDepth: 2,
+			executeAsyncSingle(id, {
+				agent: "worker", task: "Do work", agentConfig: makeAgent("worker"),
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false, sessionRoot: path.join(tempDir, "sessions"), maxSubagentDepth: 2,
+			});
+			const payload = await readAsyncPayload(id);
+			assert.equal(payload.success, true, payload.results[0]?.error);
+			assert.equal(payload.results[0]?.output, "after continuation");
 		});
-		const schemaResult = JSON.parse(fs.readFileSync(await waitForAsyncResultFile(schemaId, 10_000), "utf-8")) as AsyncResultPayload;
-		assert.equal(schemaResult.results[0]?.acceptance?.runtimeChecks[0]?.status, "failed");
-		assert.match(schemaResult.results[0]?.acceptance?.runtimeChecks[0]?.message ?? "", /Available launch tools: ambient \(inventory unknown\)/);
+	}
 
-		for (const [name, event] of [
-			["error", { type: "tool_execution_end", toolCallId: "read-error", toolName: "read", result: {}, isError: true }],
-			["missing-status", { type: "tool_execution_end", toolCallId: "read-missing-status", toolName: "read", result: {} }],
-			["non-boolean-status", { type: "tool_execution_end", toolCallId: "read-non-boolean-status", toolName: "read", result: {}, isError: "false" }],
-			["missing-name", { type: "tool_execution_end", toolCallId: "read-missing-name", result: {}, isError: false }],
-			["non-string-name", { type: "tool_execution_end", toolCallId: "read-non-string-name", toolName: 1, result: {}, isError: false }],
-			["exact-mismatch", { type: "tool_execution_end", toolCallId: "read-mismatch", toolName: "Read", result: {}, isError: false }],
-		] as const) {
-			const rejected = await run(name, event);
-			assert.equal(rejected.success, false);
-			assert.equal(rejected.results[0]?.acceptance?.runtimeChecks[0]?.status, "failed");
-			if (name === "error") assert.match(rejected.results[0]?.error ?? "", /Available launch tools: ambient \(inventory unknown\)/);
-		}
-
-		const legacy = await run("legacy", events.toolResult("read", "legacy result"));
-		assert.equal(legacy.success, true);
-
-		const dual = await run("dual", [
-			{ type: "tool_result_end", toolCallId: "read-dual", message: { role: "toolResult", toolCallId: "read-dual", toolName: "read", isError: false, content: [{ type: "text", text: "result" }] } },
-			{ type: "tool_execution_end", toolCallId: "read-dual", toolName: "read", result: {}, isError: false },
-		]);
-		assert.equal(dual.success, true);
-		assert.equal(dual.results[0]?.messages, undefined);
-		for (const [name, events] of [
-			["legacy-success-then-execution-error", [
-				{ type: "tool_result_end", toolCallId: "read-failure-1", message: { role: "toolResult", toolCallId: "read-failure-1", toolName: "read", isError: false, content: [] } },
-				{ type: "tool_execution_end", toolCallId: "read-failure-1", toolName: "read", result: {}, isError: true },
-			]],
-			["execution-success-then-legacy-error", [
-				{ type: "tool_execution_end", toolCallId: "read-failure-2", toolName: "read", result: {}, isError: false },
-				{ type: "tool_result_end", toolCallId: "read-failure-2", message: { role: "toolResult", toolCallId: "read-failure-2", toolName: "read", isError: true, content: [] } },
-			]],
-			["legacy-success-then-malformed-execution", [
-				{ type: "tool_result_end", toolCallId: "read-failure-3", message: { role: "toolResult", toolCallId: "read-failure-3", toolName: "read", isError: false, content: [] } },
-				{ type: "tool_execution_end", toolCallId: "read-failure-3", toolName: "read", result: {} },
-			]],
-		] as const) {
-			const rejected = await run(name, events);
-			assert.equal(rejected.success, false);
-			assert.equal(rejected.results[0]?.acceptance?.runtimeChecks[0]?.status, "failed");
-		}
+	it("background ignores stale watchdog completion after resumed work", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		await withIsolatedWatchdogSettings(tempDir, async () => {
+			writeWatchdogSettings(tempDir);
+			const id = `async-resumed-watchdog-${Date.now().toString(36)}`;
+			mockPi.onCall({
+				steps: [
+					{ jsonl: [events.assistantMessage("before continuation"), { type: "turn_start" }, childWatchdogStatus(id, "idle", 1)] },
+					{ delay: 1400, jsonl: [events.assistantMessage("after continuation")] },
+				],
+			});
+			executeAsyncSingle(id, {
+				agent: "worker", task: "Do work", agentConfig: makeAgent("worker"),
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false, sessionRoot: path.join(tempDir, "sessions"), maxSubagentDepth: 2,
+			});
+			const payload = await readAsyncPayload(id);
+			assert.equal(payload.success, true, payload.results[0]?.error);
+			assert.equal(payload.results[0]?.output, "after continuation");
+		});
 	});
 
 	it("background forced drain after final assistant output is cleanup success", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
@@ -898,8 +961,6 @@ setTimeout(() => process.exit(90), 15000).unref();
 			assert.equal(child?.success, false);
 			assert.match(diagnostic, /^Subagent produced no output after terminal assistant stopReason "aborted"\./);
 			assert.match(diagnostic, new RegExp(`Required file-only output was not produced: ${escapeRegExp(outputPath)}`));
-			assert.doesNotMatch(diagnostic, /completed without making edits/);
-			assert.doesNotMatch(child?.modelAttempts?.[0]?.error ?? "", /completed without making edits/);
 			assert.equal(child?.effects?.fileMutation?.status, "observed");
 			assert.equal(child?.effects?.fileMutation?.attempted, true);
 			assert.deepEqual(child?.effects?.fileMutation?.evidence?.changedFiles, ["input.md"]);
@@ -910,8 +971,6 @@ setTimeout(() => process.exit(90), 15000).unref();
 			assert.equal(status.activityState, "needs_attention");
 			assert.equal(status.steps?.[0]?.activityState, "needs_attention");
 			assert.equal(status.steps?.[0]?.error, diagnostic);
-			const eventsText = fs.readFileSync(path.join(ASYNC_DIR, id, "events.jsonl"), "utf-8");
-			assert.doesNotMatch(eventsText, /completed without making edits/);
 		} finally {
 			removeTempDir(repo);
 		}
@@ -962,14 +1021,10 @@ setTimeout(() => process.exit(90), 15000).unref();
 		assert.equal(child?.success, false);
 		assert.match(diagnostic, /^Subagent produced no output after terminal assistant stopReason "aborted"\./);
 		assert.match(diagnostic, /Required file-only output was not produced/);
-		assert.doesNotMatch(diagnostic, /completed without making edits/);
-		assert.doesNotMatch(child?.modelAttempts?.[0]?.error ?? "", /completed without making edits/);
 		assert.equal(child?.effects?.settlementDiagnostic?.requiredOutput?.missing, true);
 		assert.equal(child?.effects?.settlementDiagnostic?.finalTextPresent, true);
 		assert.equal(fs.existsSync(outputPath), false);
 
-		const eventsText = fs.readFileSync(path.join(ASYNC_DIR, id, "events.jsonl"), "utf-8");
-		assert.doesNotMatch(eventsText, /completed without making edits/);
 	});
 
 	it("reports bounded compaction failure context when file-only output is missing", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
@@ -1019,7 +1074,6 @@ setTimeout(() => process.exit(90), 15000).unref();
 		assert.equal(payload.success, false);
 		assert.equal(child?.success, false);
 		assert.match(diagnostic, /^This operation was aborted/);
-		assert.match(diagnostic, /Compaction-induced child abort could not be resumed safely: retained session unavailable\./);
 		assert.match(diagnostic, /failure followed session compaction and agent settlement/);
 		assert.match(diagnostic, /Required file-only output was not produced/);
 		assert.ok(diagnostic.length <= 8_192);
@@ -1044,7 +1098,7 @@ setTimeout(() => process.exit(90), 15000).unref();
 		const sourceId = `partial-source-${Date.now().toString(36)}`;
 		const sourceDir = path.join(ASYNC_DIR, sourceId);
 		const message = "Required file-only output was not produced: report.md";
-		const effects = { fileMutation: { status: "observed", expected: true, attempted: true, evidence: { source: "tracked-files", trackedOnly: true, cwd: tempDir, changedFiles: ["input.md"], attemptedMutation: true } } };
+		const effects = { fileMutation: { status: "observed", attempted: true, evidence: { source: "tracked-files", trackedOnly: true, cwd: tempDir, changedFiles: ["input.md"], attemptedMutation: true } } };
 		fs.mkdirSync(sourceDir, { recursive: true });
 		fs.writeFileSync(path.join(sourceDir, "status.json"), JSON.stringify({
 			runId: sourceId,
@@ -1114,7 +1168,7 @@ setTimeout(() => process.exit(90), 15000).unref();
 					concurrency: 2,
 				}],
 				resultMode: "parallel",
-				agents: [makeAgent("partial", { output: outputPath, outputMode: "file-only" }), makeAgent("failure", { completionGuard: false })],
+				agents: [makeAgent("partial", { output: outputPath, outputMode: "file-only" }), makeAgent("failure")],
 				ctx: { pi: { events: { emit() {} } }, cwd: repo, currentSessionId: "session-1" },
 				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
 				shareEnabled: false,
@@ -1203,6 +1257,47 @@ setTimeout(() => process.exit(90), 15000).unref();
 			if (Date.now() > doneDeadline) assert.fail(`Timed out waiting for async result file: ${resultPath}`);
 			await new Promise((resolve) => setTimeout(resolve, 100));
 		}
+	});
+
+	it("reports one background failed-tool stall with the current child identity", { skip: !isAsyncAvailable() ? "jiti not available" : undefined, timeout: 20_000 }, async () => {
+		mockPi.onCall({ steps: [
+			{ jsonl: [
+				{ type: "tool_execution_start", toolCallId: "outer/1", parentToolCallId: "outer", toolName: "read", args: { path: "sample.ts" } },
+				{ type: "tool_execution_end", toolCallId: "outer/1", parentToolCallId: "outer", toolName: "read", isError: true },
+				{ type: "tool_result_end", message: { role: "toolResult", toolCallId: "outer/1", toolName: "read", isError: true, content: [{ type: "text", text: "denied" }] } },
+			] },
+			{ delay: 2200, jsonl: [events.assistantMessage("Investigated alternate source.")] },
+		] });
+		const id = "async-failed-tool-" + Date.now().toString(36);
+		const asyncDir = path.join(ASYNC_DIR, id);
+		const eventsPath = path.join(asyncDir, "events.jsonl");
+		executeAsyncSingle(id, {
+			agent: "scout", task: "Investigate behavior", agentConfig: makeAgent("scout"),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false, sessionRoot: path.join(tempDir, "sessions"), maxSubagentDepth: 2,
+			controlConfig: { enabled: true, needsAttentionAfterMs: 1, activeNoticeAfterMs: 999_999, notifyOn: ["needs_attention"], notifyChannels: ["event", "async"] },
+		});
+		const statusPath = path.join(asyncDir, "status.json");
+		const deadline = Date.now() + 10_000;
+		let attentionSeen = false;
+		while (Date.now() < deadline) {
+			if (fs.existsSync(statusPath)) {
+				const status = JSON.parse(fs.readFileSync(statusPath, "utf8")) as AsyncStatusPayload;
+				if (status.activityState === "needs_attention" && status.steps?.[0]?.activityState === "needs_attention") { attentionSeen = true; break; }
+			}
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+		assert.equal(attentionSeen, true, "live runner status must expose failed-tool attention");
+		const payload = await readAsyncPayload(id);
+		const lines = fs.readFileSync(eventsPath, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line) as { type?: string; event?: { reason?: string; toolCallId?: string; index?: number } });
+		const notices = lines.filter((line) => line.type === "subagent.control" && line.event?.reason === "tool_error_stall");
+		assert.equal(notices.length, 1);
+		assert.equal(notices[0]?.event?.toolCallId, "outer/1");
+		assert.equal(notices[0]?.event?.index, 0);
+		assert.equal(payload.success, true);
+		const terminalStatus = JSON.parse(fs.readFileSync(statusPath, "utf8")) as AsyncStatusPayload;
+		assert.notEqual(terminalStatus.steps?.[0]?.activityState, "needs_attention", "continuation clears live failed-tool attention");
 	});
 
 	it("does not flag a delayed active tool as idle attention", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {

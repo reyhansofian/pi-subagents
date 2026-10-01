@@ -3,18 +3,39 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 const configuredTempRoot = process.env.PI_SUBAGENTS_TEMP_ROOT?.trim();
-const tempRoot = configuredTempRoot
-	? path.resolve(configuredTempRoot)
-	: fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-test-root-"));
+const loaderState = process.env.PI_SUBAGENTS_TEST_LOADER;
+const nestedTestProcess = loaderState !== undefined;
+const testFileProcess = process.env.NODE_TEST_CONTEXT !== undefined && loaderState !== "test-file";
+const baseRoot = configuredTempRoot ? path.resolve(configuredTempRoot) : undefined;
+if (baseRoot) fs.mkdirSync(baseRoot, { recursive: true });
+const tempRoot = testFileProcess
+	? fs.mkdtempSync(path.join(baseRoot ?? os.tmpdir(), "f-"))
+	: baseRoot ?? fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-test-root-"));
+fs.mkdirSync(tempRoot, { recursive: true });
+if (process.platform === "darwin") fs.closeSync(fs.openSync(path.join(tempRoot, ".metadata_never_index"), "a"));
 process.env.PI_SUBAGENTS_TEMP_ROOT = tempRoot;
+process.env.TMPDIR = tempRoot;
+process.env.TMP = tempRoot;
+process.env.TEMP = tempRoot;
 
-const nestedTestProcess = process.env.PI_SUBAGENTS_TEST_LOADER === "1";
+if (!nestedTestProcess || testFileProcess) process.env.PI_SUBAGENTS_TEST_PARENT_PID = String(process.pid);
 const isolatedHome = path.join(tempRoot, "home");
+fs.mkdirSync(path.join(isolatedHome, ".pi", "agent"), { recursive: true, mode: 0o700 });
 process.env.HOME = isolatedHome;
 process.env.USERPROFILE = isolatedHome;
 if (!nestedTestProcess) delete process.env.PI_CODING_AGENT_DIR;
-process.env.PI_SUBAGENTS_TEST_LOADER = "1";
+process.env.PI_SUBAGENTS_TEST_LOADER = testFileProcess ? "test-file" : "loaded";
 
-if (!configuredTempRoot) {
-	process.on("exit", () => fs.rmSync(tempRoot, { recursive: true, force: true }));
+if (!configuredTempRoot || testFileProcess) {
+	// Housekeeping for a root no other process shares: a Windows handle or a leftover
+	// descendant must not turn a test file whose tests all passed into a failed file.
+	process.on("exit", () => {
+		try {
+			fs.rmSync(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+		} catch (error) {
+			try {
+				fs.writeSync(2, `warning: test temp root not removed: ${tempRoot} (${error?.code ?? error})\n`);
+			} catch {}
+		}
+	});
 }

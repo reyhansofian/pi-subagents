@@ -4,18 +4,17 @@ import { fileURLToPath } from "node:url";
 import { it } from "node:test";
 
 it("traces bounded completion reasons through NODE_DEBUG without changing delivery", () => {
-	const run = (debug: string, forceColor = "0") => {
+	const run = (debug: string) => {
 		const child = spawnSync(process.execPath, [
 			"--experimental-strip-types",
 			"--import", new URL("../support/isolated-temp-root.mjs", import.meta.url).href,
 			fileURLToPath(new URL("../support/notify-diagnostics-fixture.ts", import.meta.url)),
-		], { env: { ...process.env, FORCE_COLOR: forceColor, NODE_DEBUG: debug, NODE_NO_WARNINGS: "1" }, encoding: "utf8" });
+		], { env: { ...process.env, FORCE_COLOR: "0", NODE_DEBUG: debug, NODE_NO_WARNINGS: "1" }, encoding: "utf8" });
 		assert.equal(child.status, 0, child.stderr);
 		return child;
 	};
 	const disabled = run("");
 	const enabled = run("pi-subagents-notify");
-	assert.match(run("pi-subagents-notify", "1").stderr, /\u001b\[/);
 	assert.equal(disabled.stderr, "");
 	assert.equal(enabled.stdout, disabled.stdout);
 	assert.equal(JSON.parse(enabled.stdout).length, 7);

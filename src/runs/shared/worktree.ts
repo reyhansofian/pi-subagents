@@ -18,7 +18,9 @@ const WORKTREE_NAMING_COMPONENT_MAX_BYTES = 96;
 const WORKTREE_NAMING_LABEL_MAX_BYTES = 256;
 const WORKTREE_NAMING_BRANCH_MAX_BYTES = 256;
 const WORKTREE_COMMAND_OUTPUT_MAX_BYTES = 128 * 1024;
-export const MACHINE_DIFF_OPTIONS = ["--no-color", "--no-ext-diff", "--no-textconv", "--default-prefix", "--line-prefix=", "--no-relative"] as const;
+const WORKTRUNK_COMMAND = process.platform === "win32" ? "git" : "wt";
+const WORKTRUNK_ARG_PREFIX = process.platform === "win32" ? ["wt"] : [];
+export const MACHINE_DIFF_OPTIONS = ["--no-color", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/", "--line-prefix=", "--no-relative"] as const;
 const MACHINE_PATCH_OPTIONS = [...MACHINE_DIFF_OPTIONS, "--binary"] as const;
 const PATCH_VALIDATION_OPTIONS = ["apply", "--check", "--cached", "--reverse", "--binary", "--whitespace=nowarn"] as const;
 
@@ -178,7 +180,7 @@ export interface WorktreeSetupProgress {
 	setup: WorktreeSetup;
 	attempts: Array<{ index: number; branch: string; path?: string; validated: boolean; command?: WorktreeSetupProgress["command"]; hookCommand?: WorktreeSetupProgress["command"] }>;
 	phase: string;
-	command?: { command: string; args: string[]; pid?: number; processGroupId?: number; result?: Omit<SetupCommandResult, "stdout" | "stderr"> };
+	command?: { command: string; args: string[]; pid?: number; processGroupId?: number; result?: Omit<SetupCommandResult, "stdout" | "stdoutBuffer" | "stderr"> };
 	unknown?: string;
 	cleanup?: WorktreeCleanupReport;
 }
@@ -243,7 +245,7 @@ class SetupTransaction {
 			...options, signal: this.options.signal, deadlineAt: this.options.deadlineAt,
 			onSpawn: (process) => { Object.assign(this.progress.command!, process); this.publish(); },
 		});
-		const { stdout: _stdout, stderr: _stderr, ...metadata } = result;
+		const { stdout: _stdout, stdoutBuffer: _stdoutBuffer, stderr: _stderr, ...metadata } = result;
 		this.progress.command.result = metadata;
 		if (result.processTree?.state === "unknown") this.unknown(result.error ?? "Command tree settlement unverified");
 		this.publish();
@@ -339,11 +341,9 @@ export function validateWorktreePatchRepresentsCurrentWorktree(worktreePath: str
 	return undefined;
 }
 
-async function resolveRepoState(tx: SetupTransaction, cwd: string, requestedBaseRef: string | undefined): Promise<RepoState> {
+async function probeWorktreeSource(tx: Pick<SetupTransaction, "git" | "gitChecked">, cwd: string): Promise<string> {
 	const repoCheck = await tx.git(cwd, ["rev-parse", "--is-inside-work-tree"], [0, 128]);
 	if (repoCheck.status !== 0 || repoCheck.stdout.trim() !== "true") throw new Error("worktree isolation requires a git repository");
-	const rawPrefix = (await tx.gitChecked(cwd, ["rev-parse", "--show-prefix"])).trim();
-	const cwdRelative = rawPrefix ? path.normalize(rawPrefix.replace(/[\\/]+$/, "")) : "";
 	const toplevel = (await tx.gitChecked(cwd, ["rev-parse", "--show-toplevel"])).trim();
 
 	// pi-subagents writes durable runtime state under .pi/subagents/ by default;
@@ -352,6 +352,26 @@ async function resolveRepoState(tx: SetupTransaction, cwd: string, requestedBase
 	if (status.trim().length > 0) {
 		throw new Error("worktree isolation requires a clean git working tree. Commit or stash changes first.");
 	}
+	return toplevel;
+}
+
+/** Read-only admission check; allocation repeats it because source state can change. */
+export async function preflightWorktreeSource(cwd: string, options: Pick<SetupCommandOptions, "signal" | "deadlineAt"> = {}): Promise<void> {
+	const git = async (cwd: string, args: string[], acceptedExitCodes: readonly number[] = [0]): Promise<SetupCommandResult> => {
+		const result = await runSetupCommand("git", ["-C", cwd, ...args], { ...options, acceptedExitCodes });
+		if (result.error) throw result.error;
+		if (result.outputIncomplete || result.status === null || !acceptedExitCodes.includes(result.status)) {
+			throw new Error(result.stderr.trim().slice(0, 2000) || "Worktree source probe failed");
+		}
+		return result;
+	};
+	await probeWorktreeSource({ git, gitChecked: async (cwd, args) => (await git(cwd, args)).stdout }, cwd);
+}
+
+async function resolveRepoState(tx: SetupTransaction, cwd: string, requestedBaseRef: string | undefined): Promise<RepoState> {
+	const toplevel = await probeWorktreeSource(tx, cwd);
+	const rawPrefix = (await tx.gitChecked(cwd, ["rev-parse", "--show-prefix"])).trim();
+	const cwdRelative = rawPrefix ? path.normalize(rawPrefix.replace(/[\\/]+$/, "")) : "";
 
 	const baseRef = normalizeWorktreeBaseRef(requestedBaseRef) ?? DEFAULT_WORKTREE_BASE_REF;
 	let baseCommit: string;
@@ -419,9 +439,14 @@ function shortWorktreeHash(value: string): string {
 }
 
 function truncateUtf8(value: string, maxBytes: number): string {
-	if (Buffer.byteLength(value, "utf-8") <= maxBytes) return value;
-	const truncated = Buffer.from(value, "utf-8").subarray(0, maxBytes).toString("utf-8");
-	return /[\uD800-\uDFFF]$/u.test(truncated) ? truncated.slice(0, -1) : truncated;
+	const bytes = Buffer.from(value, "utf-8");
+	if (bytes.length <= maxBytes) return value;
+	// Back off to a code-point boundary before decoding: cutting mid-sequence
+	// emits U+FFFD (3 bytes per dangling byte), which can push the re-encoded
+	// result beyond maxBytes (e.g. a 256-byte cap yields a 258-byte string).
+	let end = maxBytes;
+	while (end > 0 && (bytes[end]! & 0xc0) === 0x80) end -= 1;
+	return bytes.subarray(0, end).toString("utf-8");
 }
 
 /** Convert an arbitrary label to a single safe filesystem/branch component. */
@@ -526,6 +551,11 @@ function hasConfiguredWorktreeBaseDir(baseDir: string | undefined): boolean {
 		: (process.env.PI_SUBAGENTS_WORKTREE_DIR?.trim().length ?? 0) > 0;
 }
 
+function isInsidePiExtensionsDirectory(targetPath: string): boolean {
+	const extensionsDir = normalizeComparableCwd(path.join(getAgentDir(), "extensions"));
+	return isPathInside(extensionsDir, normalizeComparableCwd(targetPath));
+}
+
 interface WorktrunkCapability {
 	available: boolean;
 	reason?: string;
@@ -533,7 +563,7 @@ interface WorktrunkCapability {
 
 function runWorktrunk(args: string[], cwd?: string): WorktreeCommandResult {
 	try {
-		const result = spawnSync("wt", args, {
+		const result = spawnSync(WORKTRUNK_COMMAND, [...WORKTRUNK_ARG_PREFIX, ...args], {
 			cwd,
 			encoding: "utf-8",
 			windowsHide: true,
@@ -578,7 +608,7 @@ export function resolveWorktreeProvider(requested: WorktreeProvider | undefined,
 	return "native";
 }
 
-async function resolveSetupProvider(tx: SetupTransaction, requested: WorktreeProvider | undefined, baseDir?: string): Promise<ManagedWorktreeProvider> {
+async function resolveSetupProvider(tx: SetupTransaction, requested: WorktreeProvider | undefined, baseDir: string | undefined, repoRoot: string): Promise<ManagedWorktreeProvider> {
 	const selection = requested ?? DEFAULT_WORKTREE_PROVIDER;
 	if (selection !== "auto" && selection !== "native" && selection !== "worktrunk") throw new Error('worktree provider must be "auto", "native", or "worktrunk"');
 	if (selection === "native") return "native";
@@ -586,13 +616,14 @@ async function resolveSetupProvider(tx: SetupTransaction, requested: WorktreePro
 		if (selection === "worktrunk") throw new Error("worktreeProvider='worktrunk' cannot be combined with worktreeBaseDir or PI_SUBAGENTS_WORKTREE_DIR");
 		return "native";
 	}
+	if (selection === "auto" && isInsidePiExtensionsDirectory(repoRoot)) return "native";
 	let reason: string | undefined;
 	try {
 		const probeExitCodes = Array.from({ length: 256 }, (_, code) => code);
-		const version = await tx.command("wt", ["--version"], { maxBuffer: WORKTREE_COMMAND_OUTPUT_MAX_BYTES, acceptedExitCodes: probeExitCodes });
+		const version = await tx.command(WORKTRUNK_COMMAND, [...WORKTRUNK_ARG_PREFIX, "--version"], { maxBuffer: WORKTREE_COMMAND_OUTPUT_MAX_BYTES, acceptedExitCodes: probeExitCodes });
 		if (version.status !== 0 || !/\b(?:wt\s+)?v?(\d+\.\d+(?:\.\d+)?)\b/i.test(version.stdout.trim())) reason = "Worktrunk is unavailable or returned an invalid version";
 		else {
-			const help = await tx.command("wt", ["switch", "--help"], { maxBuffer: WORKTREE_COMMAND_OUTPUT_MAX_BYTES, acceptedExitCodes: probeExitCodes });
+			const help = await tx.command(WORKTRUNK_COMMAND, [...WORKTRUNK_ARG_PREFIX, "switch", "--help"], { maxBuffer: WORKTREE_COMMAND_OUTPUT_MAX_BYTES, acceptedExitCodes: probeExitCodes });
 			const missing = ["--create", "--base", "--no-cd", "--no-hooks", "--format"].filter((flag) => !`${help.stdout}\n${help.stderr}`.includes(flag));
 			if (help.status !== 0 || missing.length) reason = `Worktrunk switch capability unavailable: ${missing.join(", ")}`;
 		}
@@ -616,11 +647,13 @@ export function shouldDeferWorktreeCwd(requested: WorktreeProvider | undefined, 
  * to the repository. Managed leaves always nest one level deeper under the
  * project folder (`basename(repoRoot)`).
  */
-function resolveWorktreeDedicatedRoot(configuredBaseDir: string | undefined, repoRoot: string): string {
+function resolveWorktreeDedicatedRoot(configuredBaseDir: string | undefined, repoRoot: string, relocateExtensionRepo = true): string {
 	const rawBaseDir = configuredBaseDir ?? process.env.PI_SUBAGENTS_WORKTREE_DIR;
 	let expanded: string;
 	if (rawBaseDir === undefined || (configuredBaseDir === undefined && !rawBaseDir.trim())) {
-		expanded = path.join(path.dirname(repoRoot), "worktrees");
+		expanded = relocateExtensionRepo && isInsidePiExtensionsDirectory(repoRoot)
+			? path.join(getAgentDir(), "worktrees")
+			: path.join(path.dirname(repoRoot), "worktrees");
 	} else {
 		const trimmed = rawBaseDir.trim();
 		if (!trimmed) throw new Error("worktree base directory cannot be empty");
@@ -715,13 +748,35 @@ export function resolveExpectedWorktreeAgentCwd(cwd: string, runId: string, inde
 function linkNodeModulesIfPresent(toplevel: string, worktreePath: string): boolean {
 	const nodeModulesPath = path.join(toplevel, "node_modules");
 	const nodeModulesLinkPath = path.join(worktreePath, "node_modules");
-	if (!fs.existsSync(nodeModulesPath) || fs.existsSync(nodeModulesLinkPath)) return false;
+	const hasDirectoryEntry = (candidate: string): boolean => {
+		try { fs.lstatSync(candidate); return true; }
+		catch (error) {
+			if (error instanceof Error && "code" in error && error.code === "ENOENT") return false;
+			throw error;
+		}
+	};
 	try {
-		fs.symlinkSync(nodeModulesPath, nodeModulesLinkPath);
+		if (hasDirectoryEntry(nodeModulesLinkPath)) return false;
+		let sourceRealPath: string;
+		try {
+			if (!fs.statSync(nodeModulesPath).isDirectory()) throw new Error("source node_modules is not a directory");
+			sourceRealPath = fs.realpathSync.native(nodeModulesPath);
+		} catch (error) {
+			if (error instanceof Error && "code" in error && error.code === "ENOENT") return false;
+			throw error;
+		}
+		fs.symlinkSync(nodeModulesPath, nodeModulesLinkPath, process.platform === "win32" ? "junction" : "dir");
+		if (!fs.lstatSync(nodeModulesLinkPath).isSymbolicLink()
+			|| fs.realpathSync.native(nodeModulesLinkPath) !== sourceRealPath) {
+			throw new Error("created link does not resolve to the source node_modules");
+		}
 		return true;
-	} catch {
-		// Symlink creation is optional (e.g., unsupported filesystems on CI runners).
-		return false;
+	} catch (error) {
+		const code = error instanceof Error && "code" in error && typeof error.code === "string" ? `${error.code}: ` : "";
+		throw new Error(
+			`failed to link node_modules from ${nodeModulesPath} to ${nodeModulesLinkPath}: ${code}${error instanceof Error ? error.message : String(error)}`,
+			{ cause: error },
+		);
 	}
 }
 
@@ -942,7 +997,7 @@ async function createWorktrunkWorktree(
 	const naming = buildWorktreeNaming({ runId, index, agent: agents?.[index], label: labels?.[index], task: tasks?.[index], branchPrefix });
 	const args = ["-C", toplevel, "switch", "--create", naming.requestedBranch, "--base", baseCommit, "--no-cd", "--no-hooks", "--format", "json"];
 	tx.attempt(index, naming.requestedBranch);
-	const result = await tx.command("wt", args, { cwd: toplevel, maxBuffer: WORKTREE_COMMAND_OUTPUT_MAX_BYTES });
+	const result = await tx.command(WORKTRUNK_COMMAND, [...WORKTRUNK_ARG_PREFIX, ...args], { cwd: toplevel, maxBuffer: WORKTREE_COMMAND_OUTPUT_MAX_BYTES });
 	tx.progress.phase = "validation";
 	try {
 		const output = parseWorktrunkSwitchOutput(result.stdout);
@@ -1267,7 +1322,7 @@ async function compensateSetup(tx: SetupTransaction): Promise<WorktreeCleanupRep
 			deadlineAt: tx.options.deadlineAt, acceptedExitCodes,
 			onSpawn: (process) => { Object.assign(tx.progress.command!, process); tx.publish(); },
 		});
-		const { stdout: _stdout, stderr: _stderr, ...metadata } = result;
+		const { stdout: _stdout, stdoutBuffer: _stdoutBuffer, stderr: _stderr, ...metadata } = result;
 		tx.progress.command.result = metadata;
 		if (result.processTree?.state === "unknown") tx.unknown(result.error ?? "Rollback command settlement unverified");
 		tx.publish();
@@ -1331,9 +1386,11 @@ async function allocateWorktrees(tx: SetupTransaction, cwd: string, runId: strin
 	tx.progress.setup.cwd = repo.toplevel;
 	tx.progress.setup.baseCommit = repo.baseCommit;
 	const setupHook = resolveWorktreeSetupHook(repo.toplevel, options?.setupHook);
-	const provider = await resolveSetupProvider(tx, options?.provider, options?.baseDir);
+	const provider = await resolveSetupProvider(tx, options?.provider, options?.baseDir, repo.toplevel);
 	const branchPrefix = normalizeWorktreeBranchPrefix(options?.branchPrefix);
-	const dedicatedRoot = provider === "native" ? resolveWorktreeDedicatedRoot(options?.baseDir, repo.toplevel) : undefined;
+	const dedicatedRoot = provider === "native"
+		? resolveWorktreeDedicatedRoot(options?.baseDir, repo.toplevel, (options?.provider ?? DEFAULT_WORKTREE_PROVIDER) === "auto")
+		: undefined;
 	const worktrees = tx.progress.setup.worktrees;
 
 	try {

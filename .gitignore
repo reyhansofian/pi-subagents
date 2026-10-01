@@ -3,12 +3,12 @@
 .pi-subagents/
 .DS_Store
 node_modules/
+/.devenv/
+/.direnv/
+dist-pkg/
+*.tgz
 .fallow/
 tmp/
-.worktrees/
-.serena/
-# CocoIndex Code (ccc)
-/.cocoindex_code/
 
 # Fallback ignores for local ad-hoc agent and lane reports.
 /memory.md

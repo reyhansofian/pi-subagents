@@ -97,6 +97,18 @@ describe("injectSingleOutputInstruction", () => {
 		assert.match(output, /Do not call contact_supervisor merely because no write-capable tool is available\./);
 		assert.doesNotMatch(output, /Write your findings to exactly this path/);
 	});
+
+	it("treats the bundled reviewer profile as read-only in task and system-prompt instructions", () => {
+		const capabilities = { tools: ["read", "grep", "find", "ls", "watchdog_diff", "contact_supervisor"] };
+		const task = injectSingleOutputInstruction("Review this", "/tmp/review.md", capabilities);
+		const systemPrompt = injectOutputPathSystemPrompt("Review only", "/tmp/review.md", capabilities);
+
+		for (const output of [task, systemPrompt]) {
+			assert.match(output, /Return the complete artifact in your final response\./);
+			assert.match(output, /runtime will persist it to exactly this path: \/tmp\/review\.md/);
+			assert.doesNotMatch(output, /Write your findings to exactly this path/);
+		}
+	});
 });
 
 describe("requestedOutputPathFromTask", () => {
@@ -208,6 +220,18 @@ describe("extractChildWrittenOutput", () => {
 		toolCall(id, "write", { path: writePath, content }),
 		toolResult(id),
 	];
+
+	it("attributes a native codemode nested write from the paired successful result", () => {
+		const nested = (complete: boolean, status: string, parentError = false): Message[] => [
+			toolCall("outer", "codemode", { code: "await tools.write(...)" }),
+			{ ...toolResult("outer", parentError), toolName: "codemode", nestedCalls: { complete, calls: [{ id: "outer/1", name: "write", status, arguments: { path: "out.md", content: "nested report" } }] } } as Message,
+		];
+		assert.equal(extractChildWrittenOutput(nested(true, "ok"), "/repo/out.md", "/repo"), "nested report");
+		assert.equal(extractChildWrittenOutput(nested(false, "ok"), "/repo/out.md", "/repo"), undefined);
+		assert.equal(extractChildWrittenOutput(nested(true, "error"), "/repo/out.md", "/repo"), undefined);
+		assert.equal(extractChildWrittenOutput(nested(true, "ok", true), "/repo/out.md", "/repo"), undefined);
+		assert.equal(extractChildWrittenOutput([nested(true, "ok")[1]!], "/repo/out.md", "/repo"), undefined);
+	});
 
 	it("returns the last successfully written content for the configured path", () => {
 		const messages = [

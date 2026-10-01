@@ -4,13 +4,18 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import { visibleWidth, type MarkdownTheme } from "@earendil-works/pi-tui";
+import { createEventBus } from "@earendil-works/pi-coding-agent";
+import { registerInspector } from "../../src/api/inspectors.ts";
+import { getInspectorPlugins, registerInspectorEventListener } from "../../src/inspectors/plugins.ts";
 import { EXTERNAL_RUN_REGISTRY_KEY, EXTERNAL_RUN_REGISTRY_VERSION, registerExternalRun } from "../../src/api/external-runs.ts";
 import { collectFleetSnapshot, openSubagentFleet, SubagentFleetComponent } from "../../src/tui/fleet.ts";
 import { persistForegroundRunHistory, restoreForegroundRunHistory } from "../../src/runs/foreground/foreground-history.ts";
 import { FLEET_STATUS_WIDGET_KEY } from "../../src/tui/fleet-status.ts";
+import { setMainThinkingLevelSource } from "../../src/tui/running-tone.ts";
 import { registerLivePromptAudit, rewritePromptWithGuidance } from "../../src/runs/foreground/prompt-audit.ts";
 import { getArtifactPaths, getArtifactsDir, getProjectArtifactsDir } from "../../src/shared/artifacts.ts";
 import type { HerdrClient } from "../../src/inspectors/herdr/client.ts";
+import { createHerdrInspectorPlugin } from "../../src/inspectors/herdr/plugin.ts";
 import type { SubagentState } from "../../src/shared/types.ts";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai/providers/faux";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
@@ -85,6 +90,7 @@ function writeAsyncRun(root: string, input: {
 const theme = {
 	fg: (_name: string, text: string) => text,
 	bold: (text: string) => text,
+	getThinkingBorderColor: (_level: string) => (text: string) => text,
 };
 
 const markdownTheme: MarkdownTheme = {
@@ -117,9 +123,10 @@ describe("native subagent fleet", () => {
 		const ctx = {
 			model,
 			signal: undefined,
+			sessionManager: { getSessionId: () => "fleet-rewrite-session" },
 			modelRegistry: {
 				async getApiKeyAndHeaders() { return { ok: true as const, apiKey: "test" }; },
-				getRegisteredProviderConfig() { return { api: "faux", streamSimple: streamFn }; },
+				streamSimple: streamFn,
 			},
 		} as never;
 		const rewritten = await rewritePromptWithGuidance({
@@ -231,7 +238,7 @@ describe("native subagent fleet", () => {
 			assert.match(initial, /Transcript path: \/outside\/trusted\/roots\/transcript\.jsonl/);
 			assert.doesNotMatch(initial, /Herdr ·|steer ·|stop ·/);
 			component.handleInput("H");
-			assert.match(component.render(120).join("\n"), /display-only and have no Herdr controls/);
+			assert.match(component.render(120).join("\n"), /display-only and have no inspector controls/);
 			component.handleInput("s");
 			assert.match(component.render(120).join("\n"), /display-only and remain controlled/);
 			component.handleInput("D");
@@ -536,6 +543,47 @@ describe("native subagent fleet", () => {
 				component.dispose();
 			}
 		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("colors running Fleet rows by their child's recorded level, and whole runs by the main session's", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-levels-"));
+		setMainThinkingLevelSource(() => "xhigh");
+		try {
+			writeAsyncRun(root, { id: "level-steps", state: "running", agents: ["scout", "reviewer"], thinking: ["high", "medium"], lastUpdate: 300 });
+			writeAsyncRun(root, { id: "level-workflow", state: "running", mode: "workflow", agents: ["worker"], lastUpdate: 200 });
+			const state = stateForTest();
+			state.foregroundControls.set("level-foreground", { runId: "level-foreground", mode: "single", startedAt: 10, updatedAt: 400, currentAgent: "planner", currentIndex: 0, thinking: "max" });
+			const tones = ["accent", ...["off", "minimal", "low", "medium", "high", "xhigh", "max"].map((level) => `thinking:${level}`)];
+			const colored = (tone: string, text: string) => `\x1b[38;5;${Math.max(0, tones.indexOf(tone)) + 100}m${text}\x1b[39m`;
+			const ansiTheme = {
+				fg: (name: string, text: string) => colored(name, text),
+				bold: (text: string) => text,
+				getThinkingBorderColor: (level: string) => (text: string) => colored(`thinking:${level}`, text),
+			};
+			const component = new SubagentFleetComponent(
+				{ terminal: { rows: 40, columns: 140 }, requestRender() {} } as never,
+				ansiTheme as never,
+				state,
+				() => {},
+				{ asyncDirRoot: root, resultsDir: path.join(root, "results"), refreshMs: 60_000, markdownTheme },
+			);
+			try {
+				const lines = component.render(140);
+				const plain = (line: string) => line.replace(/\x1b\[[0-9;]*m/g, "");
+				const glyphTone = (label: string) => {
+					const code = lines.find((line) => plain(line).includes(`\u25cf ${label}`))?.match(/\x1b\[38;5;(\d+)m\u25cf/)?.[1];
+					return code === undefined ? undefined : tones[Number(code) - 100];
+				};
+				assert.equal(glyphTone("scout"), "thinking:high", "async step uses its recorded level");
+				assert.equal(glyphTone("planner"), "thinking:max", "foreground child uses its recorded level");
+				assert.equal(glyphTone("workflow"), "thinking:xhigh", "a whole workflow run uses the main level");
+			} finally {
+				component.dispose();
+			}
+		} finally {
+			setMainThinkingLevelSource(() => undefined);
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
@@ -1050,10 +1098,28 @@ describe("native subagent fleet", () => {
 			try {
 				const lines = component.render(100);
 				assert.ok(lines.some((line) => line.includes("FINAL ASYNC OUTPUT")));
-				assert.ok(lines.some((line) => line.includes("output-0.log")));
 				assert.ok(lines.some((line) => line.includes("worker") && line.includes("[fork]")));
-				assert.ok(lines.some((line) => line.includes("worker.jsonl")));
 				for (const line of lines) assert.ok(visibleWidth(line) <= 100, `line exceeded width: ${line}`);
+				// Read the detail pane through its scroll controls; absolute paths may wrap across rows or viewports.
+				const detailRows = (rendered: string[]) => rendered.slice(3, -3).map((line) => line.split("│")[2]!.trim());
+				let visible = lines;
+				while (true) {
+					component.handleInput("\x1b[5~");
+					const next = component.render(100);
+					if (next.join("\n") === visible.join("\n")) break;
+					visible = next;
+				}
+				const detail = detailRows(visible);
+				while (true) {
+					component.handleInput("\x1b[B");
+					const next = component.render(100);
+					if (next.join("\n") === visible.join("\n")) break;
+					visible = next;
+					detail.push(detailRows(visible).at(-1)!);
+				}
+				const fullDetail = detail.join("");
+				assert.ok(fullDetail.slice(fullDetail.indexOf("Artifacts:"), fullDetail.indexOf("Session:")).includes(path.join(asyncDir, "output-0.log")));
+				assert.ok(fullDetail.includes("worker.jsonl"));
 				tui.terminal.rows = 10;
 				assert.ok(component.render(100).length <= 8, "short-terminal render should fit the overlay's 85% height cap");
 				component.handleInput("\x1b[6~");
@@ -1451,7 +1517,9 @@ describe("native subagent fleet", () => {
 		}
 	});
 
-	it("focuses the Herdr pane the operator opens with the inspect key", async () => {
+	it("focuses an external inspector registered after Fleet opens", async (t) => {
+		const owner = { events: createEventBus() };
+		t.after(registerInspectorEventListener(owner));
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-inspect-focus-"));
 		try {
 			const asyncDir = writeAsyncRun(root, { id: "run-focus", agents: ["worker"] });
@@ -1466,7 +1534,7 @@ describe("native subagent fleet", () => {
 				updatedAt: 200,
 			});
 			const calls: string[][] = [];
-			const herdrClient: HerdrClient = {
+			const client: HerdrClient = {
 				run: async <T>(args: string[]) => {
 					calls.push(args);
 					if (args[0] === "--version") return { ok: true, data: "herdr 0.7.5" as T };
@@ -1482,6 +1550,7 @@ describe("native subagent fleet", () => {
 						const component = factory({ terminal: { rows: 32, columns: 100 }, requestRender() {} }, theme, undefined, () => {});
 						try {
 							component.render(100);
+							registerInspector(owner, { ...createHerdrInspectorPlugin({ client }), name: "test-host", available: () => true });
 							component.handleInput("H");
 							for (let attempt = 0; attempt < 500 && !calls.some((args) => args[0] === "pane" && args[1] === "split"); attempt++) {
 								await new Promise((resolve) => setImmediate(resolve));
@@ -1493,7 +1562,7 @@ describe("native subagent fleet", () => {
 				},
 			};
 
-			await openSubagentFleet(ctx as never, state, { asyncDirRoot: root, resultsDir: path.join(root, "results"), refreshMs: 60_000, herdrClient });
+			await openSubagentFleet(ctx as never, state, { asyncDirRoot: root, resultsDir: path.join(root, "results"), refreshMs: 60_000, inspectorPlugins: () => getInspectorPlugins(owner), inspectorEnv: {} });
 			const split = calls.find((args) => args[0] === "pane" && args[1] === "split");
 			assert.ok(split, `no pane split call: ${JSON.stringify(calls)}`);
 			assert.deepEqual(split.slice(-1), ["--focus"]);
@@ -1630,8 +1699,8 @@ describe("native subagent fleet", () => {
 		}
 	});
 
-	it("opens the selected async child in a Herdr inspector", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-herdr-"));
+	it("opens the selected async child in an inspector", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-inspector-"));
 		try {
 			const asyncDir = writeAsyncRun(root, { id: "async-herdr" });
 			const calls: Array<{ runId: string; asyncDir: string; index?: number }> = [];

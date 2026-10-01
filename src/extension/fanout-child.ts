@@ -1,9 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { createNativeSupervisorChannel } from "../intercom/native-supervisor-channel.ts";
-import { resolveCurrentSessionId } from "../shared/session-identity.ts";
+import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { discoverAgents } from "../agents/agents.ts";
 import { getArtifactsDir } from "../shared/artifacts.ts";
 import { createSubagentExecutor, type SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
@@ -11,11 +9,17 @@ import { resolveWaitToolConfig } from "../runs/background/wait-config.ts";
 import type { ChildRuntimeConfig } from "../runs/shared/child-runtime-config.ts";
 import { readNestedControlRequests, resolveInheritedNestedRoute, type NestedRoute, writeNestedControlResult } from "../runs/shared/nested-events.ts";
 import { deliverSubagentIntercomMessageEvent } from "../intercom/result-intercom.ts";
+import { createNativeSupervisorChannel, NATIVE_SUPERVISOR_TOOL_NAME, resolveSupervisorChannelDir } from "../intercom/native-supervisor-channel.ts";
+import { readStatus } from "../shared/utils.ts";
 import { resolveSubagentIntercomTarget } from "../intercom/intercom-bridge.ts";
 import { createSubagentParamsSchema } from "./schemas.ts";
+import { resolveDisabledFeatureSurface } from "../shared/disabled-features.ts";
 import { finalizeToolResult } from "./tool-result.ts";
+import { removedModelWorkflowFieldError } from "./public-execution.ts";
 import { loadConfig, resolveAsyncByDefault } from "./config.ts";
-import { type Details, type SubagentState } from "../shared/types.ts";
+import { SUBAGENT_ASYNC_STARTED_EVENT, type AsyncStartedEvent, type Details, type SubagentState } from "../shared/types.ts";
+import { createChildExternalJobBridgeSweeper } from "../runs/shared/external-job-bridge.ts";
+import { MODEL_ONLY_TOOL } from "../shared/extension-context.ts";
 
 function getSubagentSessionRoot(parentSessionFile: string | null): string {
 	if (parentSessionFile) {
@@ -30,7 +34,7 @@ function expandTilde(p: string): string {
 	return p.startsWith("~/") ? path.join(os.homedir(), p.slice(2)) : p;
 }
 
-function createChildSafeState(): SubagentState {
+export function createChildSafeState(): SubagentState {
 	return {
 		baseCwd: "",
 		currentSessionId: null,
@@ -143,7 +147,7 @@ function startNestedControlInboxListener(pi: ExtensionAPI, state: SubagentState,
 	return () => clearInterval(timer);
 }
 
-/** Register the child-side `subagent` tool for fanout-authorized children. */
+/** Register delegation and supervisor replies for fanout-authorized children. */
 export default function registerFanoutChildSubagentExtension(pi: ExtensionAPI, childConfig: ChildRuntimeConfig): void {
 	if (!childConfig.fanoutChild) return;
 
@@ -158,22 +162,40 @@ export default function registerFanoutChildSubagentExtension(pi: ExtensionAPI, c
 
 	const config = loadConfig();
 	const waitToolConfig = resolveWaitToolConfig(config.waitTool);
-	const state = createChildSafeState();
+	const state = childConfig.runtimeState ?? createChildSafeState();
+	const asyncChildren = new Map<string, { dir: string; agents: string[] }>();
+	const foregroundChannels = new Set<string>();
 	const supervisorChannel = createNativeSupervisorChannel(pi, state, {
-		getCurrentOwnerStates: () => executor.getCurrentSupervisorOwnerStates(),
+		getChannelDirs: () => {
+			const dirs = new Set<string>();
+			for (const run of state.foregroundControls.values()) {
+				for (const child of run.activeChildren?.values() ?? []) dirs.add(resolveSupervisorChannelDir(run.runId, child.agent, child.index));
+			}
+			for (const run of state.foregroundRuns?.values() ?? []) {
+				for (const child of run.children) {
+					if (child.status === "detached") dirs.add(resolveSupervisorChannelDir(run.runId, child.agent, child.index));
+				}
+			}
+			const retiringForeground = [...foregroundChannels].filter(dir => !dirs.has(dir));
+			for (const dir of dirs) foregroundChannels.add(dir);
+			for (const dir of retiringForeground) dirs.add(dir);
+			const retiringAsync: string[] = [];
+			for (const [id, child] of asyncChildren) {
+				const status = readStatus(child.dir);
+				if (status && status.state !== "queued" && status.state !== "running") retiringAsync.push(id);
+				for (const [index, agent] of child.agents.entries()) dirs.add(resolveSupervisorChannelDir(id, agent, index));
+			}
+			return {
+				dirs: [...dirs],
+				retire: () => {
+					for (const dir of retiringForeground) foregroundChannels.delete(dir);
+					for (const id of retiringAsync) asyncChildren.delete(id);
+				},
+			};
+		},
 	});
-	childConfig.hasPendingSupervisorRequest = supervisorChannel.hasPendingRequests;
-	pi.on("session_start", (_event, ctx) => {
-		state.currentSessionId = resolveCurrentSessionId(ctx.sessionManager);
-		state.supervisorOwnerSessionId = ctx.sessionManager.getSessionId() || null;
-		supervisorChannel.start();
-		supervisorChannel.activateTransport();
-	});
-	pi.on("session_shutdown", () => {
-		supervisorChannel.dispose();
-		if (childConfig.hasPendingSupervisorRequest === supervisorChannel.hasPendingRequests) childConfig.hasPendingSupervisorRequest = undefined;
-		state.supervisorOwnerSessionId = null;
-	});
+	const hasPendingSupervisorRequest = supervisorChannel.hasPendingRequests;
+	childConfig.hasPendingSupervisorRequest = hasPendingSupervisorRequest;
 	const executor = createSubagentExecutor({
 		pi,
 		state,
@@ -187,24 +209,64 @@ export default function registerFanoutChildSubagentExtension(pi: ExtensionAPI, c
 		discoverAgents,
 		allowMutatingManagementActions: false,
 		childRuntime: childConfig,
+		activateSupervisorTransport: supervisorChannel.activateTransport,
+		findPendingAsks: supervisorChannel.findPendingAsks,
 	});
 
-	const params = createSubagentParamsSchema();
+	const disabledFeatures = resolveDisabledFeatureSurface(config);
+	const listEnabled = (actions: string[]) => actions.filter((action) => !disabledFeatures.actions.has(action)).join(", ");
+	const blockedActions = listEnabled(["create", "update", "delete", "eject", "disable", "enable", "reset", "grant-spawn-budget", "lane.recordMerge", "lane.recordSupersession"]);
+	const params = createSubagentParamsSchema(disabledFeatures);
 	const tool: ToolDefinition<typeof params, Details> = {
 		name: "subagent",
+		...MODEL_ONLY_TOOL,
 		label: "Subagent",
 		description: [
 			"Delegate to subagents from child-safe fanout mode.",
-			"Allowed management/control actions: list, get, status, lane.status, interrupt, resume, steer, doctor.",
-			"Mutating management actions (create, update, delete, eject, disable, enable, reset, grant-spawn-budget, lane.recordMerge, lane.recordSupersession) are blocked in this mode.",
+			`Allowed management/control actions: ${listEnabled(["list", "get", "status", "lane.status", "interrupt", "resume", "steer", "doctor"])}.`,
+			...(blockedActions ? [`Mutating management actions (${blockedActions}) are blocked in this mode.`] : []),
 		].join("\n"),
 		parameters: params,
 		async execute(id, params, signal, onUpdate, ctx) {
+			const removedField = removedModelWorkflowFieldError(params);
+			if (removedField) throw new Error(removedField);
 			return finalizeToolResult(await executor.executePublic(id, params as SubagentParamsLike, signal ?? new AbortController().signal, onUpdate, ctx));
 		},
 	};
 
 	pi.registerTool(tool);
+	const bridgeSweeper = createChildExternalJobBridgeSweeper();
+	const unsubscribeBridgeStarted = pi.events.on(SUBAGENT_ASYNC_STARTED_EVENT, (payload: unknown) => {
+		const info = payload as AsyncStartedEvent;
+		if (info.id && info.asyncDir && info.sessionId === state.currentSessionId) bridgeSweeper.track(info.id, info.asyncDir);
+	});
+	let unsubscribeAsyncStarted: (() => void) | undefined;
+	pi.on("session_start", (_event, ctx) => {
+		supervisorChannel.registerTools();
+		// The host applies the explicit allowlist to dynamic registration too.
+		if (!pi.getAllTools().some(tool => tool.name === NATIVE_SUPERVISOR_TOOL_NAME)) return;
+		// Downward asks belong to this coordinator, not its parent or persisted session file.
+		state.supervisorOwnerSessionId = ctx.sessionManager.getSessionId() || null;
+		unsubscribeAsyncStarted = pi.events.on(SUBAGENT_ASYNC_STARTED_EVENT, (payload: unknown) => {
+			const info = payload as AsyncStartedEvent;
+			if (!info.id || !info.asyncDir || info.sessionId !== state.currentSessionId) return;
+			const agents = info.agents ?? (info.agent ? [info.agent] : []);
+			asyncChildren.set(info.id, { dir: info.asyncDir, agents });
+			supervisorChannel.activateTransport();
+		});
+		supervisorChannel.start();
+		supervisorChannel.activateTransport();
+	});
+	pi.on("session_shutdown", () => {
+		unsubscribeAsyncStarted?.();
+		unsubscribeBridgeStarted?.();
+		bridgeSweeper.dispose();
+		asyncChildren.clear();
+		foregroundChannels.clear();
+		supervisorChannel.dispose();
+		if (childConfig.hasPendingSupervisorRequest === hasPendingSupervisorRequest) childConfig.hasPendingSupervisorRequest = undefined;
+		state.supervisorOwnerSessionId = null;
+	});
 	const route = resolveNestedControlRoute(childConfig);
 	if (!route) return;
 	const listenerCleanupKey = "__piSubagentFanoutChildNestedControlInboxCleanups";

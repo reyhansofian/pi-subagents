@@ -27,13 +27,6 @@ import {
 import type { ChildWatchdogProgress, SubagentState } from "../../src/shared/types.ts";
 import { CHILD_WATCHDOG_STATUS_EVENT } from "../../src/watchdog/child-status.ts";
 import type { ChildRuntimeConfig } from "../../src/runs/shared/child-runtime-config.ts";
-import { clearExclusions } from "../../src/runs/shared/model-exclusions.ts";
-
-interface ModelAttempt {
-	success?: boolean;
-	exitCode?: number;
-	error?: string;
-}
 
 interface ProgressSummary {
 	agent: string;
@@ -65,6 +58,7 @@ interface LaunchResolvedExtensions {
 	disableAmbientExtensions?: boolean;
 	runtime?: string[];
 	configured?: string[];
+	required?: string[];
 	effective?: string[];
 }
 
@@ -84,8 +78,6 @@ interface RunSyncResult {
 	model?: string;
 	skills?: string[];
 	skillsWarning?: string;
-	attemptedModels?: string[];
-	modelAttempts?: ModelAttempt[];
 	contextOverflow?: boolean;
 	usage: { turns: number; input: number; output: number };
 	progress: ProgressSummary;
@@ -112,7 +104,7 @@ interface RunSyncResult {
 	agentContract?: { version: 1 };
 	execution?: { status?: string; success?: boolean; exitCode?: number; error?: string };
 	review?: { status?: string };
-	effects?: { fileMutation?: { status?: string; expected?: boolean; attempted?: boolean; message?: string } };
+	effects?: { fileMutation?: { status?: string; attempted?: boolean } };
 	acceptance?: {
 		status?: string;
 		verifyRuns?: Array<{ status?: string }>;
@@ -223,6 +215,7 @@ interface ExecutorToolResult {
 	isError?: boolean;
 	details?: {
 		totalCost?: { inputTokens: number; outputTokens: number; costUsd: number };
+		results?: Array<{ launchResolvedExtensions?: LaunchResolvedExtensions }>;
 		controlEvents?: Array<{ type?: string }>;
 		asyncId?: string;
 		timeoutMs?: number;
@@ -303,11 +296,9 @@ export function installSingleExecutionHooks() {
 		previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 		process.env.PI_CODING_AGENT_DIR = agentDir;
 		mockPi.reset();
-		clearExclusions();
 	});
 
 	afterEach(() => {
-		clearExclusions();
 		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
 		removeTempDir(agentDir);
@@ -351,11 +342,12 @@ export function installSingleExecutionHooks() {
 		workflowControllers?: Map<string, AbortController>,
 		handleScheduledRunAction?: Parameters<typeof createSubagentExecutor>[0]["handleScheduledRunAction"],
 		piEvents = createEventBus(),
-		discoverAgentsForCwd?: (cwd: string) => typeof agents,
+		discoverAgentsForCwd?: (cwd: string, preferredModelProvider?: string) => typeof agents,
 		childRuntime?: ChildRuntimeConfig,
+		sendMessage?: (message: unknown, options: unknown) => void,
 	) {
 		return createSubagentExecutor!({
-			pi: { events: piEvents, getSessionName: () => undefined },
+			pi: { events: piEvents, getSessionName: () => undefined, ...(sendMessage ? { sendMessage } : {}) },
 			...(childRuntime ? { childRuntime } : {}),
 			state: {
 				baseCwd: tempDir,
@@ -371,7 +363,7 @@ export function installSingleExecutionHooks() {
 			tempArtifactsDir: tempDir,
 			getSubagentSessionRoot: () => path.join(tempDir, ".pi/subagents", "sessions"),
 			expandTilde: (value: string) => value,
-			discoverAgents: (cwd: string) => ({ agents: discoverAgentsForCwd ? discoverAgentsForCwd(cwd) : agents }),
+			discoverAgents: (cwd: string, _scope: unknown, preferredModelProvider?: string) => ({ agents: discoverAgentsForCwd ? discoverAgentsForCwd(cwd, preferredModelProvider) : agents }),
 			allowMutatingManagementActions,
 			...(handleScheduledRunAction ? { handleScheduledRunAction } : {}),
 		});

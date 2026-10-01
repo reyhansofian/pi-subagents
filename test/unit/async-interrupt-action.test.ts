@@ -1,11 +1,18 @@
 import assert from "node:assert/strict";
-import * as fs from "node:fs";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
-import { acquireActiveAsyncCapacity } from "../../src/runs/background/active-async-capacity.ts";
+import { acquireActiveAsyncCapacity, ActiveAsyncCapacityError } from "../../src/runs/background/active-async-capacity.ts";
+import { ACTIVE_RUN_INDEX_DIR, updateActiveRunIndex } from "../../src/runs/background/active-run-index.ts";
+import { resolveAsyncResumeTarget } from "../../src/runs/background/async-resume.ts";
 import { consumeSteerRequests, consumeStopRequestPayload } from "../../src/runs/background/control-channel.ts";
+import { resultFilePath, writeAsyncResultFile } from "../../src/runs/background/result-files.ts";
+import { TERMINAL_RUN_INDEX_DIR } from "../../src/runs/background/terminal-run-index.ts";
 import { listAsyncRuns } from "../../src/runs/background/async-status.ts";
+import { readProcessTerminal } from "../../src/runs/background/process-terminal.ts";
+import { reconcileAsyncRun } from "../../src/runs/background/stale-run-reconciler.ts";
 import { inspectSubagentStatus } from "../../src/runs/background/run-status.ts";
 import { createSubagentExecutor, steerWorkflowChildByKey } from "../../src/runs/foreground/subagent-executor.ts";
 import { resolveExternalCliRunnerStatus } from "../../src/runs/shared/external-cli-contract.ts";
@@ -60,6 +67,44 @@ function createRunningAsync(state: SubagentState, runId: string, options: { trac
 			updatedAt: 100,
 		});
 	}
+	return asyncDir;
+}
+
+function observedProof(runId: string, runnerProcessInstanceId: string) {
+	return {
+		version: 1,
+		state: "observed",
+		runId,
+		runnerProcessInstanceId,
+		observedAt: 300,
+		instances: [{ kind: "runner", processInstanceId: runnerProcessInstanceId, closeObservedAt: 300, exitCode: 0, signal: null }],
+	};
+}
+
+function createPausedAsync(state: SubagentState, runId: string): string {
+	const asyncDir = createRunningAsync(state, runId, { track: false, sessionId: "session" });
+	const statusPath = path.join(asyncDir, "status.json");
+	writeJson(statusPath, {
+		...JSON.parse(fs.readFileSync(statusPath, "utf-8")),
+		state: "paused",
+		processTerminal: { version: 1, state: "pending", runId, runnerProcessInstanceId: "runner-a", resumeDisposition: "resumable" },
+		steps: [
+			{ agent: "done", status: "completed", startedAt: 50, endedAt: 90, exitCode: 0 },
+			{ agent: "paused", status: "paused", startedAt: 100, endedAt: 200, exitCode: 0, processTerminal: { version: 1, state: "not-started", runId, childIndex: 1, runnerProcessInstanceId: "runner-a", resumeDisposition: "resumable" } },
+		],
+	});
+	writeAsyncResultFile(resultFilePath(RESULTS_DIR, runId), {
+		id: runId,
+		sessionId: "session",
+		state: "paused",
+		success: false,
+		summary: "Paused after interrupt.",
+		exitCode: 0,
+		results: [
+			{ agent: "done", output: "done", success: true, exitCode: 0 },
+			{ agent: "paused", output: "paused", success: false, exitCode: 0, interrupted: true },
+		],
+	});
 	return asyncDir;
 }
 
@@ -447,6 +492,81 @@ describe("async interrupt action", () => {
 		}
 	});
 
+	it("exposes exact async child targets when owned workflow steering has no foreground route", async () => {
+		const state = createState();
+		const workflowRunId = `workflow-async-target-${Date.now().toString(36)}`;
+		const childRunId = `${workflowRunId}-child`;
+		const asyncDir = createRunningAsync(state, workflowRunId, { track: false, mode: "workflow" });
+		const childDir = createRunningAsync(state, childRunId);
+		state.currentSessionId = "session";
+		state.workflowControllers = new Map([[workflowRunId, new AbortController()]]);
+		const statusPath = path.join(asyncDir, "status.json");
+		const status = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
+		status.steps = [{ agent: "worker", workflowKey: "writer", status: "running", async: true, runId: childRunId }];
+		writeJson(statusPath, status);
+		try {
+			const executor = executorWithKill(state, () => true);
+			const result = await executor.execute("steer", { action: "steer", id: workflowRunId, mode: "follow_up", message: "Continue carefully." }, new AbortController().signal, undefined, ctx());
+			assert.equal(result.isError, true);
+			assert.match(text(result), /no live foreground child/);
+			assert.ok(text(result).includes(`id: "${childRunId}"`));
+			assert.match(text(result), /recorded as running; direct steering rechecks/);
+			assert.deepEqual(consumeSteerRequests(asyncDir), []);
+			assert.deepEqual(consumeSteerRequests(childDir), []);
+			const view = inspectSubagentStatus({ id: workflowRunId }, { state, kill: () => true });
+			assert.ok(text(view).includes(`Child run: ${childRunId}`));
+			assert.ok(text(view).includes(`action: "steer", id: "${childRunId}"`));
+			assert.doesNotMatch(text(view), new RegExp(`action: "steer", id: "${workflowRunId}"`));
+			const direct = await executor.execute("steer-child", { action: "steer", id: childRunId, mode: "follow_up", message: "Continue carefully." }, new AbortController().signal, undefined, ctx());
+			assert.equal(direct.isError, undefined);
+			assert.equal(direct.details.steering?.deliveryStatus, "queued");
+			assert.notEqual(direct.details.steering?.state, "delivered");
+			assert.equal(consumeSteerRequests(childDir)[0]?.mode, "follow_up");
+		} finally {
+			cleanup(workflowRunId, asyncDir);
+			cleanup(childRunId, childDir);
+		}
+	});
+
+	it("keeps async workflow hints projection-only, selective, and scoped to the active owner", () => {
+		const state = createState();
+		const workflowRunId = `workflow-async-hints-${Date.now().toString(36)}`;
+		const asyncDir = createRunningAsync(state, workflowRunId, { track: false, mode: "workflow" });
+		state.currentSessionId = "session";
+		state.workflowControllers = new Map([[workflowRunId, new AbortController()]]);
+		const statusPath = path.join(asyncDir, "status.json");
+		const status = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
+		const child = (runId: string, overrides = {}) => ({ agent: "worker", workflowKey: runId, status: "running", async: true, runId, ...overrides });
+		status.steps = [child("async-one"), child("async-two"), child("async-one"),
+			child("completed-child", { status: "complete" }), child("paused-child", { status: "paused" }),
+			child("pending-child", { status: "pending" }), child("foreground-child", { async: false }),
+			child("unknown-child", { async: undefined }), child("external-child", { runner: { type: "external-cli" } }),
+			child("job-child", { runner: { type: "external-job", provider: "test" } }), child("../unsafe"), child(workflowRunId)];
+		writeJson(statusPath, status);
+		try {
+			const read = () => text(inspectSubagentStatus({ id: workflowRunId }, { state, kill: () => true }));
+			const view = read();
+			const hints = view.split("\n").filter((line) => line.includes('action: "steer"'));
+			assert.equal(hints.length, 2);
+			assert.ok(hints[0].includes('id: "async-one"'));
+			assert.ok(hints[1].includes('id: "async-two"'));
+			assert.match(view, /queued does not mean consumed/);
+			for (const sessionId of [null, "other-session"]) {
+				state.currentSessionId = sessionId;
+				assert.doesNotMatch(read(), /Async children recorded as running/);
+			}
+			state.currentSessionId = "session";
+			state.workflowControllers.clear();
+			assert.doesNotMatch(read(), /Async children recorded as running/);
+			state.workflowControllers.set(workflowRunId, new AbortController());
+			status.state = "complete";
+			writeJson(statusPath, status);
+			assert.doesNotMatch(read(), /Async children recorded as running/);
+		} finally {
+			cleanup(workflowRunId, asyncDir);
+		}
+	});
+
 	it("rejects ambiguous workflow steering without choosing a foreground child", async () => {
 		const state = createState();
 		const workflowRunId = `workflow-ambiguous-${Date.now().toString(36)}`;
@@ -700,6 +820,241 @@ describe("async interrupt action", () => {
 			cleanup(runId, asyncDir);
 		}
 	});
+
+	it("rejects a stop after a running run closes its stop inbox", async () => {
+		const state = createState();
+		state.currentSessionId = "session";
+		const runId = `stop-closed-${Date.now().toString(36)}`;
+		const asyncDir = createRunningAsync(state, runId, { track: false, sessionId: "session" });
+		try {
+			writeJson(path.join(asyncDir, "control", "stop-inbox-closed.json"), { version: 1, closedAt: Date.now() });
+			const result = await executorWithKill(state, () => true)
+				.execute("stop-closed", { action: "stop", id: runId }, new AbortController().signal, undefined, ctx());
+
+			assert.equal(result.isError, true);
+			assert.match(text(result), /Failed to stop async run.*Retry stop after runner shutdown is observed/);
+			assert.equal(fs.existsSync(path.join(asyncDir, "control", "stop-requests")), false);
+		} finally {
+			cleanup(runId, asyncDir);
+		}
+	});
+
+	it("seals a paused whole run only with exact observed runner proof", async () => {
+		const state = createState();
+		state.currentSessionId = "session";
+		const runId = `stop-paused-${Date.now().toString(36)}`;
+		const asyncDir = createPausedAsync(state, runId);
+		try {
+			writeJson(path.join(asyncDir, "process-terminal.json"), observedProof(runId, "runner-a"));
+			const proofBefore = fs.readFileSync(path.join(asyncDir, "process-terminal.json"), "utf-8");
+			const capacity = acquireActiveAsyncCapacity({ sessionId: "session", limit: 1, runId, kind: "runner", asyncDir });
+			capacity.markStarted("runner-a");
+			assert.throws(() => acquireActiveAsyncCapacity({ sessionId: "session", limit: 1, runId: `${runId}-blocked`, kind: "runner", asyncDir: `${asyncDir}-blocked` }), ActiveAsyncCapacityError);
+			const childStop = await executorWithKill(state, () => true)
+				.execute("stop-paused-child", { action: "stop", id: runId, childId: "paused" }, new AbortController().signal, undefined, ctx());
+			assert.equal(childStop.isError, true);
+			assert.equal(fs.existsSync(path.join(asyncDir, "control", "stop-requests")), false);
+			writeJson(path.join(asyncDir, "control", "stop-inbox-closed.json"), { version: 1, closedAt: Date.now() });
+
+			const result = await executorWithKill(state, () => true)
+				.execute("stop-paused", { action: "stop", id: runId }, new AbortController().signal, undefined, ctx());
+
+			assert.equal(result.isError, undefined);
+			assert.match(text(result), /Stopped paused async run/);
+			assert.equal(fs.existsSync(path.join(asyncDir, "control", "stop-requests")), false);
+			const status = JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8"));
+			const payload = JSON.parse(fs.readFileSync(path.join(RESULTS_DIR, `${runId}.json`), "utf-8"));
+			assert.equal(status.state, "stopped");
+			assert.equal(status.steps[0].status, "completed");
+			assert.equal(status.steps[1].status, "stopped");
+			assert.equal(payload.state, "stopped");
+			assert.equal(payload.results[0].output, "done");
+			assert.equal(payload.results[1].stopped, true);
+			assert.equal(fs.readFileSync(path.join(asyncDir, "process-terminal.json"), "utf-8"), proofBefore);
+			const repeated = await executorWithKill(state, () => true)
+				.execute("stop-paused-again", { action: "stop", id: runId }, new AbortController().signal, undefined, ctx());
+			assert.equal(repeated.isError, true);
+			assert.equal(JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")).steps[0].status, "completed");
+			assert.equal(listAsyncRuns(ASYNC_DIR, { states: ["stopped"], sessionId: "session" }).some((run) => run.id === runId), true);
+			assert.throws(() => resolveAsyncResumeTarget({ id: runId }, { asyncDirRoot: ASYNC_DIR, resultsDir: RESULTS_DIR }), /stopped and cannot be resumed/);
+			const next = acquireActiveAsyncCapacity({ sessionId: "session", limit: 1, runId: `${runId}-next`, kind: "runner", asyncDir: `${asyncDir}-next` });
+			assert.equal(next.owner.runId, `${runId}-next`);
+			assert.equal(next.rollback(), true);
+		} finally {
+			cleanup(runId, asyncDir);
+		}
+	});
+
+	it("seals stale-repaired paused status without losing current terminal authority", async () => {
+		const state = createState();
+		state.currentSessionId = "session";
+		const runId = `stop-stale-repaired-paused-${Date.now().toString(36)}`;
+		const asyncDir = createPausedAsync(state, runId);
+		const statusPath = path.join(asyncDir, "status.json");
+		const sidecarPath = path.join(asyncDir, "process-terminal.json");
+		const currentRoot = observedProof(runId, "runner-current");
+		const currentCompleteStep = { ...observedProof(runId, "runner-current"), childIndex: 0, resumeDisposition: "non-resumable" };
+		const currentPausedStep = { version: 1, state: "unknown", runId, childIndex: 1, runnerProcessInstanceId: "runner-current", reason: "process-tree-unverified", resumeDisposition: "resumable" } as const;
+		try {
+			const pausedStatus = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
+			const currentStatus = {
+				...pausedStatus,
+				processTerminal: currentRoot,
+				steps: [
+					{ ...pausedStatus.steps[0], processTerminal: currentCompleteStep },
+					{ ...pausedStatus.steps[1], processTerminal: currentPausedStep },
+				],
+			};
+			writeJson(statusPath, {
+				...pausedStatus,
+				state: "running",
+				pid: 12345,
+				lastUpdate: 100,
+				processTerminal: { version: 1, state: "pending", runId, runnerProcessInstanceId: "runner-stale" },
+				steps: [
+					{ ...pausedStatus.steps[0], processTerminal: { version: 1, state: "pending", runId, childIndex: 0, runnerProcessInstanceId: "runner-stale" } },
+					{ ...pausedStatus.steps[1], processTerminal: { version: 1, state: "not-started", runId, childIndex: 1, runnerProcessInstanceId: "runner-stale" } },
+				],
+			});
+			const repaired = reconcileAsyncRun(asyncDir, { resultsDir: RESULTS_DIR, now: () => 400 }, () => {
+				writeJson(sidecarPath, currentRoot);
+				writeJson(statusPath, currentStatus);
+			});
+			assert.equal(repaired.repaired, true);
+			assert.equal(repaired.status?.state, "paused");
+			assert.deepEqual(repaired.status?.processTerminal, currentRoot);
+			assert.deepEqual(repaired.status?.steps?.[0]?.processTerminal, currentCompleteStep);
+			assert.deepEqual(repaired.status?.steps?.[1]?.processTerminal, currentPausedStep);
+			assert.deepEqual(readProcessTerminal(asyncDir, { runId, runnerProcessInstanceId: "runner-current" }), currentRoot);
+			const pausedPublic = listAsyncRuns(ASYNC_DIR, { states: ["paused"], sessionId: "session" }).find((run) => run.id === runId);
+			assert.deepEqual(pausedPublic?.processTerminal, currentRoot);
+			assert.deepEqual(pausedPublic?.steps[0]?.processTerminal, currentCompleteStep);
+			assert.deepEqual(pausedPublic?.steps[1]?.processTerminal, currentPausedStep);
+
+			const sidecarBefore = fs.readFileSync(sidecarPath, "utf-8");
+			const capacity = acquireActiveAsyncCapacity({ sessionId: "session", limit: 1, runId, kind: "runner", asyncDir });
+			capacity.markStarted("runner-current");
+			const result = await executorWithKill(state, () => true)
+				.execute("stop-stale-repaired-paused", { action: "stop", id: runId }, new AbortController().signal, undefined, ctx());
+			assert.equal(result.isError, undefined);
+			assert.match(text(result), /Stopped paused async run/);
+			const stoppedStatus = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
+			const stoppedResult = JSON.parse(fs.readFileSync(path.join(RESULTS_DIR, `${runId}.json`), "utf-8"));
+			assert.equal(stoppedStatus.state, "stopped");
+			assert.equal(stoppedStatus.steps[0].status, "completed");
+			assert.equal(stoppedStatus.steps[1].status, "stopped");
+			assert.equal(stoppedResult.state, "stopped");
+			assert.equal(stoppedResult.results[0].output, "done");
+			assert.equal(stoppedResult.results[1].stopped, true);
+			assert.equal(fs.readFileSync(sidecarPath, "utf-8"), sidecarBefore);
+			assert.deepEqual(stoppedStatus.processTerminal, currentRoot);
+			assert.deepEqual(stoppedStatus.steps[0].processTerminal, currentCompleteStep);
+			assert.deepEqual(stoppedStatus.steps[1].processTerminal, currentPausedStep);
+			assert.deepEqual(readProcessTerminal(asyncDir, { runId, runnerProcessInstanceId: "runner-current" }), currentRoot);
+			const stoppedPublic = listAsyncRuns(ASYNC_DIR, { states: ["stopped"], sessionId: "session" }).find((run) => run.id === runId);
+			assert.deepEqual(stoppedPublic?.processTerminal, currentRoot);
+			assert.deepEqual(stoppedPublic?.steps[0]?.processTerminal, currentCompleteStep);
+			assert.deepEqual(stoppedPublic?.steps[1]?.processTerminal, currentPausedStep);
+			const next = acquireActiveAsyncCapacity({ sessionId: "session", limit: 1, runId: `${runId}-next`, kind: "runner", asyncDir: `${asyncDir}-next` });
+			assert.equal(next.rollback(), true);
+		} finally {
+			cleanup(runId, asyncDir);
+		}
+	});
+
+	it("keeps stopped publication discoverable when terminal indexing runs out of space", async () => {
+		const state = createState();
+		state.currentSessionId = "session";
+		const runId = `stop-paused-index-failure-${Date.now().toString(36)}`;
+		const asyncDir = createPausedAsync(state, runId);
+		const proofPath = path.join(asyncDir, "process-terminal.json");
+		const markerPath = path.join(ASYNC_DIR, ACTIVE_RUN_INDEX_DIR, runId);
+		const terminalIndexDir = path.join(ASYNC_DIR, TERMINAL_RUN_INDEX_DIR, "session");
+		const originalRename = fs.renameSync;
+		let storageFull = true;
+		try {
+			const pausedStatus = { ...JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")), endedAt: 200, lastUpdate: 200 };
+			writeJson(path.join(asyncDir, "status.json"), { ...pausedStatus, state: "running", endedAt: undefined, lastUpdate: 100 });
+			updateActiveRunIndex(asyncDir, "running");
+			writeJson(path.join(asyncDir, "status.json"), pausedStatus);
+			updateActiveRunIndex(asyncDir, "paused");
+			const pausedMarkers = fs.readdirSync(terminalIndexDir).filter((name) => name.endsWith(`-${runId}.json`));
+			assert.equal(fs.existsSync(markerPath), false);
+			assert.equal(pausedMarkers.length, 1);
+			assert.match(pausedMarkers[0]!, /^0+200-/);
+			writeJson(proofPath, observedProof(runId, "runner-a"));
+			const proofBefore = fs.readFileSync(proofPath, "utf-8");
+			const capacity = acquireActiveAsyncCapacity({ sessionId: "session", limit: 1, runId, kind: "runner", asyncDir });
+			capacity.markStarted("runner-a");
+			fs.renameSync = ((from, to) => {
+				if (storageFull && String(to).includes(`${path.sep}.terminal-runs${path.sep}`)) throw Object.assign(new Error("injected terminal index capacity failure"), { code: "ENOSPC" });
+				return originalRename(from, to);
+			}) as typeof fs.renameSync;
+			syncBuiltinESMExports();
+
+			const failed = await executorWithKill(state, () => true)
+				.execute("stop-paused-index-failure", { action: "stop", id: runId }, new AbortController().signal, undefined, ctx());
+			assert.equal(failed.isError, true);
+			const status = JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8"));
+			const payload = JSON.parse(fs.readFileSync(path.join(RESULTS_DIR, `${runId}.json`), "utf-8"));
+			assert.equal(status.state, "stopped");
+			assert.equal(status.runId, runId);
+			assert.equal(payload.state, "stopped");
+			assert.equal(payload.id, runId);
+			assert.equal(fs.readFileSync(proofPath, "utf-8"), proofBefore);
+			assert.equal(fs.existsSync(markerPath), true);
+			const next = acquireActiveAsyncCapacity({ sessionId: "session", limit: 1, runId: `${runId}-next`, kind: "runner", asyncDir: `${asyncDir}-next` });
+			assert.equal(next.rollback(), true);
+
+			const originalError = console.error;
+			console.error = () => {};
+			try {
+				assert.equal(listAsyncRuns(ASYNC_DIR, { sessionId: "session" }).some((run) => run.id === runId), true);
+			} finally {
+				console.error = originalError;
+			}
+			assert.equal(fs.existsSync(markerPath), true);
+			storageFull = false;
+			assert.equal(listAsyncRuns(ASYNC_DIR, { sessionId: "session" }).some((run) => run.id === runId), true);
+			assert.equal(fs.existsSync(markerPath), false);
+			const recoveredMarkers = fs.readdirSync(terminalIndexDir).filter((name) => name.endsWith(`-${runId}.json`));
+			assert.equal(recoveredMarkers.includes(pausedMarkers[0]!), true);
+			assert.equal(recoveredMarkers.length, 2);
+			assert.equal(listAsyncRuns(ASYNC_DIR, { states: ["stopped"], sessionId: "session", entryLimit: 1 }).some((run) => run.id === runId), true);
+		} finally {
+			fs.renameSync = originalRename;
+			syncBuiltinESMExports();
+			cleanup(runId, asyncDir);
+		}
+	});
+
+	for (const proofCase of ["missing", "pending", "unknown", "not-started", "malformed", "wrong-run", "wrong-runner"] as const) {
+		it(`keeps a paused run resumable when proof is ${proofCase}`, async () => {
+			const state = createState();
+			state.currentSessionId = "session";
+			const runId = `stop-paused-${proofCase}-${Date.now().toString(36)}`;
+			const asyncDir = createPausedAsync(state, runId);
+			try {
+				if (proofCase === "pending") writeJson(path.join(asyncDir, "process-terminal.json"), { version: 1, state: "pending", runId, runnerProcessInstanceId: "runner-a" });
+				if (proofCase === "unknown") writeJson(path.join(asyncDir, "process-terminal.json"), { version: 1, state: "unknown", runId, runnerProcessInstanceId: "runner-a", reason: "process-tree-unverified" });
+				if (proofCase === "not-started") writeJson(path.join(asyncDir, "process-terminal.json"), { version: 1, state: "not-started", runId, runnerProcessInstanceId: "runner-a" });
+				if (proofCase === "malformed") fs.writeFileSync(path.join(asyncDir, "process-terminal.json"), "not json", "utf-8");
+				if (proofCase === "wrong-run") writeJson(path.join(asyncDir, "process-terminal.json"), observedProof("other-run", "runner-a"));
+				if (proofCase === "wrong-runner") writeJson(path.join(asyncDir, "process-terminal.json"), observedProof(runId, "runner-b"));
+
+				const result = await executorWithKill(state, () => true)
+					.execute(`stop-paused-${proofCase}`, { action: "stop", id: runId }, new AbortController().signal, undefined, ctx());
+
+				assert.equal(result.isError, true);
+				assert.match(text(result), /Stop request persisted.*Retry stop/);
+				assert.ok(fs.readdirSync(path.join(asyncDir, "control", "stop-requests")).length > 0);
+				assert.equal(JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")).state, "paused");
+				assert.equal(JSON.parse(fs.readFileSync(path.join(RESULTS_DIR, `${runId}.json`), "utf-8")).state, "paused");
+			} finally {
+				cleanup(runId, asyncDir);
+			}
+		});
+	}
 
 	it("stops a reload-recovered workflow through the durable control channel", async () => {
 		const state = createState();

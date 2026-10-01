@@ -1,85 +1,58 @@
-type ToolEvent = { type?: string; toolName?: unknown; toolCallId?: unknown; isError?: unknown; message?: unknown; assistantMessageEvent?: unknown };
-
-/** A pending empty assistant stream is initialization, not model continuation. */
-export function isAssistantProgress(event: ToolEvent): boolean {
-	if (!["message_start", "message_update", "message_end"].includes(event.type ?? "")) return false;
-	const message = event.message as { role?: string; content?: Array<{ type?: string; text?: string }> } | undefined;
-	if (message?.role !== "assistant") return false;
-	if (message.content?.some((part) => part.type === "toolCall" || (typeof part.text === "string" && part.text.length > 0))) return true;
-	const delta = event.assistantMessageEvent as { type?: string; delta?: unknown } | undefined;
-	return event.type === "message_update" && typeof delta?.delta === "string" && delta.delta.length > 0;
-}
+type ToolEvent = { type?: string; toolName?: unknown; toolCallId?: unknown; args?: unknown; isError?: unknown; message?: unknown; assistantMessageEvent?: unknown };
 
 export interface FailedToolCall {
 	tool: string;
-	toolCallId?: string;
-	failureId: string;
+	toolCallId: string;
 	path?: string;
 	failedAt: number;
 	summary: string;
 }
 
-/** A completion pair is one observation, not two failures or evidence of recovery. */
+/** Local observer only: a paired result is not a second failure or a recovery. */
 export function createToolErrorWatch() {
-	type Call = { tool: string; id: string; path?: string; failureId: string; failed?: boolean };
-	const active = new Map<string, Call>();
-	const completed = new Map<string, Call>();
-	let failure: FailedToolCall | undefined;
+	const calls = new Map<string, { tool: string; path?: string; failed: boolean }>();
+	const failedIds = new Set<string>();
+	let pending: FailedToolCall | undefined;
 	return {
-		/** True only for a new call or substantive assistant continuation. */
-		observe(event: ToolEvent, now: number, path?: string): boolean {
-			if (event.type === "compaction_start" || event.type === "agent_settled") {
-				const hadFailure = !!failure;
-				failure = undefined;
-				active.clear();
-				completed.clear();
-				return hadFailure;
+		observe(event: ToolEvent, now: number, path?: string): void {
+			if (event.type === "agent_settled" || event.type === "compaction_start") {
+				pending = undefined;
+				calls.clear();
+				return;
 			}
+			if (event.type === "message_start" || event.type === "message_update" || event.type === "message_end") {
+				const message = event.message as { role?: string; content?: Array<{ type?: string; text?: string }> } | undefined;
+				const delta = event.assistantMessageEvent as { type?: string; delta?: unknown } | undefined;
+				if (message?.role === "assistant" && (message.content?.some((part) => part.type === "toolCall" || Boolean(part.text?.trim())) || (event.type === "message_update" && typeof delta?.delta === "string" && delta.delta.trim().length > 0))) pending = undefined;
+			}
+			const id = event.type === "tool_result_end"
+				? (event.message as { toolCallId?: unknown } | undefined)?.toolCallId ?? event.toolCallId
+				: event.toolCallId;
 			if (event.type === "tool_execution_start") {
-				const id = typeof event.toolCallId === "string" && event.toolCallId ? event.toolCallId : undefined;
-				if (!id) {
-					failure = undefined;
-					for (const call of completed.values()) call.failed = true;
-					return true;
+				if (typeof id !== "string" || !id) pending = undefined;
+				if (typeof id === "string" && id && !calls.has(id)) {
+					pending = undefined;
+					calls.set(id, { tool: typeof event.toolName === "string" ? event.toolName : "tool", path, failed: false });
+					if (calls.size > 128) calls.delete(calls.keys().next().value!);
 				}
-				const key = "id:" + id;
-				if (active.has(key) || completed.has(key)) return false;
-				failure = undefined;
-				for (const call of completed.values()) call.failed = true;
-				const call = { tool: typeof event.toolName === "string" ? event.toolName : "tool", id, path, failureId: key };
-				active.set(key, call);
-				if (active.size > 128) active.delete(active.keys().next().value!);
-				return true;
+				return;
 			}
-			if (isAssistantProgress(event)) {
-				failure = undefined;
-				for (const call of completed.values()) call.failed = true;
-				return true;
-			}
-			const message = event.message as { role?: string; toolCallId?: string; toolName?: string; isError?: boolean; content?: Array<{ type?: string; text?: string }> } | undefined;
-			const result = event.type === "tool_result_end" || ((event.type === "message_end" || event.type === "message_start") && message?.role === "toolResult");
-			if (event.type !== "tool_execution_end" && !result) return false;
-			const id = (typeof message?.toolCallId === "string" && message.toolCallId) || (typeof event.toolCallId === "string" && event.toolCallId);
-			if (!id) return false;
-			const key = "id:" + id;
-			const call = active.get(key) ?? completed.get(key);
-			if (!call) return false;
-			if (active.has(key)) {
-				active.delete(key);
-				completed.set(key, call);
-				if (completed.size > 64) completed.delete(completed.keys().next().value!);
-			}
-			if (event.isError !== true && message?.isError !== true) return false;
-			const text = message?.content?.find((part) => part.type === "text" && part.text?.trim())?.text?.trim();
-			if (!call.failed && !failure) {
-				call.failed = true;
-				failure = { tool: call.tool, failureId: call.failureId, ...(call.id ? { toolCallId: call.id } : {}), ...(call.path ? { path: call.path } : {}), failedAt: now, summary: (text || "Tool execution failed").slice(0, 180) };
-			} else if (failure?.failureId === call.failureId && text && failure.summary === "Tool execution failed") failure.summary = text.slice(0, 180);
-			return false;
+			if ((event.type !== "tool_execution_end" && event.type !== "tool_result_end") || typeof id !== "string") return;
+			const call = calls.get(id);
+			if (!call) return;
+			const result = event.message as { role?: string; isError?: unknown; content?: Array<{ type?: string; text?: string }> } | undefined;
+			const failed = event.type === "tool_execution_end" ? event.isError === true : result?.role === "toolResult" && result.isError === true;
+			if (!failed) return;
+			if (!call.failed && failedIds.has(id)) return;
+			failedIds.add(id);
+			const summary = result?.content?.find((part) => part.type === "text" && part.text?.trim())?.text?.trim().slice(0, 180);
+			if (!call.failed && !pending) pending = { tool: call.tool, toolCallId: id, path: call.path, failedAt: now, summary: summary || "Tool execution failed" };
+			else if (pending?.toolCallId === id && summary && pending.summary === "Tool execution failed") pending.summary = summary;
+			call.failed = true;
 		},
 		due(now: number, graceMs: number): FailedToolCall | undefined {
-			return failure && now - failure.failedAt >= graceMs ? failure : undefined;
+			return pending && now - pending.failedAt >= graceMs ? pending : undefined;
 		},
-		clear(): void { failure = undefined; active.clear(); completed.clear(); },
+		clear(): void { calls.clear(); failedIds.clear(); pending = undefined; },
 	};
 }

@@ -6,11 +6,15 @@ import { FLEET_KEYBINDING_ACTIONS, type ArtifactDirPreference, type ExtensionCon
 import { validateMissionStoreConfig } from "../missions/store.ts";
 import { validateAuthorityPolicy } from "../policy/authority.ts";
 import { getAgentDir } from "../shared/utils.ts";
-import { DEFAULT_MODEL_EXCLUSION_TTL_MS, MAX_MODEL_EXCLUSION_TTL_MS, setDefaultTTL } from "../runs/shared/model-exclusions.ts";
 import { validatePermissionConfig } from "../runs/shared/permissions.ts";
 import { MAX_ABANDONED_SLOT_RELEASE_AFTER_MS, MIN_ABANDONED_SLOT_RELEASE_AFTER_MS } from "../runs/background/active-async-capacity.ts";
 import { normalizeWorktreeBranchPrefix } from "../runs/shared/worktree.ts";
 import { validateModelResponseAliases } from "../shared/model-response-aliases.ts";
+import { validateDisabledFeatures } from "../shared/disabled-features.ts";
+
+// Explicit route identity, worktree, checkpoint, and tool-surface policies must not be silently
+// discarded and replaced by the built-in defaults after validation fails.
+const FAIL_CLOSED_CONFIG_KEYS = ["worktreeProvider", "worktreeBranchPrefix", "modelResponseAliases", "modelExclusions", "checkpointBeforeDeadlineMs", "disabledFeatures", "scheduledRuns", "toolActivation"];
 
 const ARTIFACT_DIR_PREFERENCES = new Set<ArtifactDirPreference>(["project", "session", "temp"]);
 const FLEET_KEYBINDING_ACTION_SET = new Set<string>(FLEET_KEYBINDING_ACTIONS);
@@ -56,6 +60,8 @@ export function resolveScheduledStoreRoot(value: string): string {
 function validateScheduledRunsConfig(value: unknown): void {
 	if (value === undefined) return;
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("config.scheduledRuns must be a JSON object");
+	const enabled = (value as Record<string, unknown>).enabled;
+	if (enabled !== undefined && typeof enabled !== "boolean") throw new Error("config.scheduledRuns.enabled must be a boolean");
 	const storeRoot = (value as Record<string, unknown>).storeRoot;
 	if (storeRoot === undefined) return;
 	if (typeof storeRoot !== "string" || !storeRoot.trim()) throw new Error("config.scheduledRuns.storeRoot must be a non-empty string");
@@ -94,17 +100,6 @@ function validateCapacityConfig(value: unknown): void {
 			|| abandonedSlotReleaseAfterMs < MIN_ABANDONED_SLOT_RELEASE_AFTER_MS
 			|| abandonedSlotReleaseAfterMs > MAX_ABANDONED_SLOT_RELEASE_AFTER_MS)) {
 		throw new Error(`config.capacity.abandonedSlotReleaseAfterMs must be false or an integer from ${MIN_ABANDONED_SLOT_RELEASE_AFTER_MS} to ${MAX_ABANDONED_SLOT_RELEASE_AFTER_MS}`);
-	}
-}
-
-/** Validate the user-controlled TTL policy before it reaches the exclusion store. */
-// TEST:test/unit/pi-coding-agent-dir.test.ts[loads and applies model exclusion TTL config]
-function validateModelExclusionsConfig(value: unknown): void {
-	if (value === undefined) return;
-	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("config.modelExclusions must be a JSON object");
-	const defaultTtlMs = (value as Record<string, unknown>).defaultTtlMs;
-	if (defaultTtlMs !== undefined && (typeof defaultTtlMs !== "number" || !Number.isFinite(defaultTtlMs) || defaultTtlMs <= 0 || defaultTtlMs > MAX_MODEL_EXCLUSION_TTL_MS)) {
-		throw new Error(`config.modelExclusions.defaultTtlMs must be a finite positive number no greater than ${MAX_MODEL_EXCLUSION_TTL_MS}`);
 	}
 }
 
@@ -154,6 +149,13 @@ function validateConfig(config: Record<string, unknown>): void {
 		throw new Error('config.defaultSubagentContext must be "fresh" or "fork"');
 	}
 	validateForkContextConfig(config.forkContext);
+	if (config.checkpointBeforeDeadlineMs !== undefined
+		&& (typeof config.checkpointBeforeDeadlineMs !== "number"
+			|| !Number.isInteger(config.checkpointBeforeDeadlineMs)
+			|| config.checkpointBeforeDeadlineMs <= 0
+			|| config.checkpointBeforeDeadlineMs > 2_147_483_647)) {
+		throw new Error("config.checkpointBeforeDeadlineMs must be a positive integer no larger than 2147483647");
+	}
 	if (config.foregroundDetachShortcut !== undefined
 		&& (typeof config.foregroundDetachShortcut !== "string" || !isValidKeyId(config.foregroundDetachShortcut))) {
 		throw new Error("config.foregroundDetachShortcut must be a valid keybinding string such as \"ctrl+b\"");
@@ -170,14 +172,18 @@ function validateConfig(config: Record<string, unknown>): void {
 	if (config.resultScanLogging !== undefined && config.resultScanLogging !== "all" && config.resultScanLogging !== "activity" && config.resultScanLogging !== "off") {
 		throw new Error('config.resultScanLogging must be "all", "activity", or "off"');
 	}
+	if (config.toolActivation !== undefined && config.toolActivation !== "auto" && config.toolActivation !== "dynamic" && config.toolActivation !== "eager") {
+		throw new Error('config.toolActivation must be "auto", "dynamic", or "eager"');
+	}
 	validateMissionStoreConfig(config.missions);
 	validateAuthorityPolicy(config.authorityPolicy);
 	validatePermissionConfig(config.permissions);
 	validateScheduledRunsConfig(config.scheduledRuns);
+	validateDisabledFeatures(config.disabledFeatures);
 	validateFleetKeybindingsConfig(config.fleetKeybindings);
 	validateArtifactConfig(config.artifactConfig);
 	validateCapacityConfig(config.capacity);
-	validateModelExclusionsConfig(config.modelExclusions);
+	if (config.modelExclusions !== undefined) throw new Error("config.modelExclusions was removed; model failures are no longer persisted or used for automatic switching");
 	validateModelResponseAliases(config.modelResponseAliases);
 	validateMainWindowRendererConfig(config.mainWindowRenderer);
 	validateOrcaProgressTabsConfig(config.orcaProgressTabs);
@@ -210,28 +216,6 @@ export function updateConfig(updater: (config: ExtensionConfig) => ExtensionConf
 	return next;
 }
 
-/**
- * Resolve the default TTL that the process-wide exclusion store should use.
- *
- * @param config Extension configuration after validation.
- * @returns The configured TTL in milliseconds, or the built-in 24-hour default.
- */
-// TEST:test/unit/pi-coding-agent-dir.test.ts[loads and applies model exclusion TTL config]
-export function resolveModelExclusionTTL(config: Pick<ExtensionConfig, "modelExclusions">): number {
-	return config.modelExclusions?.defaultTtlMs ?? DEFAULT_MODEL_EXCLUSION_TTL_MS;
-}
-
-/**
- * Apply the configured exclusion policy to the process-wide model store.
- *
- * @param config Extension configuration after validation.
- * @returns Nothing.
- */
-// TEST:test/unit/pi-coding-agent-dir.test.ts[loads and applies model exclusion TTL config]
-export function applyModelExclusionsConfig(config: Pick<ExtensionConfig, "modelExclusions">): void {
-	setDefaultTTL(resolveModelExclusionTTL(config), { shortenExisting: config.modelExclusions?.defaultTtlMs !== undefined });
-}
-
 export function resolveAsyncByDefault(config: Pick<ExtensionConfig, "asyncByDefault">): boolean {
 	return config.asyncByDefault !== false;
 }
@@ -242,12 +226,9 @@ export function loadConfig(): ExtensionConfig {
 		return readConfigForUpdate(configPath);
 	} catch (error) {
 		if (error instanceof PrunedForkConfigError) throw error;
-		// Explicit route identity and worktree policies must not be silently
-		// discarded and replaced by the built-in defaults after validation fails.
 		try {
 			const raw = JSON.parse(fs.readFileSync(configPath, "utf-8")) as unknown;
-			if (raw && typeof raw === "object" && !Array.isArray(raw)
-				&& (Object.hasOwn(raw, "worktreeProvider") || Object.hasOwn(raw, "worktreeBranchPrefix") || Object.hasOwn(raw, "modelResponseAliases"))) throw error;
+			if (raw && typeof raw === "object" && !Array.isArray(raw) && FAIL_CLOSED_CONFIG_KEYS.some((key) => Object.hasOwn(raw, key))) throw error;
 		} catch (readError) {
 			if (readError === error) throw error;
 		}

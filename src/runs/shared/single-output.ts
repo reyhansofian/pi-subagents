@@ -2,7 +2,16 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Message } from "@earendil-works/pi-ai";
 import type { OutputMode, SavedOutputReference } from "../../shared/types.ts";
-import { hasMutationToolCapability } from "./completion-guard.ts";
+
+const READ_ONLY_OUTPUT_TOOLS = new Set([
+	"read", "grep", "find", "ls", "web_search", "fetch_content", "get_search_content",
+	"source_check", "intercom", "contact_supervisor", "structured_output", "watchdog_diff",
+]);
+
+function hasOutputWriteCapability(tools: string[] | undefined, mcpDirectTools: string[] | undefined): boolean {
+	if ((mcpDirectTools?.length ?? 0) > 0 || tools === undefined) return true;
+	return tools.some((tool) => !READ_ONLY_OUTPUT_TOOLS.has(tool));
+}
 
 export interface SingleOutputSnapshot {
 	exists: boolean;
@@ -38,14 +47,30 @@ export function extractChildWrittenOutput(
 	if (!messages?.length || !outputPath) return undefined;
 	const resolvedTarget = path.resolve(cwd ?? ".", outputPath);
 	const comparableTarget = process.platform === "win32" ? resolvedTarget.toLowerCase() : resolvedTarget;
+	const codemodeCalls = new Set<string>();
 	const successfulCallIds = new Set<string>();
 	for (const message of messages) {
+		if (message.role === "assistant") {
+			for (const part of message.content) if (part.type === "toolCall" && part.name === "codemode") codemodeCalls.add(part.id);
+		}
 		if (message.role === "toolResult" && message.isError === false && typeof message.toolCallId === "string") {
 			successfulCallIds.add(message.toolCallId);
 		}
 	}
 	let content: string | undefined;
 	for (const message of messages) {
+		if (message.role === "toolResult" && message.toolName === "codemode" && message.isError === false && codemodeCalls.has(message.toolCallId)) {
+			const nested = (message as typeof message & { nestedCalls?: { complete?: boolean; calls?: Array<{ name?: string; status?: string; arguments?: unknown }> } }).nestedCalls;
+			if (nested?.complete === true) for (const call of nested.calls ?? []) {
+				if (call.name !== "write" || call.status !== "ok") continue;
+				const args = call.arguments;
+				if (!args || typeof args !== "object" || Array.isArray(args)) continue;
+				const { path: writePath, content: written } = args as Record<string, unknown>;
+				if (typeof writePath !== "string" || typeof written !== "string") continue;
+				const resolvedWritePath = path.resolve(cwd ?? ".", writePath);
+				if ((process.platform === "win32" ? resolvedWritePath.toLowerCase() : resolvedWritePath) === comparableTarget) content = written;
+			}
+		}
 		if (message.role !== "assistant") continue;
 		for (const part of message.content) {
 			if (part.type !== "toolCall" || part.name !== "write" || !successfulCallIds.has(part.id)) continue;
@@ -93,7 +118,7 @@ interface OutputInstructionCapabilities {
 }
 
 function formatOutputPathInstruction(outputPath: string, capabilities?: OutputInstructionCapabilities): string {
-	const delivery = !capabilities || hasMutationToolCapability(capabilities.tools, capabilities.mcpDirectTools)
+	const delivery = !capabilities || hasOutputWriteCapability(capabilities.tools, capabilities.mcpDirectTools)
 		? `Write your findings to exactly this path: ${outputPath}`
 		: [
 			"Return the complete artifact in your final response.",
