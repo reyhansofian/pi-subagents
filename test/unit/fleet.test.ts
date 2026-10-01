@@ -1098,10 +1098,28 @@ describe("native subagent fleet", () => {
 			try {
 				const lines = component.render(100);
 				assert.ok(lines.some((line) => line.includes("FINAL ASYNC OUTPUT")));
-				assert.ok(lines.some((line) => line.includes("output-0.log")));
 				assert.ok(lines.some((line) => line.includes("worker") && line.includes("[fork]")));
-				assert.ok(lines.some((line) => line.includes("worker.jsonl")));
 				for (const line of lines) assert.ok(visibleWidth(line) <= 100, `line exceeded width: ${line}`);
+				// Read the detail pane through its scroll controls; absolute paths may wrap across rows or viewports.
+				const detailRows = (rendered: string[]) => rendered.slice(3, -3).map((line) => line.split("│")[2]!.trim());
+				let visible = lines;
+				while (true) {
+					component.handleInput("\x1b[5~");
+					const next = component.render(100);
+					if (next.join("\n") === visible.join("\n")) break;
+					visible = next;
+				}
+				const detail = detailRows(visible);
+				while (true) {
+					component.handleInput("\x1b[B");
+					const next = component.render(100);
+					if (next.join("\n") === visible.join("\n")) break;
+					visible = next;
+					detail.push(detailRows(visible).at(-1)!);
+				}
+				const fullDetail = detail.join("");
+				assert.ok(fullDetail.slice(fullDetail.indexOf("Artifacts:"), fullDetail.indexOf("Session:")).includes(path.join(asyncDir, "output-0.log")));
+				assert.ok(fullDetail.includes("worker.jsonl"));
 				tui.terminal.rows = 10;
 				assert.ok(component.render(100).length <= 8, "short-terminal render should fit the overlay's 85% height cap");
 				component.handleInput("\x1b[6~");
