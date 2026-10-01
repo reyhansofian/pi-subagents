@@ -3,6 +3,8 @@
 .pi-subagents/
 .DS_Store
 node_modules/
+/.devenv/
+/.direnv/
 dist-pkg/
 *.tgz
 .fallow/

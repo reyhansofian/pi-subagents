@@ -57,6 +57,44 @@ describe("resolveTempScopeId", () => {
 });
 
 describe("shared temp paths", () => {
+	it("gives concurrent test files distinct roots while their subprocesses inherit each file root", () => {
+		const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-test-files-"));
+		const loader = new URL("../support/isolated-temp-root.mjs", import.meta.url).href;
+		try {
+			const files = ["first", "second"].map((name) => {
+				const file = path.join(fixture, name + ".test.mjs");
+				fs.writeFileSync(file, `import { test } from "node:test";
+import { spawnSync } from "node:child_process";
+import { writeFileSync, statSync } from "node:fs";
+test("file root", () => {
+  const child = spawnSync(process.execPath, ["--import", ` + JSON.stringify(loader) + `, "--input-type=module", "--eval", "console.log(process.env.PI_SUBAGENTS_TEMP_ROOT)"], { env: process.env, encoding: "utf8" });
+  if (child.status !== 0) throw new Error(child.stderr);
+  writeFileSync(` + JSON.stringify(path.join(fixture, name + ".json")) + `, JSON.stringify({ root: process.env.PI_SUBAGENTS_TEMP_ROOT, childRoot: child.stdout.trim(), parentPid: process.env.PI_SUBAGENTS_TEST_PARENT_PID, pid: process.pid, context: process.env.NODE_TEST_CONTEXT, agentMode: statSync(process.env.HOME + "/.pi/agent").mode & 0o777 }));
+});`);
+				return file;
+			});
+			const env = { ...process.env, PI_SUBAGENTS_TEMP_ROOT: path.join(fixture, "base"), PI_SUBAGENTS_TEST_LOADER: "loaded" };
+			delete env.NODE_TEST_CONTEXT;
+			const result = spawnSync(process.execPath, ["--import", loader, "--test", ...files], {
+				encoding: "utf8",
+				env,
+			});
+			assert.equal(result.status, 0, result.stderr);
+			assert.equal(fs.existsSync(path.join(fixture, "first.json")), true, result.stdout + result.stderr);
+			const [first, second] = ["first", "second"].map((name) => JSON.parse(fs.readFileSync(path.join(fixture, name + ".json"), "utf8")) as { root: string; childRoot: string; parentPid: string; pid: number; context: string; agentMode: number });
+			for (const file of [first, second]) {
+				assert.ok(file.context);
+				assert.equal(file.childRoot, file.root);
+				assert.equal(file.parentPid, String(file.pid));
+				if (process.platform !== "win32") assert.equal(file.agentMode, 0o700);
+			}
+			assert.notEqual(first.root, second.root);
+			assert.equal(path.dirname(first.root), path.join(fixture, "base"));
+			assert.equal(path.dirname(second.root), path.join(fixture, "base"));
+		} finally {
+			fs.rmSync(fixture, { recursive: true, force: true });
+		}
+	});
 	it("uses the explicit temp root before shared paths resolve", () => {
 		const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-temp-override-"));
 		const override = path.join(fixture, "async state");
@@ -106,6 +144,7 @@ console.log(JSON.stringify({ agentDir: getAgentDir(), profilePath: path.join(pro
 				PI_SUBAGENTS_TEMP_ROOT: tempRoot,
 			};
 			delete env.PI_SUBAGENTS_TEST_LOADER;
+			delete env.NODE_TEST_CONTEXT;
 			const result = spawnSync(process.execPath, [
 				"--experimental-strip-types",
 				"--import", loaderUrl,
@@ -152,7 +191,7 @@ console.log(JSON.stringify({ agentDir: getAgentDir(), profilePath: path.join(pro
 		assert.equal(path.dirname(ASYNC_DIR), TEMP_ROOT_DIR);
 		assert.equal(path.dirname(CHAIN_RUNS_DIR), TEMP_ROOT_DIR);
 		assert.equal(path.dirname(TEMP_ARTIFACTS_DIR), TEMP_ROOT_DIR);
-		assert.match(path.basename(TEMP_ROOT_DIR), /^pi-subagents-/);
+		assert.match(path.basename(TEMP_ROOT_DIR), /^(?:pi-subagents-|f-)/);
 		assert.equal(path.basename(RESULTS_DIR), "async-subagent-results");
 		assert.equal(path.basename(ASYNC_DIR), "async-subagent-runs");
 		assert.equal(path.basename(CHAIN_RUNS_DIR), "chain-runs");
