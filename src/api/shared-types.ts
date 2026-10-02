@@ -10,6 +10,7 @@ export {
 	type AsyncStartedEvent,
 	type ControlEvent,
 	type Details,
+	type StatusAttention,
 	type ExecutionProjection,
 	type ExternalJobRunnerStatus,
 	type ExternalJobStatus,

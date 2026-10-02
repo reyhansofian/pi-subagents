@@ -401,6 +401,7 @@ export function inspectSubagentFleet(_params: FleetViewParams, deps: FleetViewDe
 	try {
 		asyncRuns = listAsyncRuns(deps.asyncDirRoot ?? DIRS.async, {
 			states: ["queued", "running"],
+			readOnly: true,
 			sessionId: deps.state?.currentSessionId ?? undefined,
 			resultsDir: deps.resultsDir ?? DIRS.results,
 			kill: deps.kill,

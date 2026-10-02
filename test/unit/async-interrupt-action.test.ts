@@ -1219,7 +1219,7 @@ describe("async interrupt action", () => {
 		}
 	});
 
-	it("shows terminal status when a result appears after display dismissal", async () => {
+	it("projects terminal result after dismissal without rewriting the persisted status", async () => {
 		const state = createState();
 		state.currentSessionId = "session";
 		const runId = `dismiss-then-complete-${Date.now().toString(36)}`;
@@ -1234,8 +1234,8 @@ describe("async interrupt action", () => {
 			assert.match(statusText, /State: complete/);
 			assert.doesNotMatch(statusText, /State: display-dismissed/);
 			const status = JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8"));
-			assert.equal(status.state, "complete");
-			assert.equal(status.displayDismissedAt, undefined);
+			assert.equal(status.state, "running");
+			assert.equal(typeof status.displayDismissedAt, "number");
 		} finally {
 			cleanup(runId, asyncDir);
 		}

@@ -8,6 +8,9 @@ import { updateActiveRunIndex } from "../../src/runs/background/active-run-index
 import { summarizeAsyncStatus } from "../../src/runs/background/async-status.ts";
 import { formatAsyncResultTranscript, formatAsyncRunTranscript } from "../../src/runs/background/fleet-view.ts";
 import { inspectSubagentStatus } from "../../src/runs/background/run-status.ts";
+import { runSubagent, type SubagentRunConfig } from "../../src/runs/background/subagent-runner.ts";
+import { resolveControlConfig } from "../../src/runs/shared/subagent-control.ts";
+import { createFakeChildSessions } from "../support/fake-child-session.ts";
 import { createNestedRoute, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
 import { claimRunFanoutBatch, createRunFanoutBudget, writeRunFanoutBudgetDescriptor } from "../../src/runs/shared/run-fanout-budget.ts";
 import { TEMP_ROOT_DIR, type AsyncStatus, type SubagentState } from "../../src/shared/types.ts";
@@ -25,6 +28,241 @@ function textContent(result: ReturnType<typeof inspectSubagentStatus>): string {
 }
 
 describe("async run status inspection", () => {
+	it("does not carry a failed child invocation into a resumed session attempt", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-attention-resume-"));
+		const queue = path.join(root, "queue");
+		const dir = path.join(root, "runs", "resume");
+		const finishFirst = path.join(root, "finish-first");
+		const finishSecond = path.join(root, "finish-second");
+		fs.mkdirSync(queue, { recursive: true });
+		fs.writeFileSync(path.join(queue, "pending-1.json"), JSON.stringify({ steps: [
+			{ jsonl: [
+				{ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "useful progress" }], stopReason: "toolUse" } },
+				{ type: "tool_execution_start", toolName: "exec", toolCallId: "failed-before-resume", args: {} },
+				{ type: "tool_execution_end", toolName: "exec", toolCallId: "failed-before-resume", isError: true },
+			] },
+			{ waitForPath: finishFirst, jsonl: [
+				{ type: "compaction_start" },
+				{ type: "message_end", message: { role: "assistant", content: [], stopReason: "aborted", errorMessage: "Connection reset by provider transport", usage: { output: 0 } } },
+			] },
+		] }));
+		fs.writeFileSync(path.join(queue, "pending-2.json"), JSON.stringify({ steps: [
+			{ waitForPath: finishSecond, jsonl: [{ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "resumed successfully" }], stopReason: "stop" } }] },
+		] }));
+		const children = createFakeChildSessions(() => queue);
+		const config: SubagentRunConfig = { id: "resume", steps: [{ agent: "worker", task: "test", sessionFile: path.join(root, "session.jsonl") }], resultPath: path.join(root, "result.json"), cwd: root, placeholder: "{previous}", asyncDir: dir, sessionId: "test-session", artifactConfig: { enabled: false }, share: false, controlConfig: resolveControlConfig(undefined, { needsAttentionAfterMs: 1 }) };
+		const running = runSubagent(config, children.factory);
+		const read = () => inspectSubagentStatus({ id: "resume" }, { asyncDirRoot: path.join(root, "runs"), resultsDir: root }).details.attention;
+		const until = async (predicate: () => boolean) => {
+			for (let i = 0; i < 150; i++) { if (predicate()) return; await new Promise((resolve) => setTimeout(resolve, 20)); }
+			assert.fail("resume producer transition not observed: " + JSON.stringify(read()));
+		};
+		try {
+			await until(() => read()?.steps[0]?.reason === "tool_error_stall");
+			assert.equal(read()?.steps[0]?.invocation?.toolCallId, "failed-before-resume");
+			fs.writeFileSync(finishFirst, "ok");
+			await until(() => children.sessions.length === 2 && read()?.steps[0]?.state === "none");
+			assert.equal(children.sessions[0]?.launch.storage.kind, "file");
+			assert.deepEqual(children.sessions[1]?.launch.storage, children.sessions[0]?.launch.storage, "resume reuses the retained session");
+			assert.match(children.sessions[1]?.task ?? "", /prior run ended from a provider\/transport abort/);
+			assert.equal(read()?.steps[0]?.state, "none");
+			assert.notEqual(read()?.steps[0]?.invocation?.toolCallId, "failed-before-resume");
+			fs.writeFileSync(finishSecond, "ok");
+			await running;
+			assert.equal(read()?.state, "unknown");
+		} finally {
+			for (const file of [finishFirst, finishSecond]) fs.writeFileSync(file, "ok");
+			await running;
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+	it("invalidates failed calls on a new child attempt without clearing a concurrent sibling", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-attention-siblings-"));
+		const queue = path.join(root, "queue");
+		const dir = path.join(root, "runs", "siblings");
+		fs.mkdirSync(queue, { recursive: true });
+		const retry = path.join(root, "retry");
+		const finish = path.join(root, "finish");
+		const done = path.join(root, "done");
+		fs.writeFileSync(path.join(queue, "pending-1.json"), JSON.stringify({ matchArgIncludes: "alpha", steps: [
+			{ jsonl: [{ type: "tool_execution_start", toolName: "exec", toolCallId: "failed-alpha", args: {} }, { type: "tool_execution_end", toolName: "exec", toolCallId: "failed-alpha", isError: true }] },
+			{ waitForPath: retry, jsonl: [{ type: "auto_retry_start" }] },
+			{ waitForPath: done, jsonl: [{ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "alpha finished" }] } }] },
+		] }));
+		fs.writeFileSync(path.join(queue, "pending-2.json"), JSON.stringify({ matchArgIncludes: "beta", steps: [
+			{ jsonl: [{ type: "tool_execution_start", toolName: "contact_supervisor", toolCallId: "waiting-beta", args: { reason: "need_decision" } }] },
+			{ waitForPath: finish, jsonl: [{ type: "tool_execution_end", toolName: "contact_supervisor", toolCallId: "waiting-beta" }, { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "beta finished" }] } }] },
+		] }));
+		const config: SubagentRunConfig = { id: "siblings", steps: [{ parallel: [{ agent: "worker", task: "alpha" }, { agent: "worker", task: "beta" }] }], resultPath: path.join(root, "result.json"), cwd: root, placeholder: "{previous}", asyncDir: dir, sessionId: "test-session", artifactConfig: { enabled: false }, share: false, controlConfig: resolveControlConfig(undefined, { needsAttentionAfterMs: 1 }) };
+		const running = runSubagent(config, createFakeChildSessions(() => queue).factory);
+		const read = () => inspectSubagentStatus({ id: "siblings" }, { asyncDirRoot: path.join(root, "runs"), resultsDir: root }).details.attention;
+		const until = async (predicate: () => boolean) => {
+			for (let i = 0; i < 120; i++) { if (predicate()) return; await new Promise((resolve) => setTimeout(resolve, 25)); }
+			assert.fail("producer did not publish expected sibling transition: " + JSON.stringify(read()) + " status=" + fs.readFileSync(path.join(dir, "status.json"), "utf8"));
+		};
+		try {
+			await until(() => read()?.steps[0]?.reason === "tool_error_stall" && read()?.steps[1]?.invocation?.toolCallId === "waiting-beta");
+			assert.equal(read()?.steps[0]?.invocation?.toolCallId, "failed-alpha");
+			fs.writeFileSync(retry, "ok");
+			await until(() => read()?.steps[0]?.state === "none");
+			assert.equal(read()?.steps[1]?.invocation?.toolCallId, "waiting-beta");
+			fs.writeFileSync(finish, "ok");
+			await until(() => read()?.steps[1]?.state === "unknown");
+			assert.notEqual(read()?.steps[1]?.invocation?.toolCallId, "waiting-beta");
+			fs.writeFileSync(done, "ok");
+			await running;
+			assert.equal(read()?.state, "unknown");
+		} finally {
+			for (const file of [retry, finish, done]) fs.writeFileSync(file, "ok");
+			await running;
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+	it("promotes another overdue tool when the threshold invocation finishes", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-attention-threshold-"));
+		const queue = path.join(root, "queue");
+		const dir = path.join(root, "runs", "threshold");
+		fs.mkdirSync(queue, { recursive: true });
+		const finish = path.join(root, "finish");
+		const supervisor = path.join(root, "supervisor");
+		const done = path.join(root, "done");
+		fs.writeFileSync(path.join(queue, "default-response.json"), JSON.stringify({ steps: [
+			{ jsonl: ["first", "second"].map((toolCallId) => ({ type: "tool_execution_start", toolName: "read", toolCallId, args: {} })) },
+			{ waitForPath: finish, jsonl: [{ type: "tool_execution_end", toolName: "read", toolCallId: "first" }] },
+			{ waitForPath: supervisor, jsonl: [{ type: "tool_execution_start", toolName: "contact_supervisor", toolCallId: "supervisor-call", args: { reason: "need_decision" } }, { type: "tool_execution_end", toolName: "read", toolCallId: "second" }] },
+			{ waitForPath: done, jsonl: [{ type: "tool_execution_end", toolName: "contact_supervisor", toolCallId: "supervisor-call" }, { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }] } }] },
+		] }));
+		const config: SubagentRunConfig = { id: "threshold", steps: [{ agent: "worker", task: "test" }], resultPath: path.join(root, "result.json"), cwd: root, placeholder: "{previous}", asyncDir: dir, sessionId: "test-session", artifactConfig: { enabled: false }, share: false, controlConfig: resolveControlConfig(undefined, { activeNoticeAfterMs: 1, needsAttentionAfterMs: 60_000 }) };
+		const running = runSubagent(config, createFakeChildSessions(() => queue).factory);
+		const read = () => inspectSubagentStatus({ id: "threshold" }, { asyncDirRoot: path.join(root, "runs"), resultsDir: root }).details.attention;
+		try {
+			for (let i = 0; i < 120 && read()?.steps[0]?.invocation?.toolCallId !== "first"; i++) await new Promise((resolve) => setTimeout(resolve, 25));
+			assert.equal(read()?.steps[0]?.reason, "tool_open_threshold");
+			fs.writeFileSync(finish, "ok");
+			for (let i = 0; i < 120 && read()?.steps[0]?.invocation?.toolCallId !== "second"; i++) await new Promise((resolve) => setTimeout(resolve, 25));
+			assert.equal(read()?.steps[0]?.invocation?.toolCallId, "second");
+			fs.writeFileSync(supervisor, "ok");
+			for (let i = 0; i < 120 && (JSON.parse(fs.readFileSync(path.join(dir, "status.json"), "utf8")).steps[0].recentTools?.length ?? 0) < 2; i++) await new Promise((resolve) => setTimeout(resolve, 25));
+			assert.equal(read()?.steps[0]?.invocation?.toolCallId, "supervisor-call", "threshold completion cannot erase a concurrent request");
+			fs.writeFileSync(done, "ok");
+			await running;
+		} finally {
+			for (const release of [finish, supervisor, done]) fs.writeFileSync(release, "ok");
+			await running;
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+	it("persists and replaces actual child call evidence at the producer boundary", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-attention-producer-"));
+		try {
+			const dir = path.join(root, "runs", "produced");
+			const queue = path.join(root, "queue");
+			fs.mkdirSync(dir, { recursive: true });
+			fs.writeFileSync(path.join(dir, "status.json"), JSON.stringify({ runId: "produced", mode: "single", state: "failed", startedAt: 1, steps: [{ agent: "worker", status: "failed", attentionEvidence: { state: "current", reason: "tool_error_stall", toolName: "exec", toolCallId: "old-failure" } }] }));
+			fs.mkdirSync(queue, { recursive: true });
+			const releaseFirst = path.join(root, "release-first");
+			const releaseOrdinary = path.join(root, "release-ordinary");
+			const releaseMessage = path.join(root, "release-message");
+			const releaseSecond = path.join(root, "release-second");
+			const releaseFinish = path.join(root, "release-finish");
+			const releaseDone = path.join(root, "release-done");
+			const request = (toolCallId: string) => ({ type: "tool_execution_start", toolName: "contact_supervisor", toolCallId, args: { reason: "need_decision", secret: "must-not-persist-in-attention" } });
+			fs.writeFileSync(path.join(queue, "default-response.json"), JSON.stringify({ steps: [
+				{ jsonl: [request("child-first")] },
+				{ waitForPath: releaseOrdinary, jsonl: [{ type: "tool_execution_start", toolName: "read", toolCallId: "ordinary", args: { path: "README.md" } }] },
+				{ waitForPath: releaseMessage, jsonl: [{ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "still waiting" }] } }] },
+				{ waitForPath: releaseFirst, jsonl: [request("child-second")] },
+				{ waitForPath: releaseSecond, jsonl: [{ type: "tool_execution_end", toolName: "contact_supervisor", toolCallId: "child-second" }] },
+				{ waitForPath: releaseFinish, jsonl: [{ type: "tool_execution_end", toolName: "contact_supervisor", toolCallId: "child-first" }, { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "finished" }] } }] },
+				{ waitForPath: releaseDone },
+			] }));
+			const config: SubagentRunConfig = { id: "produced", steps: [{ agent: "worker", task: "test" }], resultPath: path.join(root, "result.json"), cwd: root, placeholder: "{previous}", asyncDir: dir, sessionId: "test-session", artifactConfig: { enabled: false }, share: false };
+			const running = runSubagent(config, createFakeChildSessions(() => queue).factory);
+			const read = () => inspectSubagentStatus({ id: "produced" }, { asyncDirRoot: path.join(root, "runs"), resultsDir: root }).details.attention;
+			const awaitCall = async (id: string) => {
+				for (let i = 0; i < 150; i++) {
+					const evidence = read();
+					if (evidence?.steps[0]?.invocation?.state === "known" && evidence.steps[0].invocation.toolCallId === id) return evidence;
+					await new Promise((resolve) => setTimeout(resolve, 20));
+				}
+				assert.fail("child invocation " + id + " not published");
+			};
+			try {
+				assert.equal((await awaitCall("child-first")).steps[0]?.reason, "supervisor_request");
+				assert.equal(JSON.parse(fs.readFileSync(path.join(dir, "status.json"), "utf8")).steps[0].attentionEvidence.toolCallId, "child-first");
+				fs.writeFileSync(releaseOrdinary, "ok");
+				for (let i = 0; i < 150 && JSON.parse(fs.readFileSync(path.join(dir, "status.json"), "utf8")).steps[0].toolCount < 2; i++) await new Promise((resolve) => setTimeout(resolve, 20));
+				assert.equal(read()?.steps[0]?.invocation?.toolCallId, "child-first", "ordinary concurrent start cannot clear a live request");
+				fs.writeFileSync(releaseMessage, "ok");
+				for (let i = 0; i < 150 && JSON.parse(fs.readFileSync(path.join(dir, "status.json"), "utf8")).steps[0].turnCount < 1; i++) await new Promise((resolve) => setTimeout(resolve, 20));
+				assert.equal(read()?.steps[0]?.invocation?.toolCallId, "child-first", "assistant continuation cannot clear a live request");
+				fs.writeFileSync(releaseFirst, "ok");
+				assert.equal((await awaitCall("child-second")).steps[0]?.invocation?.state, "known");
+				assert.equal(JSON.stringify(JSON.parse(fs.readFileSync(path.join(dir, "status.json"), "utf8")).steps[0].attentionEvidence).includes("must-not-persist-in-attention"), false);
+				fs.writeFileSync(releaseSecond, "ok");
+				assert.equal((await awaitCall("child-first")).steps[0]?.invocation?.state, "known", "ending the second call restores the first");
+				fs.writeFileSync(releaseFinish, "ok");
+				for (let i = 0; i < 150 && read()?.state !== "none"; i++) await new Promise((resolve) => setTimeout(resolve, 20));
+				assert.equal(read()?.state, "none", "resolution clears the persisted call before completion");
+				fs.writeFileSync(releaseDone, "ok");
+				await running;
+				assert.equal(read()?.state, "unknown", "terminal evidence is not live");
+				assert.equal(JSON.parse(fs.readFileSync(path.join(dir, "status.json"), "utf8")).steps[0].attentionEvidence, undefined);
+				assert.equal(JSON.stringify(read()).includes("must-not-persist-in-attention"), false);
+			} finally { for (const release of [releaseOrdinary, releaseMessage, releaseFirst, releaseSecond, releaseFinish, releaseDone]) fs.writeFileSync(release, "ok"); await running; }
+		} finally { fs.rmSync(root, { recursive: true, force: true }); }
+	});
+	it("projects persisted attention by child invocation without mutating the run", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-attention-status-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const dir = path.join(asyncRoot, "attention-run");
+			fs.mkdirSync(dir, { recursive: true });
+			const status = { runId: "attention-run", toolCallId: "host-launch", mode: "parallel", state: "running", startedAt: 1, pid: 99999, steps: [
+				{ childId: "first", agent: "worker", status: "running", attentionEvidence: { state: "current", reason: "tool_open_threshold", toolName: "exec", toolCallId: "child-2" } },
+				{ childId: "second", agent: "worker", status: "running", attentionEvidence: { state: "current", reason: "tool_error_stall", toolName: "exec", toolCallId: "child-sibling" } },
+			] };
+			const file = path.join(dir, "status.json");
+			fs.writeFileSync(file, JSON.stringify(status));
+			let probes = 0;
+			const deps = { asyncDirRoot: asyncRoot, resultsDir: path.join(root, "results"), kill: () => { probes++; return false; } };
+			for (let i = 0; i < 2; i++) {
+				const result = inspectSubagentStatus({ id: "attention-run" }, deps);
+				assert.deepEqual(result.details.attention, { runId: "attention-run", state: "current", steps: [
+					{ index: 0, childId: "first", state: "current", reason: "tool_open_threshold", invocation: { state: "known", toolName: "exec", toolCallId: "child-2" } },
+					{ index: 1, childId: "second", state: "current", reason: "tool_error_stall", invocation: { state: "known", toolName: "exec", toolCallId: "child-sibling" } },
+				] });
+			}
+			assert.equal(probes, 0);
+			assert.equal(fs.readFileSync(file, "utf8"), JSON.stringify(status));
+			updateActiveRunIndex(dir, "running");
+			assert.match(textContent(inspectSubagentStatus({}, deps)), /attention-run/);
+			assert.match(textContent(inspectSubagentStatus({ view: "fleet" }, deps)), /attention-run/);
+			assert.equal(probes, 0);
+			assert.equal(fs.readFileSync(file, "utf8"), JSON.stringify(status));
+			fs.writeFileSync(file, JSON.stringify({ ...status, steps: [
+				{ childId: "first", agent: "worker", status: "running", attentionEvidence: { state: "none" } },
+				{ childId: "second", agent: "worker", status: "running", attentionEvidence: { state: "none" } },
+			] }));
+			assert.equal(inspectSubagentStatus({ id: "attention-run" }, deps).details.attention?.state, "none");
+			fs.writeFileSync(file, JSON.stringify({ ...status, steps: [
+				{ childId: "first", agent: "worker", status: "running", attentionEvidence: { state: "current", reason: "idle" } },
+				{ childId: "second", agent: "worker", status: "running" },
+			] }));
+			assert.deepEqual(inspectSubagentStatus({ id: "attention-run" }, deps).details.attention?.steps.map((step) => [step.state, step.invocation?.state]), [["current", "unknown"], ["unknown", undefined]]);
+			fs.writeFileSync(file, JSON.stringify({ ...status, steps: [
+				{ childId: "first", agent: "worker", status: "running", attentionEvidence: { state: "none" } },
+				{ childId: "second", agent: "worker", status: "running" },
+			] }));
+			assert.equal(inspectSubagentStatus({ id: "attention-run" }, deps).details.attention?.state, "unknown");
+			fs.writeFileSync(file, JSON.stringify({ ...status, state: "failed" }));
+			assert.equal(inspectSubagentStatus({ id: "attention-run" }, deps).details.attention?.state, "unknown");
+			fs.writeFileSync(file, JSON.stringify(status));
+			fs.mkdirSync(deps.resultsDir);
+			fs.writeFileSync(path.join(deps.resultsDir, "attention-run.json"), JSON.stringify({ runId: "attention-run", success: true }));
+			assert.equal(inspectSubagentStatus({ id: "attention-run" }, deps).details.attention?.state, "unknown", "terminal result outranks stale running attention");
+		} finally { fs.rmSync(root, { recursive: true, force: true }); }
+	});
 	it("preserves short transcript ANSI escaping and the unindented binary placeholder", () => {
 		const text = formatAsyncResultTranscript({
 			id: "short-preview", state: "complete",
@@ -213,6 +451,7 @@ describe("async run status inspection", () => {
 			for (const workflowReceipt of [{ path: "/opaque/published.json", receipt: {} }, undefined, { path: 42 }, []]) {
 				fs.writeFileSync(resultPath, JSON.stringify({ runId: "receipt-run", mode: "workflow", success: true, workflowReceipt }));
 				const result = inspectSubagentStatus({ id: "receipt-run" }, { asyncDirRoot: path.join(root, "absent"), resultsDir: root });
+				assert.deepEqual(result.details.attention, { runId: "receipt-run", state: "unknown", steps: [] });
 				const expected = workflowReceipt && "path" in workflowReceipt && typeof workflowReceipt.path === "string" ? workflowReceipt.path : undefined;
 				assert.equal(result.details?.workflowReceiptPath, expected);
 				assert.equal(textContent(result).includes("Workflow receipt:"), expected !== undefined);
@@ -223,7 +462,7 @@ describe("async run status inspection", () => {
 		delete (globalThis as Record<PropertyKey, unknown>)[Symbol.for(EXTERNAL_JOB_PROVIDER_REGISTRY_KEY)];
 	});
 
-	it("repairs stale running status and reports diagnosis plus result path", () => {
+	it("inspects stale running status without reconciling", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-run-status-stale-"));
 		let budgetDirectory: string | undefined;
 		try {
@@ -233,7 +472,8 @@ describe("async run status inspection", () => {
 			fs.mkdirSync(asyncDir, { recursive: true });
 			const sessionFile = path.join(root, "session.jsonl");
 			fs.writeFileSync(sessionFile, "", "utf-8");
-			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+			const statusPath = path.join(asyncDir, "status.json");
+			fs.writeFileSync(statusPath, JSON.stringify({
 				runId: "run-stale",
 				sessionId: "session-current",
 				mode: "single",
@@ -259,16 +499,13 @@ describe("async run status inspection", () => {
 
 			const text = textContent(result);
 			assert.equal(result.isError, undefined);
-			assert.match(text, /State: failed/);
+			assert.match(text, /State: running/);
 			assert.match(text, /Run fan-out: 1\/64 used, 63 remaining/);
 			assert.deepEqual(result.details.runFanoutBudget, { used: 1, limit: 64, remaining: 63 });
-			assert.match(text, /Diagnosis: Async runner process 12345 exited or disappeared/);
-			assert.match(text, new RegExp(`Result: ${path.join(resultsDir, "run-stale.json").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
-			assert.match(text, /Step 1: scout failed, error: Async runner process 12345 exited or disappeared/);
-			assert.match(text, /Revive: subagent\(\{ action: "resume", id: "run-stale", message: "\.\.\." \}\)/);
-			const resultJson = JSON.parse(fs.readFileSync(path.join(resultsDir, "run-stale.json"), "utf-8"));
-			assert.equal(resultJson.success, false);
-			assert.equal(resultJson.results[0].sessionFile, sessionFile);
+			assert.match(text, /Step 1: scout running/);
+			assert.equal(result.details.attention?.state, "unknown");
+			assert.equal(fs.existsSync(path.join(resultsDir, "run-stale.json")), false);
+			assert.equal(JSON.parse(fs.readFileSync(statusPath, "utf-8")).state, "running");
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 			if (budgetDirectory) fs.rmSync(budgetDirectory, { recursive: true, force: true });
@@ -1204,7 +1441,7 @@ describe("async run status inspection", () => {
 		}
 	});
 
-	it("repairs stale nested async descendants before rendering root status", () => {
+	it("projects stale nested descendants without reconciling them", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-run-status-stale-nested-"));
 		const route = createNestedRoute("run-stale-nested-root");
 		const nestedAsyncDir = path.join(TEMP_ROOT_DIR, "nested-subagent-runs", "run-stale-nested-root", "nested-stale");
@@ -1260,9 +1497,8 @@ describe("async run status inspection", () => {
 
 			const text = textContent(result);
 			assert.equal(result.isError, undefined);
-			assert.match(text, /↳ reviewer \[nested-stale\] failed/);
-			assert.match(text, /1\. reviewer failed \| error: Async runner process 54321 exited or disappeared/);
-			assert.ok(fs.existsSync(path.join(resultsDir, "nested", "run-stale-nested-root", "nested-stale.json")));
+			assert.match(text, /↳ reviewer \[nested-stale\] running/);
+			assert.equal(fs.existsSync(path.join(resultsDir, "nested", "run-stale-nested-root", "nested-stale.json")), false);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 			fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });

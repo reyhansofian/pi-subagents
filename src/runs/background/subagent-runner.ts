@@ -471,6 +471,7 @@ function setOptionalProperty<T extends object, K extends keyof T>(target: T, key
 }
 
 function resetStepLiveDetail(step: RunnerStatusStep): void {
+	step.attentionEvidence = { state: "none" };
 	delete step.currentTool;
 	delete step.currentToolArgs;
 	delete step.currentToolStartedAt;
@@ -2242,6 +2243,11 @@ export async function runSubagent(
 	};
 	const writeStatusPayloadNow = (): void => {
 		if (finalResultPublication) return;
+		if (statusPayload.state !== "running" || !controlConfig.enabled) {
+			for (const step of statusPayload.steps) delete step.attentionEvidence;
+		} else {
+			for (const step of statusPayload.steps) if (step.status !== "running") delete step.attentionEvidence;
+		}
 		refreshWorkflowGraph();
 		writeRecoverableStatusResult();
 		runPersistence.write(statusPath, { ...statusPayload });
@@ -2638,11 +2644,20 @@ export async function runSubagent(
 	const mutatingFailureStates = initialStatusSteps.map(() => createMutatingFailureState());
 	const toolErrorWatches = initialStatusSteps.map(() => createToolErrorWatch());
 	const failedToolAttentionIds: Array<string | undefined> = initialStatusSteps.map(() => undefined);
-	const pendingToolResults: Array<{ tool: string; path?: string; mutates: boolean; startedAt?: number } | undefined> = initialStatusSteps.map(() => undefined);
+	const pendingToolResults: Array<{ tool: string; toolCallId?: string; path?: string; mutates: boolean; startedAt?: number } | undefined> = initialStatusSteps.map(() => undefined);
 	type ActiveToolCall = { key: string; tool: string; args: string; startedAt: number; path?: string; blocksSupervisor: boolean };
 	const activeToolCalls = initialStatusSteps.map(() => new Map<string, ActiveToolCall>());
 	const activeToolKeysByName = initialStatusSteps.map(() => new Map<string, string[]>());
 	const activeToolSequences = initialStatusSteps.map(() => 0);
+	const recordAttention = (index: number, reason: Exclude<import("../../shared/types.ts").AttentionEvidence, { state: "none" }>["reason"], toolName?: string, toolCallId?: string): void => {
+		const step = statusPayload.steps[index];
+		if (!step) return;
+		step.attentionEvidence = {
+			state: "current", reason,
+			...(toolName && toolName.length <= 128 ? { toolName } : {}),
+			...(toolCallId && toolCallId.length <= 256 ? { toolCallId } : {}),
+		};
+	};
 	const latestActiveToolCall = (flatIndex: number): ActiveToolCall | undefined => [...(activeToolCalls[flatIndex]?.values() ?? [])].sort((left, right) => right.startedAt - left.startedAt)[0];
 	const refreshStepCurrentTool = (flatIndex: number): void => {
 		const step = statusPayload.steps[flatIndex];
@@ -2760,6 +2775,7 @@ export async function runSubagent(
 		if (!target) return false;
 		const previous = step.activityState;
 		step.activityState = "needs_attention";
+		recordAttention(flatIndex, "tool_open_threshold", target.tool, target.key.startsWith("id:") ? target.key.slice(3) : undefined);
 		statusPayload.activityState = "needs_attention";
 		const toolDurationMs = Math.max(0, now - target.startedAt);
 		appendControlEvent(buildControlEvent(omitUndefinedProperties({
@@ -2973,15 +2989,39 @@ export async function runSubagent(
 		const step = statusPayload.steps[flatIndex];
 		if (!step) return;
 		const previousActivityState = step.activityState;
+		const previousAttentionEvidence = step.attentionEvidence;
 		const now = Date.now();
 		const errorWatch = toolErrorWatches[flatIndex];
-		errorWatch?.observe(event, now, event.type === "tool_execution_start" && event.toolName ? resolveCurrentPath(event.toolName, event.args) : undefined);
-		if (failedToolAttentionIds[flatIndex] && !errorWatch?.due(now, 0)) {
+		if (event.type === "agent_start" || event.type === "auto_retry_start") {
+			// A new attempt cannot inherit a previous attempt's failed-call evidence.
+			supervisorAttentionSteps.delete(flatIndex);
+			errorWatch?.clear();
 			failedToolAttentionIds[flatIndex] = undefined;
+			pendingToolResults[flatIndex] = undefined;
+			activeToolCalls[flatIndex]?.clear();
+			activeToolKeysByName[flatIndex]?.clear();
 			if (step.activityState === "needs_attention") {
 				delete step.activityState;
 				syncAggregateActivityState();
 			}
+			step.attentionEvidence = { state: "none" };
+		}
+		errorWatch?.observe(event, now, event.type === "tool_execution_start" && event.toolName ? resolveCurrentPath(event.toolName, event.args) : undefined);
+		if (failedToolAttentionIds[flatIndex] && !errorWatch?.due(now, 0) && !supervisorAttentionSteps.has(flatIndex)) {
+			failedToolAttentionIds[flatIndex] = undefined;
+			step.attentionEvidence = { state: "none" };
+			if (step.activityState === "needs_attention") {
+				delete step.activityState;
+				syncAggregateActivityState();
+			}
+		}
+		if ((event.type === "tool_execution_start" || event.type === "compaction_start" || event.type === "agent_settled" || (event.type === "message_end" && event.message?.role === "assistant"))
+			&& (event.type === "agent_settled" || !supervisorAttentionSteps.has(flatIndex))) {
+			if (step.attentionEvidence?.state === "current" && step.attentionEvidence.reason !== "supervisor_request" && step.activityState === "needs_attention") {
+				delete step.activityState;
+				syncAggregateActivityState();
+			}
+			step.attentionEvidence = { state: "none" };
 		}
 		statusPayload.currentStep = flatIndex;
 		if (isChildWatchdogStatusEvent(event)) {
@@ -3020,17 +3060,18 @@ export async function runSubagent(
 				step.toolBudget = toolBudgetState(configuredToolBudget, step.toolCount);
 				statusPayload.toolBudget = step.toolBudget;
 			}
-			recordActiveToolCall(flatIndex, { toolCallId: (event as { toolCallId?: unknown }).toolCallId, toolName: event.toolName }, { argsPreview, currentPath, blocksSupervisor, now });
-			pendingToolResults[flatIndex] = omitUndefinedProperties({ tool: event.toolName, path: currentPath, mutates, startedAt: now });
+			recordActiveToolCall(flatIndex, { toolCallId: event.toolCallId, toolName: event.toolName }, { argsPreview, currentPath, blocksSupervisor, now });
+			pendingToolResults[flatIndex] = omitUndefinedProperties({ tool: event.toolName, toolCallId: event.toolCallId, path: currentPath, mutates, startedAt: now });
 			statusPayload.toolCount = (statusPayload.toolCount ?? 0) + 1;
 			syncTopLevelCurrentTool();
-			if (controlConfig.enabled && blocksSupervisor && step.activityState !== "needs_attention") {
+			if (controlConfig.enabled && blocksSupervisor) {
 				const previous = step.activityState;
 				step.activityState = "needs_attention";
-				supervisorAttentionSteps.set(flatIndex, previous);
+				recordAttention(flatIndex, "supervisor_request", event.toolName, event.toolCallId);
+				if (!supervisorAttentionSteps.has(flatIndex)) supervisorAttentionSteps.set(flatIndex, previous);
 				currentActivityState = "needs_attention";
 				statusPayload.activityState = "needs_attention";
-				appendControlEvent(buildControlEvent(omitUndefinedProperties({
+				if (previous !== "needs_attention") appendControlEvent(buildControlEvent(omitUndefinedProperties({
 					type: "needs_attention",
 					from: previous,
 					to: "needs_attention",
@@ -3051,6 +3092,15 @@ export async function runSubagent(
 			}
 		} else if (event.type === "tool_execution_end") {
 			const endedTool = removeActiveToolCall(flatIndex, event);
+			if (endedTool && step.attentionEvidence?.state === "current" && step.attentionEvidence.reason === "tool_open_threshold"
+				&& step.attentionEvidence.toolCallId === (endedTool.key.startsWith("id:") ? endedTool.key.slice(3) : undefined)) {
+				step.attentionEvidence = { state: "none" };
+				if (!supervisorAttentionSteps.has(flatIndex)) {
+					delete step.activityState;
+					syncAggregateActivityState();
+					maybeEmitOpenToolAttention(flatIndex, now);
+				}
+			}
 			if (endedTool) {
 				step.recentTools ??= [];
 				step.recentTools.push({ tool: endedTool.tool, args: endedTool.args, endMs: now });
@@ -3058,14 +3108,24 @@ export async function runSubagent(
 			refreshStepCurrentTool(flatIndex);
 			const supervisorPreviousActivity = supervisorAttentionSteps.get(flatIndex);
 			const stillBlockingSupervisor = [...(activeToolCalls[flatIndex]?.values() ?? [])].some((active) => active.blocksSupervisor);
+			if (stillBlockingSupervisor) {
+				const remaining = [...(activeToolCalls[flatIndex]?.values() ?? [])].filter((active) => active.blocksSupervisor).at(-1)!;
+				recordAttention(flatIndex, "supervisor_request", remaining.tool, remaining.key.startsWith("id:") ? remaining.key.slice(3) : undefined);
+			}
 			const clearedSupervisorAttention = endedTool?.blocksSupervisor && !stillBlockingSupervisor ? supervisorAttentionSteps.delete(flatIndex) : false;
 			if (clearedSupervisorAttention && step.activityState === "needs_attention") {
+				step.attentionEvidence = { state: "none" };
 				setOptionalProperty(step, "activityState", supervisorPreviousActivity);
+				if (supervisorPreviousActivity === "needs_attention") {
+					delete step.activityState;
+					maybeEmitOpenToolAttention(flatIndex, now);
+				}
 				syncAggregateActivityState();
 			}
 			syncTopLevelCurrentTool();
 		} else if (event.type === "tool_result_end" && event.message) {
 			const toolSnapshot = pendingToolResults[flatIndex];
+			const resultCallId = (event.message as { toolCallId?: unknown }).toolCallId ?? event.toolCallId;
 			pendingToolResults[flatIndex] = undefined;
 			const resultText = extractTextFromContent(event.message.content);
 			if (toolSnapshot && resultText.includes("Tool budget hard limit reached")) {
@@ -3089,6 +3149,7 @@ export async function runSubagent(
 				if (controlConfig.enabled && shouldEscalateMutatingFailures(state, controlConfig.failedToolAttemptsBeforeAttention) && step.activityState !== "needs_attention") {
 					const previous = step.activityState;
 					step.activityState = "needs_attention";
+					recordAttention(flatIndex, "tool_failures", toolSnapshot.tool, toolSnapshot.toolCallId === resultCallId ? toolSnapshot.toolCallId : undefined);
 					statusPayload.activityState = "needs_attention";
 					appendControlEvent(buildControlEvent(omitUndefinedProperties({
 						type: "needs_attention",
@@ -3140,7 +3201,7 @@ export async function runSubagent(
 		statusPayload.lastUpdate = now;
 		maybeEmitActiveLongRunning(flatIndex, now);
 		// A sibling may keep aggregate attention unchanged; publish this step's transition.
-		writeStatusPayload(step.activityState !== previousActivityState);
+		writeStatusPayload(step.activityState !== previousActivityState || step.attentionEvidence !== previousAttentionEvidence);
 	};
 	const updateRunnerActivityState = (now: number, skipExternalProbeIndex?: number): boolean => {
 		if (!controlConfig.enabled) return false;
@@ -3154,6 +3215,7 @@ export async function runSubagent(
 				failedToolAttentionIds[index] = failure.toolCallId;
 				const previous = step.activityState;
 				step.activityState = "needs_attention";
+				recordAttention(index, "tool_error_stall", failure.tool, failure.toolCallId);
 				appendControlEvent(buildControlEvent({ to: "needs_attention", from: previous, runId: id, agent: step.agent, index, ts: now, reason: "tool_error_stall", message: step.agent + " needs attention after failed tool '" + failure.tool + "' without continuation", currentTool: failure.tool, toolCallId: failure.toolCallId, currentPath: failure.path, recentFailureSummary: failure.summary }));
 				changed = true;
 			}
@@ -3198,6 +3260,7 @@ export async function runSubagent(
 				}
 				const previous = step.activityState;
 				step.activityState = "needs_attention";
+				if (previous !== "needs_attention") recordAttention(index, "idle");
 				if (previous !== "needs_attention") {
 					appendControlEvent(buildControlEvent(omitUndefinedProperties({
 						from: previous,

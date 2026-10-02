@@ -400,6 +400,23 @@ export interface ControlEvent {
 	taskPreview?: string;
 }
 
+/** A bounded, producer-owned snapshot; absence on legacy steps means unavailable, not healthy. */
+export type AttentionEvidence =
+	| { state: "none" }
+	| { state: "current"; reason: "idle" | "tool_failures" | "tool_error_stall" | "supervisor_request" | "tool_open_threshold"; toolName?: string; toolCallId?: string };
+
+export interface StatusAttention {
+	runId: string;
+	state: "current" | "none" | "unknown";
+	steps: Array<{
+		index: number;
+		childId?: string;
+		state: "current" | "none" | "unknown";
+		reason?: Exclude<AttentionEvidence, { state: "none" }>["reason"];
+		invocation?: { state: "known"; toolName: string; toolCallId: string } | { state: "unknown" };
+	}>;
+}
+
 export type SubagentResultStatus = "running" | "completed" | "failed" | "paused" | "stopped" | "detached";
 export type SubagentOutputState = "present" | "absent" | "unknown";
 export type SubagentRunMode = "single" | "parallel" | "chain" | "workflow";
@@ -1432,6 +1449,8 @@ export interface AgentCapabilityRow {
 
 export interface Details {
 	mode: SubagentResultMode | "management";
+	/** Current background child attention; unknown is not a safe/healthy assertion. */
+	attention?: StatusAttention;
 	workflowReceiptPath?: string;
 	runId?: string;
 	/** Host tool-call id retained when it differs from the internal run id. */
@@ -1989,6 +2008,7 @@ export interface AsyncStatus {
 		transcriptPath?: string;
 		transcriptError?: string;
 		activityState?: ActivityState;
+		attentionEvidence?: AttentionEvidence;
 		lastActivityAt?: number;
 		currentTool?: string;
 		currentToolArgs?: string;

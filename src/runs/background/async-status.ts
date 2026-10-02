@@ -160,6 +160,8 @@ interface AsyncRunListOptions {
 	kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean;
 	now?: () => number;
 	reconcile?: boolean;
+	/** Public inspection must never repair or release lifecycle state. */
+	readOnly?: boolean;
 	runId?: string;
 	/** The caller already holds a canonical run id; never interpret a miss as a prefix. */
 	exactRunId?: boolean;
@@ -513,7 +515,7 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 						activeEntries.add(entry);
 					} else {
 						observeStatus?.(null);
-						updateActiveRunIndex(path.join(asyncDirRoot, entry), "failed");
+						if (!options.readOnly) updateActiveRunIndex(path.join(asyncDirRoot, entry), "failed");
 					}
 				}
 			}
@@ -556,7 +558,7 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 					continue;
 				}
 			}
-			const reconciliation = options.reconcile === false
+			const reconciliation = options.reconcile === false || options.readOnly
 				? undefined
 				: reconcileAsyncRun(asyncDir, { resultsDir: options.resultsDir, kill: options.kill, now: options.now }, observeStatus);
 			status = (reconciliation?.status ?? readStatus(asyncDir)) as (AsyncStatus & { cwd?: string }) | null;
@@ -564,15 +566,15 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 		} catch (error) {
 			observeStatus?.(null);
 			if (!activeEntries.has(entry) || !isAsyncStatusIsolationError(asyncDir, error)) throw error;
-			isolateCorruptActiveRun(asyncDir, entry, error, options.now);
+			if (!options.readOnly) isolateCorruptActiveRun(asyncDir, entry, error, options.now);
 			continue;
 		}
 		if (!status) {
 			observeStatus?.(null);
-			if (activeEntries.has(entry)) updateActiveRunIndex(asyncDir, "failed");
+			if (activeEntries.has(entry) && !options.readOnly) updateActiveRunIndex(asyncDir, "failed");
 			continue;
 		}
-		if (activeEntries.has(entry) && !isActiveAsyncState(status.state)) {
+		if (activeEntries.has(entry) && !options.readOnly && !isActiveAsyncState(status.state)) {
 			const processTerminal = readProcessTerminal(asyncDir, { runId: status.runId, runnerProcessInstanceId: status.processTerminal?.runnerProcessInstanceId });
 			if (processTerminal?.state === "observed" || (activeRunMarkerAgeMs(asyncDir, options.now?.()) ?? 0) > DEFAULT_STALE_TERMINAL_ACTIVE_MARKER_MS) {
 				updateActiveRunIndex(asyncDir, status.state, status.toolCallId, { terminalIndexBeforeRelease: true });
@@ -587,10 +589,10 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 		if (options.sessionId && status.sessionId !== options.sessionId) continue;
 		const nestedWarnings: string[] = [];
 		let nestedRoute: NestedRoute | undefined;
-		if (options.reconcile !== false && includeNested) {
+		if (includeNested && (options.readOnly || options.reconcile !== false)) {
 			try {
 				nestedRoute = resolveNestedRoute(status.runId || path.basename(asyncDir));
-				if (nestedRoute) reconcileNestedAsyncDescendants(nestedRoute, { resultsDir: options.resultsDir, kill: options.kill, now: options.now });
+				if (nestedRoute && !options.readOnly && options.reconcile !== false) reconcileNestedAsyncDescendants(nestedRoute, { resultsDir: options.resultsDir, kill: options.kill, now: options.now });
 			} catch (error) {
 				observeStatus?.(null);
 				nestedWarnings.push(`Nested status unavailable: ${getErrorMessage(error)}`);
@@ -602,7 +604,7 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 		} catch (error) {
 			observeStatus?.(null);
 			if (!activeEntries.has(entry) || !isAsyncStatusIsolationError(asyncDir, error)) throw error;
-			isolateCorruptActiveRun(asyncDir, entry, error, options.now);
+			if (!options.readOnly) isolateCorruptActiveRun(asyncDir, entry, error, options.now);
 			continue;
 		}
 		runs.push(summary);

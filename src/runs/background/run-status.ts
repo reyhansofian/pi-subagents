@@ -7,9 +7,10 @@ import { readFleetTranscript } from "../../tui/fleet-transcript.ts";
 import { formatAsyncRunList, formatAsyncRunOutputPath, formatAsyncRunProgressLabel, formatWorkflowStageLine, listAsyncRuns } from "./async-status.ts";
 import { formatAsyncResultTranscript, formatAsyncRunTranscript, formatNestedRunTranscript, inspectSubagentFleet } from "./fleet-view.ts";
 import { formatNestedRunStatusLines } from "../shared/nested-render.ts";
+import { asyncStatusChildIdentity } from "../shared/child-identity.ts";
 import { formatModelThinking } from "../../shared/formatters.ts";
 import { formatActivityLabel } from "../../shared/status-format.ts";
-import { DIRS, type AsyncStatus, type Details, type ForegroundRunControl, type ForegroundResumeRun, type NestedRunSummary, type SteeringStatus, type SubagentState } from "../../shared/types.ts";
+import { DIRS, type AsyncStatus, type Details, type ForegroundRunControl, type ForegroundResumeRun, type NestedRunSummary, type StatusAttention, type SteeringStatus, type SubagentState } from "../../shared/types.ts";
 import { inspectActiveAsyncCapacityOwner, type ActiveAsyncCapacityInspection } from "./active-async-capacity.ts";
 import { readStatus } from "../../shared/utils.ts";
 import { resolveSubagentIntercomTarget } from "../../intercom/intercom-bridge.ts";
@@ -21,8 +22,7 @@ import { formatWaitSubscriptions } from "./wait-subscriptions.ts";
 import { resolveAsyncRunLocation } from "./async-resume.ts";
 import { resolveSubagentRunId } from "./run-id-resolver.ts";
 import { flatToLogicalStepIndex, normalizeParallelGroups } from "./parallel-groups.ts";
-import { reconcileAsyncRun, reconcileNestedAsyncDescendants } from "./stale-run-reconciler.ts";
-import { attachRootChildrenToSteps, findNestedRouteForRootId, projectNestedRegistryForRoot, type NestedRunResolutionScope } from "../shared/nested-events.ts";
+import { attachRootChildrenToSteps, projectNestedRegistryForRoot, type NestedRunResolutionScope } from "../shared/nested-events.ts";
 import { readMissionBinding } from "../../missions/lifecycle.ts";
 import { formatWorkflowJsonPreview } from "../../workflows/scripted-workflow.ts";
 import { parseWorkflowChildSummary } from "../../workflows/workflow-child-summary.ts";
@@ -44,6 +44,22 @@ interface RunStatusParams {
 	index?: number;
 	view?: "fleet" | "transcript";
 	lines?: number;
+}
+
+function projectStatusAttention(status: AsyncStatus): StatusAttention {
+	const steps: StatusAttention["steps"] = (status.steps ?? []).map((step, index) => {
+		const childId = asyncStatusChildIdentity(step, index);
+		const evidence = status.state === "running" && step.status === "running" ? step.attentionEvidence : undefined;
+		const base = { index, ...(childId ? { childId } : {}) };
+		if (!evidence || (evidence.state !== "none" && evidence.state !== "current")) return { ...base, state: "unknown" };
+		if (evidence.state === "none") return { ...base, state: "none" };
+		if (!["idle", "tool_failures", "tool_error_stall", "supervisor_request", "tool_open_threshold"].includes(evidence.reason)) return { ...base, state: "unknown" };
+		const invocation = evidence.toolCallId && evidence.toolName && evidence.toolCallId.length <= 256 && evidence.toolName.length <= 128
+			? { state: "known" as const, toolName: evidence.toolName, toolCallId: evidence.toolCallId }
+			: { state: "unknown" as const };
+		return { ...base, state: "current", reason: evidence.reason, invocation };
+	});
+	return { runId: status.runId, state: steps.some((step) => step.state === "current") ? "current" : steps.length > 0 && steps.every((step) => step.state === "none") ? "none" : "unknown", steps };
 }
 
 function formatProcessTerminal(value: AsyncStatus["processTerminal"] | undefined): string {
@@ -381,7 +397,7 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 			};
 		}
 		try {
-			const runs = listAsyncRuns(asyncDirRoot, { states: ["queued", "running"], sessionId: currentSessionId, resultsDir, kill: deps.kill, now: deps.now });
+			const runs = listAsyncRuns(asyncDirRoot, { states: ["queued", "running"], sessionId: currentSessionId, resultsDir, reconcile: false, readOnly: true });
 			if (params.view === "transcript") {
 				if (runs.length === 1) return inspectSubagentStatus({ ...params, id: runs[0]!.id }, deps);
 				return {
@@ -434,9 +450,7 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 				}
 			}
 			if (resolved?.kind === "nested") {
-				reconcileNestedAsyncDescendants(resolved.match.route, { resultsDir, kill: deps.kill, now: deps.now });
-				const refreshed = resolveSubagentRunId(requestedId, { asyncDirRoot, resultsDir, state: deps.state, nested: deps.nested });
-				const nested = refreshed?.kind === "nested" ? refreshed : resolved;
+				const nested = resolved;
 				if (params.view === "transcript") {
 					try {
 						return { content: [{ type: "text", text: formatNestedRunTranscript(nested.match.run, { index: params.index, lines: params.lines, sessionRoots: deps.sessionRoots }) }], details: { mode: "single", results: [] } };
@@ -472,19 +486,10 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 
 	if (asyncDir) {
 		const diskStatus = readStatus(asyncDir);
-		let reconciliation;
-		try {
-			reconciliation = reconcileAsyncRun(asyncDir, { resultsDir, kill: deps.kill, now: deps.now });
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			return {
-				content: [{ type: "text", text: message }],
-				isError: true,
-				details: { mode: "single", results: [] },
-			};
-		}
-		const status = reconciliation.status;
-		if (!status && diskStatus?.displayDismissedAt !== undefined) {
+		// Inspection projects the published snapshot; only lifecycle owners reconcile.
+		const reconciliation = { resultPath };
+		const status = diskStatus?.displayDismissedAt === undefined ? diskStatus : null;
+		if (!status && diskStatus?.displayDismissedAt !== undefined && !resultPath) {
 			if (params.action === "debug.run") {
 				const { sidecar, overlay } = debugProcessTerminal(asyncDir, diskStatus);
 				const capacity = inspectActiveAsyncCapacityOwner({ runId: diskStatus.runId, sessionId: diskStatus.sessionId, asyncDir }, { rootDir: deps.activeCapacityRoot, liveWorkflowRunIds: new Set(deps.state?.workflowControllers?.keys() ?? []), abandonedSlotReleaseAfterMs: deps.abandonedSlotReleaseAfterMs });
@@ -505,7 +510,7 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 			}
 			return {
 				content: [{ type: "text", text: `Run: ${diskStatus.runId}\nState: display-dismissed\nDismissed: ${new Date(diskStatus.displayDismissedAt).toISOString()}\nNo running work was terminated.` }],
-				details: { mode: "single", results: [] },
+				details: { mode: "single", results: [], attention: projectStatusAttention({ ...diskStatus, state: "failed" }) },
 			};
 		}
 		const effectiveRunId = status?.runId ?? resolvedId ?? "unknown";
@@ -538,8 +543,6 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 			let nestedChildren: NestedRunSummary[] = [];
 			let nestedWarning: string | undefined;
 			try {
-				const nestedRoute = findNestedRouteForRootId(status.runId);
-				if (nestedRoute) reconcileNestedAsyncDescendants(nestedRoute, { resultsDir, kill: deps.kill, now: deps.now });
 				nestedChildren = projectNestedRegistryForRoot(status.runId)?.children ?? [];
 				attachRootChildrenToSteps(status.runId, status.steps, nestedChildren);
 			} catch (error) {
@@ -613,7 +616,6 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 				`Dir: ${asyncDir}`,
 				outputPath ? `Output: ${outputPath}` : undefined,
 				status.parallelHandoff ? `Parallel handoff: ${status.parallelHandoff.path}` : undefined,
-				reconciliation.message ? `Diagnosis: ${reconciliation.message}` : undefined,
 				reconciliation.resultPath && fs.existsSync(reconciliation.resultPath) ? `Result: ${reconciliation.resultPath}` : undefined,
 			].filter((line): line is string => Boolean(line));
 			const liveWorkflowControls = status.mode === "workflow" && deps.state?.currentSessionId === status.sessionId && deps.state?.workflowControllers?.has(status.runId)
@@ -719,7 +721,7 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 			if (fs.existsSync(logPath)) lines.push(`Log: ${logPath}`);
 			if (fs.existsSync(eventsPath)) lines.push(`Events: ${eventsPath}`);
 
-			return { content: [{ type: "text", text: lines.join("\n") }], details: { mode: "single", results: [], ...(status.workflowReceiptPath ? { workflowReceiptPath: status.workflowReceiptPath } : {}), ...(status.preflight ? { preflight: status.preflight } : {}), ...(status.workflow?.preflightWarnings?.length ? { preflightWarnings: status.workflow.preflightWarnings } : {}), ...(workflowChildren ? { workflowChildren } : {}), ...(workflowTerminalProof ? { workflowTerminalProof } : {}), ...(runFanoutBudget ? { runFanoutBudget } : {}), ...(processTerminal ? { lifecycleStatus: { processTerminal } } : {}) } };
+			return { content: [{ type: "text", text: lines.join("\n") }], details: { mode: "single", results: [], attention: projectStatusAttention(resultPath || processTerminal?.state === "observed" || processTerminal?.state === "unknown" ? { ...status, state: "failed" } : status), ...(status.workflowReceiptPath ? { workflowReceiptPath: status.workflowReceiptPath } : {}), ...(status.preflight ? { preflight: status.preflight } : {}), ...(status.workflow?.preflightWarnings?.length ? { preflightWarnings: status.workflow.preflightWarnings } : {}), ...(workflowChildren ? { workflowChildren } : {}), ...(workflowTerminalProof ? { workflowTerminalProof } : {}), ...(runFanoutBudget ? { runFanoutBudget } : {}), ...(processTerminal ? { lifecycleStatus: { processTerminal } } : {}) } };
 		}
 	}
 
@@ -779,7 +781,7 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 			if (data.summary) lines.push("", data.summary);
 			const workflowChildren = parseWorkflowChildSummary((data as unknown as Record<string, unknown>).workflowChildren);
 			if (workflowChildren && workflowChildren.workflowRunId !== runId) throw new Error("workflowChildren.workflowRunId does not match the result run id.");
-			return { content: [{ type: "text", text: lines.join("\n") }], details: { mode: "single", results: [], ...(workflowReceiptPath ? { workflowReceiptPath } : {}), ...(workflowChildren ? { workflowChildren } : {}) } };
+			return { content: [{ type: "text", text: lines.join("\n") }], details: { mode: "single", results: [], attention: { runId: typeof runId === "string" ? runId : resolvedId ?? "unknown", state: "unknown", steps: [] }, ...(workflowReceiptPath ? { workflowReceiptPath } : {}), ...(workflowChildren ? { workflowChildren } : {}) } };
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			return {
