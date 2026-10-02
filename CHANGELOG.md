@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Background npm children now start on Pi 1.0.0, which no longer exports `@earendil-works/pi-agent-core/node`; missing declared targets still fail closed. Ported from Albert Gwo’s [#2634](https://github.com/nicobailon/pi-subagents/pull/2634) (10694a673cb077b4d3ec6a6cfe68acb6c28b83a5).
+
 ## [0.74.0] - 2026-09-30
 
 ### Highlights
