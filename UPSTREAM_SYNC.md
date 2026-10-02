@@ -6,19 +6,54 @@ Base: upstream pi-subagents **v0.74.0** (b6bda32f03b7f549623bc404c9be14dca298ddc
 
 Source: Albert Gwo's upstream pi-subagents [#2634](https://github.com/nicobailon/pi-subagents/pull/2634), commit 10694a673cb077b4d3ec6a6cfe68acb6c28b83a5. The Pi 1.0.0 pi-agent-core manifest exports its root and package.json but **not** ./node. The old detached alias resolver required ./node even though the runner import graph does not import it; it rejected the real host before spawn. Ported the source's optional-export guard only for this alias: absent ./node is skipped, present exports resolve to realpath, declared missing files and missing packages still fail. No other alias, dependency, pin, loader, or lifecycle path changed. The test fixture and this record are fork-local additions.
 
-The Pi 1.0.0 npm fixture places pi-coding-agent at /tmp/pi-100-followup-O76Tdv/sdk-1.0.0/node_modules/@earendil-works/pi-coding-agent; pi-agent-core, pi-ai, pi-tui, chord and typebox resolve under that selected host's nested node_modules. Existing 0.99.2 and 0.87.1 SDK fixtures are /tmp/pi-subagents-v074-evidence-nYVOeX/sdk/node_modules/@earendil-works/pi-coding-agent and /tmp/pi-subagents-v074-evidence-nYVOeX/sdk87/node_modules/@earendil-works/pi-coding-agent; test code asserts their selected host/peer package versions and containment. The npm pack was installed separately under /tmp/pi-100-followup-O76Tdv/baseline-packed and candidate-packed: compiled JS, not worktree TypeScript. No ambient SDK fallback, real credentials, provider network, or host settings were used.
+The measured Pi 1.0.0 npm layout placed pi-coding-agent at sdk/node_modules/@earendil-works/pi-coding-agent; pi-agent-core, pi-ai, pi-tui, chord (all 1.0.0) and typebox (1.3.27) resolved from its nested node_modules. The selected 0.99.2 and 0.87.1 SDK roots were also sdk/node_modules/@earendil-works/pi-coding-agent in separate isolated fixtures; the SDK tests check selected host and peer versions/containment. Baseline and candidate were packed and installed into separate node_modules/pi-subagents trees, and the smoke exercised compiled JS, not worktree TypeScript. No ambient SDK fallback, real credentials, provider network, or host settings were used.
 
-To reproduce the packed detached failure and success (from the repository, with **fresh** output directories), substitute the verified package roots above. Use an allowlisted environment; the example output directory is R and its /home, /agent and /tmp subpaths are isolated:
+Reproduce from the repository at the candidate commit (Node 22.20.0 and npm 10.9.3 were measured). The following is a **Bash script**, not Fish syntax; run it in Bash even when your interactive shell is Fish. It makes a fresh temporary root, never deletes it, and does not install into the running Pi host. Use a trusted npm registry; installs use a disposable package cache and only the named isolated prefixes. The baseline is commit daf98af0e69ec846615f9b8c3498cb06c708a022, not a hidden retained pack. Each archived source uses its own lockfile; no installation is required in the live worktree.
 
-~~~sh
-R=/tmp/pi-100-followup-O76Tdv/pre-fix-new
-HOST=/tmp/pi-100-followup-O76Tdv/sdk-1.0.0/node_modules/@earendil-works/pi-coding-agent
-env -i PATH=/etc/profiles/per-user/reyhan/bin:/usr/bin:/bin HOME="$R/home" XDG_CONFIG_HOME="$R/home/.config" XDG_CACHE_HOME="$R/cache" PI_CODING_AGENT_DIR="$R/agent" TMPDIR="$R/tmp" PI_OFFLINE=1 JITI_FS_CACHE=false PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT="$HOST" node test/smoke/npm-detached-host.mjs /tmp/pi-100-followup-O76Tdv/baseline-packed/node_modules/pi-subagents "$HOST" "$R" failure
-R=/tmp/pi-100-followup-O76Tdv/post-fix-new
-env -i PATH=/etc/profiles/per-user/reyhan/bin:/usr/bin:/bin HOME="$R/home" XDG_CONFIG_HOME="$R/home/.config" XDG_CACHE_HOME="$R/cache" PI_CODING_AGENT_DIR="$R/agent" TMPDIR="$R/tmp" PI_OFFLINE=1 JITI_FS_CACHE=false PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT="$HOST" node test/smoke/npm-detached-host.mjs /tmp/pi-100-followup-O76Tdv/candidate-packed/node_modules/pi-subagents "$HOST" "$R" success
+~~~bash
+set -euo pipefail
+REPO="$PWD" # run from the repository root at the candidate commit
+NODE="$(command -v node)"
+NPM="$(command -v npm)"
+TOOLS_PATH="$(dirname "$NODE"):$(dirname "$NPM"):/usr/bin:/bin"
+R="$(mktemp -d /tmp/pi-subagents-1.0-smoke.XXXXXXXX)"
+mkdir -p "$R"/{baseline-src,candidate-src,base-tar,candidate-tar,cache,baseline-packed,candidate-packed,setup-home,setup-tmp}
+npm_clean() {
+  env -i PATH="$TOOLS_PATH" HOME="$R/setup-home" XDG_CONFIG_HOME="$R/setup-home/.config" XDG_CACHE_HOME="$R/cache" TMPDIR="$R/setup-tmp" NPM_CONFIG_USERCONFIG="$R/setup-home/.npmrc" NPM_CONFIG_GLOBALCONFIG="$R/setup-home/global.npmrc" NPM_CONFIG_CACHE="$R/cache" "$NPM" "$@"
+}
+git -C "$REPO" archive daf98af0e69ec846615f9b8c3498cb06c708a022 | tar -x -C "$R/baseline-src"
+git -C "$REPO" archive HEAD | tar -x -C "$R/candidate-src"
+npm_clean --prefix "$R/baseline-src" ci --ignore-scripts
+npm_clean --prefix "$R/candidate-src" ci --ignore-scripts
+npm_clean --prefix "$R/baseline-src" run build:pkg
+npm_clean --prefix "$R/candidate-src" run build:pkg
+npm_clean pack "$R/baseline-src/dist-pkg" --ignore-scripts --pack-destination "$R/base-tar"
+npm_clean pack "$R/candidate-src/dist-pkg" --ignore-scripts --pack-destination "$R/candidate-tar"
+npm_clean --prefix "$R/baseline-packed" install --ignore-scripts --no-save --no-package-lock --legacy-peer-deps "$R/base-tar/pi-subagents-0.74.0.tgz"
+npm_clean --prefix "$R/candidate-packed" install --ignore-scripts --no-save --no-package-lock --legacy-peer-deps "$R/candidate-tar/pi-subagents-0.74.0.tgz"
+npm_clean --prefix "$R/sdk-1.0.0" install --ignore-scripts --no-save --no-package-lock --install-strategy=nested @earendil-works/pi-coding-agent@1.0.0
+HOST="$R/sdk-1.0.0/node_modules/@earendil-works/pi-coding-agent"
+test "$("$NODE" -p "require(process.argv[1]).version" "$HOST/package.json")" = 1.0.0
+for pair in pi-agent-core pi-ai pi-tui chord; do
+  test "$("$NODE" -p "require(process.argv[1]).version" "$HOST/node_modules/@earendil-works/$pair/package.json")" = 1.0.0
+done
+test "$("$NODE" -p "require(process.argv[1]).version" "$HOST/node_modules/typebox/package.json")" = 1.3.27
+for spec in 'baseline-packed failure pre-fix' 'candidate-packed success post-fix'; do
+  read -r pack expectation run <<< "$spec"
+  RUN="$R/$run" # must not exist: fixture creates its own home, agent, work, sessions and tmp
+  env -i PATH=/usr/bin:/bin HOME="$RUN/home" XDG_CONFIG_HOME="$RUN/home/.config" XDG_CACHE_HOME="$RUN/cache" PI_CODING_AGENT_DIR="$RUN/agent" TMPDIR="$RUN/tmp" PI_OFFLINE=1 JITI_FS_CACHE=false PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT="$HOST" "$NODE" "$REPO/test/smoke/npm-detached-host.mjs" "$R/$pack/node_modules/pi-subagents" "$HOST" "$RUN" "$expectation"
+done
+printf 'Smoke artifacts retained under %s\n' "$R"
+
+# Optional: reproduce the separately measured three-version SDK matrix (7/7).
+npm_clean --prefix "$R/sdk-0.99.2" install --ignore-scripts --no-save --no-package-lock --install-strategy=nested @earendil-works/pi-coding-agent@0.99.2
+npm_clean --prefix "$R/sdk-0.87.1" install --ignore-scripts --no-save --no-package-lock --install-strategy=nested @earendil-works/pi-coding-agent@0.87.1 @earendil-works/pi-ai@0.87.1
+mkdir -p "$R/sdk-check"/{home,agent,tmp,cache}
+cd "$R/candidate-src"
+env -i PATH=/usr/bin:/bin HOME="$R/sdk-check/home" XDG_CONFIG_HOME="$R/sdk-check/home/.config" XDG_CACHE_HOME="$R/sdk-check/cache" PI_CODING_AGENT_DIR="$R/sdk-check/agent" TMPDIR="$R/sdk-check/tmp" PI_SUBAGENTS_TEST_SDK_ROOT="$R/sdk-0.99.2/node_modules/@earendil-works/pi-coding-agent" PI_SUBAGENTS_TEST_PI1_SDK_ROOT="$HOST" PI_SUBAGENTS_TEST_LEGACY_SDK_ROOT="$R/sdk-0.87.1/node_modules/@earendil-works/pi-coding-agent" "$NODE" --experimental-strip-types --import ./test/support/register-loader.mjs --test test/integration/native-codemode-evidence.test.ts
 ~~~
 
-Pre-fix: PASS expected rejection, no child start (/tmp/pi-100-followup-O76Tdv/pre-fix-3/launch.json). Post-fix: PASS real detached compiled runner, synthetic read and two provider turns, host SDK identity, complete status, observed process close (/tmp/pi-100-followup-O76Tdv/post-fix-2/). This is an **unsandboxed isolated Node test**, not evidence of network namespace isolation or a live deployed Pi installation; the existing bwrap-only 0.86.1 smoke is unchanged and was not run here. Real host credentials, deployed model/provider behavior, full workflow and cross-version recovery remain **UNVERIFIED**.
+The fixture accepts INSTALLED_EXTENSION PI_PACKAGE_ROOT FRESH_ROOT failure|success in that order; FRESH_ROOT must not exist. It verifies the selected host manifest is 1.0.0 and peers belong to the selected SDK fixture. The exact measured baseline was **PASS expected rejection** (missing pi-agent-core/node alias; no child start); the candidate was **PASS real detached compiled runner** (synthetic read, two provider turns, selected-host SDK identity, complete status and observed child process close). The script above is a reproducible recipe, not a claim that these fresh commands were run on every machine or every npm layout: the measured npm host used nested peers; --install-strategy=nested and the version assertions make that layout explicit. This is an **unsandboxed isolated Node test**, not evidence of network namespace isolation or a live deployed Pi installation; the existing bwrap-only 0.86.1 smoke is unchanged and was not run here. Real host credentials, deployed model/provider behavior, full workflow and cross-version recovery remain **UNVERIFIED**.
 
 | Historical behavior / commits | Decision on v0.74.0 | Persistent evidence / qualification |
 | --- | --- | --- |
@@ -38,7 +73,7 @@ Pre-fix: PASS expected rejection, no child start (/tmp/pi-100-followup-O76Tdv/pr
 
 ## Reproduce the scoped checks
 
-Use isolated, credential-free Pi packages; do not install into or activate a live host. Set PI_SUBAGENTS_TEST_SDK_ROOT to a Pi 0.99.2 package root, PI_SUBAGENTS_TEST_PI1_SDK_ROOT to a Pi 1.0.0 package root, and PI_SUBAGENTS_TEST_LEGACY_SDK_ROOT to a Pi 0.87.1 package root. Then, from this repository:
+Use isolated, credential-free Pi packages; do not install into or activate a live host. For the SDK matrix, the Bash recipe above installs explicit 0.99.2, 1.0.0 and 0.87.1 package roots and supplies PI_SUBAGENTS_TEST_SDK_ROOT, PI_SUBAGENTS_TEST_PI1_SDK_ROOT and PI_SUBAGENTS_TEST_LEGACY_SDK_ROOT. The other commands below are the recorded focused checks, not another claim of a full-suite run. From the repository with its existing workspace-local dependencies:
 
 ~~~sh
 npm run typecheck
