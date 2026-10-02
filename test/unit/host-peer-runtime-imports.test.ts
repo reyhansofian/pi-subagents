@@ -124,6 +124,32 @@ test("resolves pi-agent-core/node to its exact package export instead of appendi
 	}
 });
 
+test("skips only absent pi-agent-core/node, not broken declared exports or a missing peer", () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-core-node-"));
+	const core = path.join(root, "node_modules", "@earendil-works", "pi-agent-core");
+	const target = path.join(core, "dist", "index.js");
+	try {
+		fs.mkdirSync(path.dirname(target), { recursive: true });
+		fs.writeFileSync(target, "export {};\n");
+		const manifest = { name: "@earendil-works/pi-agent-core", version: "1.0.0", exports: { ".": "./dist/index.js" } };
+		fs.writeFileSync(path.join(core, "package.json"), JSON.stringify(manifest));
+		let resolved = resolveHostPeerAliases(root);
+		assert.equal(resolved.aliases["@earendil-works/pi-agent-core"], fs.realpathSync(target));
+		assert.equal(resolved.aliases["@earendil-works/pi-agent-core/node"], undefined);
+		assert.ok(!resolved.missing.includes("@earendil-works/pi-agent-core/node"));
+		fs.writeFileSync(path.join(core, "package.json"), JSON.stringify({ ...manifest, exports: { ...manifest.exports, "./node": "./dist/node.js" } }));
+		resolved = resolveHostPeerAliases(root);
+		assert.ok(resolved.missing.includes("@earendil-works/pi-agent-core/node"), "declared missing file fails closed");
+		fs.writeFileSync(path.join(core, "dist/node.js"), "export {};\n");
+		assert.equal(resolveHostPeerAliases(root).aliases["@earendil-works/pi-agent-core/node"], fs.realpathSync(path.join(core, "dist/node.js")));
+		fs.rmSync(core, { recursive: true });
+		assert.ok(resolveHostPeerAliases(root).missing.includes("@earendil-works/pi-agent-core/node"), "missing package is never optional");
+		assert.ok(resolveHostPeerAliases(root).missing.includes("@earendil-works/pi-agent-core"));
+	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
 function writeFakeTypeboxPackage(typeboxDir: string): void {
 	fs.mkdirSync(typeboxDir, { recursive: true });
 	fs.writeFileSync(
