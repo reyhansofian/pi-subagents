@@ -55,7 +55,7 @@ describe("registered subagent tool description", () => {
 	it("uses concise split metadata only by default", () => {
 		assert.equal(buildSubagentToolDescription(), DEFAULT_SUBAGENT_TOOL_DESCRIPTION);
 		const metadata = buildSubagentToolPromptMetadata();
-		assert.equal(SUBAGENT_TOOL_PROMPT_SNIPPET, "For operator-requested delegation, use subagents; compose multi-child work in one workflow call.");
+		assert.equal(SUBAGENT_TOOL_PROMPT_SNIPPET, "For operator-requested delegation, use subagents; compose multi-child work in one workflow call per coordinator-gated phase.");
 		assert.deepEqual(SUBAGENT_TOOL_PROMPT_GUIDELINES, [
 			"Do not invoke subagents unless the operator requested delegation directly or through applicable instructions.",
 		]);
@@ -80,7 +80,7 @@ describe("registered subagent tool description", () => {
 				/action is management\/control; validate accepts workflow:true or a path without launching/,
 				/action:"list",capabilities:true.*executable, non-disabled.*runner.available === true/,
 				/Passive PATH\/PATHEXT\/X_OK.*not authentication\/version\/launch proof/,
-				/exactly one top-level subagent workflow call with async:true/,
+				/one top-level subagent workflow call with async:true per coordinator-gated phase/,
 				/explicit return, top-level await.*nested async function\/arrow\/method helpers are rejected/,
 				/Await runs.run.*before .output.*ordered array, not a key map/,
 				/every stored run promise with direct await, Promise.race or Promise.all/,
@@ -321,5 +321,44 @@ describe("registered subagent tool description", () => {
 		const invalidAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-tool-desc-invalid-"));
 		writeExtensionConfig(invalidAgentDir, { toolDescriptionMode: "tiny" });
 		assert.equal(readRegisteredTool(invalidAgentDir).description, FULL_SUBAGENT_TOOL_DESCRIPTION);
+	});
+
+	it("registers phase gates and the bounded-child path in every mode and execution surface", () => {
+		for (const disabledFeatures of [[], ["workflow-scripts"]]) {
+			for (const toolDescriptionMode of [undefined, "full", "compact", "custom"]) {
+				const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-tool-desc-phases-"));
+				writeExtensionConfig(agentDir, { toolDescriptionMode, disabledFeatures });
+				fs.writeFileSync(path.join(agentDir, "subagent-tool-description.md"), "Custom phase guidance.", "utf-8");
+				const tool = readRegisteredTool(agentDir);
+				const execution = disabledFeatures.length ? "chain or tasks" : "workflow";
+				assert.ok(tool.description.includes(`one top-level subagent ${execution} call with async:true per coordinator-gated phase`));
+				for (const contract of [
+					/Start the next phase only after consuming completed results and recording the required coordinator decision\/approval/,
+					/A phase with one bounded child may use direct \{agent,task\} with async:true/,
+					/Do not rerun completed research or repurpose a retained scout to enter a planner\/coder phase/,
+					/Keep task-wide limits across phases/,
+					/A launch receipt is not completion/,
+					/Native async completion wakes this session.*return control.*no sleep\/poll/,
+					/Ordinary child subagents are not orchestrators.*depth\/session limits/,
+					/one writer per cwd\/worktree/,
+					/Invoke subagents only when delegation is authorized by the operator/,
+					/fallback requires explicit owner approval/,
+				]) assert.match(tool.description, contract);
+				if (toolDescriptionMode === undefined) assert.match(tool.promptSnippet!, /per coordinator-gated phase\.$/);
+			}
+		}
+	});
+
+	it("ships phase-scoped workflow guidance without a second orchestration workaround", () => {
+		const guide = fs.readFileSync(path.join(projectRoot, "docs/workflows.md"), "utf8");
+		for (const contract of [
+			/one top-level `subagent` workflow call with `async:true` per coordinator-gated phase/,
+			/consuming completed results and recording the required coordinator decision\/approval/,
+			/one bounded child.*direct `\{ agent, task \}` with `async:true`/,
+			/Do not rerun completed research or repurpose a retained scout to enter a planner\/coder phase/,
+			/task-wide limits across phases/,
+			/A launch receipt is not completion.*native async completion notification/,
+			/no sleep, polling, or `bg_wait` merely for a wake/,
+		]) assert.match(guide, contract);
 	});
 });
