@@ -32,6 +32,7 @@ function deliverControlNotice(input: {
 	if (input.visibleControlNotices.has(key)) return;
 	input.visibleControlNotices.add(key);
 	const noticeText = input.details.noticeText ?? formatControlNoticeMessage(input.details.event, childIntercomTarget);
+	const nativeAsk = input.details.event.reason === "supervisor_request" && input.details.event.currentTool !== "intercom";
 	input.pi.sendMessage(
 		{
 			customType: SUBAGENT_CONTROL_MESSAGE_TYPE,
@@ -39,7 +40,7 @@ function deliverControlNotice(input: {
 			display: true,
 			details: { ...input.details, childIntercomTarget, noticeText },
 		},
-		{ triggerTurn: input.details.source === "async" },
+		{ triggerTurn: input.details.source === "async" && !nativeAsk },
 	);
 }
 

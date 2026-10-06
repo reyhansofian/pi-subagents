@@ -1,3 +1,4 @@
+import { decisionAuthority, type DecisionAuthority } from "../intercom/native-supervisor-channel.ts";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as net from "node:net";
@@ -79,11 +80,11 @@ export default function registerHerdrPiBridge(pi: ExtensionAPI): void {
 		...MODEL_ONLY_TOOL,
 		label: "Contact supervisor",
 		description: "Contact the parent/supervisor session for a blocking decision, structured interview, or progress update.",
-		parameters: Type.Object({ reason: Type.Union([Type.Literal("need_decision"), Type.Literal("interview_request"), Type.Literal("progress_update")]), message: Type.Optional(Type.String({ maxLength: 65_536 })), interview: Type.Optional(Type.Unknown()) }, { additionalProperties: false }),
-		execute: async (_toolCallId, input: { reason: "need_decision" | "interview_request" | "progress_update"; message?: string; interview?: unknown }) => {
+		parameters: Type.Object({ authority: Type.Optional(Type.Union([Type.Literal("user"), Type.Literal("supervisor")])), reason: Type.Union([Type.Literal("need_decision"), Type.Literal("interview_request"), Type.Literal("progress_update")]), message: Type.Optional(Type.String({ maxLength: 65_536 })), interview: Type.Optional(Type.Unknown()) }, { additionalProperties: false }),
+		execute: async (_toolCallId, input: { authority?: DecisionAuthority; reason: "need_decision" | "interview_request" | "progress_update"; message?: string; interview?: unknown }) => {
 			if (input.reason !== "interview_request" && !input.message?.trim()) throw new Error("message is required for supervisor decisions and progress updates.");
 			const id = `sup_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-			send({ type: "supervisor-request", requestId: id, reason: input.reason, message: input.message?.slice(0, 65_536) ?? "", ...(input.interview !== undefined ? { interview: input.interview } : {}), expectsReply: input.reason !== "progress_update", nativeSessionId });
+			send({ type: "supervisor-request", requestId: id, reason: input.reason, ...decisionAuthority(input.reason, input.authority), message: input.message?.slice(0, 65_536) ?? "", ...(input.interview !== undefined ? { interview: input.interview } : {}), expectsReply: input.reason !== "progress_update", nativeSessionId });
 			if (input.reason === "progress_update") { await new Promise<string>((resolve) => supervisor.set(id, { reason: input.reason, resolve })); return { content: [{ type: "text", text: "Supervisor progress update queued." }], details: { delivered: true, requestId: id, reason: input.reason } }; }
 			const reason = input.reason as "need_decision" | "interview_request"; const answer = await new Promise<string>((resolve) => supervisor.set(id, { reason, resolve })); const details: Record<string, unknown> = { requestId: id, reason }; if (reason === "interview_request") try { details.structuredReply = JSON.parse(answer.replace(/^```(?:json)?\s*|\s*```$/giu, "")); } catch { details.structuredReplyParseError = "Supervisor interview reply was not valid JSON."; }
 			return { content: [{ type: "text", text: `**Reply from supervisor:**\n${answer}` }], details };

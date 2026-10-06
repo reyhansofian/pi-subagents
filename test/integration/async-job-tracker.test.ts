@@ -101,6 +101,7 @@ function writeSupervisorRequest(input: { sessionId: string; runId: string; toolC
 		id: requestId,
 		createdAt: Date.now(),
 		reason: "need_decision",
+		authority: "supervisor",
 		message: "Need a decision",
 		expectsReply: true,
 		orchestratorSessionId: input.sessionId,
@@ -1750,7 +1751,7 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		}
 	});
 
-	it("escalates a supervisor request still unanswered after the grace period once", (t) => {
+	it("does not create a second autonomous notice for a discovered native ask after the grace period", (t) => {
 		const asyncRoot = createTempDir("pi-async-job-supervisor-grace-pending-");
 		t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
 		try {
@@ -1759,7 +1760,7 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 			assert.equal(run.events.length, 1);
 			t.mock.timers.tick(1_000);
 			t.mock.timers.tick(120_000);
-			assert.deepEqual(run.events.slice(1).map((entry) => [entry.channel, (entry.data as { noticeDeferred?: boolean }).noticeDeferred]), [[SUBAGENT_CONTROL_EVENT, undefined], [SUBAGENT_CONTROL_INTERCOM_EVENT, undefined]]);
+			assert.deepEqual(run.events.slice(1), []);
 		} finally {
 			removeTempDir(asyncRoot);
 		}

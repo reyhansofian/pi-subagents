@@ -77,6 +77,7 @@ function writeRequest(input: { sessionId: string; runId: string; agent?: string;
 		createdAt: Date.now(),
 		...(input.expiresAt !== undefined ? { expiresAt: input.expiresAt } : {}),
 		reason,
+		...(reason !== "progress_update" ? { authority: "supervisor" } : {}),
 		message: input.message ?? "Need a decision",
 		expectsReply: reason !== "progress_update",
 		orchestratorSessionId: input.sessionId,
@@ -388,7 +389,7 @@ describe("supervisor ask registration", () => {
 								assert.equal(cReturned, false);
 								await assert.rejects(parentTools.get(NATIVE_SUPERVISOR_TOOL_NAME)!.execute("foreign", { action: "reply", replyTo: cRequest, message: "A cannot answer C" }), /No pending supervisor request found/);
 								await assert.rejects(runtime.call(NATIVE_SUPERVISOR_TOOL_NAME, { action: "reply", replyTo: "wrong-request-id", message: "Wrong" }), /No pending supervisor request found/);
-								const escalation = await runtime.call("contact_supervisor", { reason: "need_decision", message: "C needs a choice; may I approve option A?" });
+								const escalation = await runtime.call("contact_supervisor", { reason: "need_decision", authority: "supervisor", message: "C needs a choice; may I approve option A?" });
 								assert.match(text(escalation), /Approve option A/);
 								assert.equal(cReturned, false, "A's answer to B must not unblock C");
 								const reply = await runtime.call(NATIVE_SUPERVISOR_TOOL_NAME, { action: "reply", replyTo: cRequest, message: "Use option A" });
@@ -399,7 +400,7 @@ describe("supervisor ask registration", () => {
 								assert.equal(launch.runtime.orchestratorSessionId, runtimes[0]!.owner, "C belongs to B's exact runtime id, not A or B's file");
 								assert.equal(runtime.registered.has(NATIVE_SUPERVISOR_TOOL_NAME), false, "leaf must not get downward authority");
 								await new Promise(resolve => setTimeout(resolve, 25));
-								const reply = await runtime.call("contact_supervisor", { reason: "need_decision", message: "Which option?" });
+								const reply = await runtime.call("contact_supervisor", { reason: "need_decision", authority: "supervisor", message: "Which option?" });
 								assert.equal(reply.details.requestId, cRequest);
 								assert.match(text(reply), /Use option A/);
 								cReturned = true;
@@ -481,7 +482,7 @@ describe("supervisor ask registration", () => {
 			await runtime.emit("session_start");
 			fs.writeFileSync(path.join(root, "status.json"), JSON.stringify({ runId, state: "running" }));
 			runtime.events.emit(SUBAGENT_ASYNC_STARTED_EVENT, { id: runId, asyncDir: root, agent: "leaf", sessionId: runtime.sessionFile });
-			request = contact.execute("ask", { reason: "need_decision", message: "Which option?" }, abort.signal);
+			request = contact.execute("ask", { reason: "need_decision", authority: "supervisor", message: "Which option?" }, abort.signal);
 			// Attach rejection handling before any assertion can abort the child.
 			void request!.catch(() => {});
 			await waitForCondition(() => runtime.notices.length > 0, "direct async ask notification");
@@ -776,7 +777,7 @@ describe("supervisor ask registration", () => {
 				const dir = resolveSupervisorChannelDir(runId, "worker", 0);
 				channels.push(dir);
 				ensureSupervisorChannelDir(dir);
-				fs.writeFileSync(path.join(dir, "requests", id + ".json"), JSON.stringify({ type: "subagent.supervisor.request", id, createdAt: Date.now(), reason: "need_decision", message: "Decision?", expectsReply: true, orchestratorSessionId: owner, runId, agent: "worker", childIndex: 0 }));
+				fs.writeFileSync(path.join(dir, "requests", id + ".json"), JSON.stringify({ type: "subagent.supervisor.request", id, createdAt: Date.now(), reason: "need_decision", authority: "supervisor", message: "Decision?", expectsReply: true, orchestratorSessionId: owner, runId, agent: "worker", childIndex: 0 }));
 				return id;
 			}
 			let runtime;
@@ -1072,6 +1073,7 @@ describe("supervisor ask registration", () => {
 			const blocked = childTools.get("contact_supervisor")!.execute("ask", {
 				action: "ask",
 				reason: "need_decision",
+				authority: "supervisor",
 				message: "Which option should I take?",
 			} as never);
 

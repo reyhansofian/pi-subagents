@@ -16,6 +16,9 @@ import { SUPERVISOR_REPLY_ENTRY_TYPE, SUPERVISOR_REQUEST_MESSAGE_TYPE } from "..
 import { INTERCOM_DETACH_REQUEST_EVENT, type SubagentState } from "../../src/shared/types.ts";
 
 const createdChannels: string[] = [];
+// Node 22 lazily captures fs.readdirSync in rimraf. Initialize it before spies.
+const cleanupWarmup = fs.mkdtempSync(path.join(os.tmpdir(), "supervisor-test-cleanup-"));
+fs.rmSync(cleanupWarmup, { recursive: true });
 
 function makeState(sessionId: string | null, ctx: unknown): SubagentState {
 	return {
@@ -48,6 +51,7 @@ function writeRequest(input: { sessionId: string; runId: string; agent?: string;
 		createdAt: input.createdAt ?? Date.now(),
 		...(input.expiresAt !== undefined ? { expiresAt: input.expiresAt } : {}),
 		reason: input.reason ?? "need_decision",
+		...(input.reason !== "progress_update" ? { authority: "supervisor" } : {}),
 		message: input.message ?? "Need a decision",
 		expectsReply: input.reason !== "progress_update",
 		orchestratorSessionId: input.sessionId,
@@ -948,6 +952,7 @@ describe("native supervisor channel", () => {
 				id: requestId,
 				requestId,
 				reason: "interview_request",
+				authority: "supervisor",
 				expectsReply: true,
 				runId,
 				agent: "worker",
@@ -970,6 +975,7 @@ describe("native supervisor channel", () => {
 			assert.deepEqual({ ...entries[0]?.data, createdAt: undefined }, {
 				requestId,
 				reason: "interview_request",
+				authority: "supervisor",
 				runId,
 				agent: "worker",
 				childIndex: 2,
@@ -1207,7 +1213,7 @@ describe("native supervisor channel", () => {
 		controller.abort();
 
 		await assert.rejects(
-			() => registeredTools.get("contact_supervisor")!.execute("contact", { reason: "need_decision", message: "Need a decision" }, controller.signal),
+			() => registeredTools.get("contact_supervisor")!.execute("contact", { reason: "need_decision", authority: "supervisor", message: "Need a decision" }, controller.signal),
 			/Supervisor request cancelled/,
 		);
 

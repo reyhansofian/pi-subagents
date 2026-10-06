@@ -526,9 +526,11 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 			}
 			const child: ChildSession = {
 				subscribe: (listener) => session.subscribe((event) => listener(event as unknown as ChildSessionEvent)),
-				prompt: (text) => session.prompt(text),
-				steer: (text) => session.steer(text),
-				followUp: (text) => session.followUp(text),
+				// SDK inputs default to interactive. Coordinator-generated inputs must
+				// never masquerade as human authority in a nested parent session.
+				prompt: (text) => session.prompt(text, { source: "extension" }),
+				steer: (text) => session.steer(text, undefined, { source: "extension" }),
+				followUp: (text) => session.followUp(text, undefined, { source: "extension" }),
 				abort: () => session.abort(),
 				hasQueuedMessages: () => session.agent?.hasQueuedMessages?.() === true,
 				dispose: () => {

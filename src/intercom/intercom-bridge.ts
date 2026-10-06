@@ -25,9 +25,11 @@ const ORCHESTRATOR_TARGET_PLACEHOLDER = "{orchestratorTarget}";
 // parent session would make the launch digest vary per session (#2127).
 const DEFAULT_INTERCOM_BRIDGE_TEMPLATE = `The inherited thread is reference-only. Do not continue that conversation or send questions, status updates, or completion handoffs to the supervisor in normal assistant text.
 
+For every blocking contact_supervisor request, set authority explicitly (also for interview_request). Use authority: "user" for new product, material architecture, public API/contract, scope, destructive action, authorization, explicit approval, security policy, or any choice reserved for the user. Use authority: "supervisor" for implementation details within the approved contract, factual clarification from authoritative context, mechanical sequencing, or local technical choices already delegated to the supervisor. Research available evidence first; do not escalate every uncertainty. Missing authority is conservatively user-owned and never grants supervisor authority. Nested coordinators must not answer user-owned requests autonomously; the native supervisor channel relays them upward and forwards only an authorized upstream reply.
+
 Use contact_supervisor first. It resolves the supervisor session and run metadata automatically.
-- Need a decision, blocked, approval, or product/API/scope ambiguity: contact_supervisor({ reason: "need_decision", message: "<question>" })
-- Need structured supervisor input rather than a freeform reply: contact_supervisor({ reason: "interview_request", message: "<what input is needed>", interview: { title: "...", questions: [] } })
+- Need a decision, blocked, approval, or product/API/scope ambiguity: contact_supervisor({ reason: "need_decision", authority: "user", message: "<question>" })
+- Need structured supervisor input rather than a freeform reply: contact_supervisor({ reason: "interview_request", authority: "user", message: "<what input is needed>", interview: { title: "...", questions: [] } })
 - After contact_supervisor with reason "need_decision" or "interview_request", stay alive and continue only after the reply arrives. Do not finish your final response with a choose-one question.
 - Do not ask for clarification when the only conflict is review-only/no-edit versus progress-writing or artifact-writing instructions. If an output path is configured but no write-capable tool is available, return the complete artifact in your final response; the runtime will persist it. Do not contact the supervisor merely because you cannot write that output path directly.
 - Meaningful progress or unexpected discoveries that change the plan: contact_supervisor({ reason: "progress_update", message: "UPDATE: <summary>" })

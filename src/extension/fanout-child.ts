@@ -6,7 +6,7 @@ import { discoverAgents } from "../agents/agents.ts";
 import { getArtifactsDir } from "../shared/artifacts.ts";
 import { createSubagentExecutor, type SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
 import { resolveWaitToolConfig } from "../runs/background/wait-config.ts";
-import type { ChildRuntimeConfig } from "../runs/shared/child-runtime-config.ts";
+import { childSupervisorMetadata, type ChildRuntimeConfig } from "../runs/shared/child-runtime-config.ts";
 import { readNestedControlRequests, resolveInheritedNestedRoute, type NestedRoute, writeNestedControlResult } from "../runs/shared/nested-events.ts";
 import { deliverSubagentIntercomMessageEvent } from "../intercom/result-intercom.ts";
 import { createNativeSupervisorChannel, NATIVE_SUPERVISOR_TOOL_NAME, resolveSupervisorChannelDir } from "../intercom/native-supervisor-channel.ts";
@@ -166,6 +166,7 @@ export default function registerFanoutChildSubagentExtension(pi: ExtensionAPI, c
 	const asyncChildren = new Map<string, { dir: string; agents: string[] }>();
 	const foregroundChannels = new Set<string>();
 	const supervisorChannel = createNativeSupervisorChannel(pi, state, {
+		upstreamSupervisor: childSupervisorMetadata(childConfig),
 		getChannelDirs: () => {
 			const dirs = new Set<string>();
 			for (const run of state.foregroundControls.values()) {
@@ -247,6 +248,7 @@ export default function registerFanoutChildSubagentExtension(pi: ExtensionAPI, c
 		if (!pi.getAllTools().some(tool => tool.name === NATIVE_SUPERVISOR_TOOL_NAME)) return;
 		// Downward asks belong to this coordinator, not its parent or persisted session file.
 		state.supervisorOwnerSessionId = ctx.sessionManager.getSessionId() || null;
+		state.lastUiContext = ctx;
 		unsubscribeAsyncStarted = pi.events.on(SUBAGENT_ASYNC_STARTED_EVENT, (payload: unknown) => {
 			const info = payload as AsyncStartedEvent;
 			if (!info.id || !info.asyncDir || info.sessionId !== state.currentSessionId) return;

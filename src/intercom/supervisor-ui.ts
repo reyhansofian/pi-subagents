@@ -11,6 +11,8 @@ export interface SupervisorRequestMessageDetails {
 	id?: string;
 	requestId?: string;
 	reason?: SupervisorReason;
+	authority?: "user" | "supervisor";
+	authorityImplicit?: boolean;
 	expectsReply?: boolean;
 	runId?: string;
 	agent?: string;
@@ -24,6 +26,7 @@ export interface SupervisorRequestMessageDetails {
 export interface SupervisorReplyEntryData {
 	requestId: string;
 	reason?: SupervisorReason;
+	authority?: "user" | "supervisor";
 	runId: string;
 	agent: string;
 	childIndex: number;
@@ -124,6 +127,7 @@ function replyData(value: unknown): SupervisorReplyEntryData | undefined {
 	return {
 		requestId: value.requestId,
 		...(value.reason === undefined ? {} : { reason: value.reason }),
+		...(value.authority === "user" || value.authority === "supervisor" ? { authority: value.authority } : {}),
 		runId: value.runId,
 		agent: value.agent,
 		childIndex: value.childIndex,
@@ -147,6 +151,7 @@ function requestLines(message: SupervisorMessageLike, details: SupervisorRequest
 	const requestId = withRequestId(details);
 	const lines = [
 		`Reason: ${boundedField(details.reason)}`,
+		`Authority: ${boundedField(details.authority, details.expectsReply ? "user (implicit)" : "none")}${details.authorityImplicit ? " (implicit)" : ""}`,
 		`Run: ${boundedField(details.runId)}`,
 		`Agent: ${boundedField(details.agent)}`,
 		`Child index: ${boundedField(details.childIndex)}`,
@@ -163,6 +168,7 @@ function replyLines(data: SupervisorReplyEntryData, expanded: boolean): string[]
 	const requestId = boundedField(data.requestId);
 	const lines = [
 		...(data.reason ? [`Reason: ${boundedField(data.reason)}`] : []),
+		...(data.authority ? [`Authority: ${data.authority}`] : []),
 		`Run: ${boundedField(data.runId)}`,
 		`Agent: ${boundedField(data.agent)}`,
 		`Child index: ${boundedField(data.childIndex)}`,

@@ -9,6 +9,7 @@ import { INTERCOM_DETACH_REQUEST_EVENT, POLL_INTERVAL_MS, TEMP_ROOT_DIR, type Co
 import { writeAtomicJson } from "../shared/atomic-json.ts";
 import { shouldUseNativeFsWatch } from "../shared/watch-strategy.ts";
 import { MODEL_ONLY_TOOL } from "../shared/extension-context.ts";
+import { hasUserAuthority, markUserAuthorityBoundary, registerUserAuthorityInput } from "./user-authority.ts";
 import {
 	SUPERVISOR_REQUEST_MESSAGE_TYPE,
 	SUPERVISOR_REPLY_ENTRY_TYPE,
@@ -21,6 +22,8 @@ const SUPERVISOR_CHANNEL_ROOT = path.join(TEMP_ROOT_DIR, "supervisor-channels");
 const REQUESTS_DIR = "requests";
 const REPLIES_DIR = "replies";
 export const NATIVE_SUPERVISOR_TOOL_NAME = "subagent_supervisor";
+export const USER_ATTENTION_EVENT = "subagents:user-attention:v1";
+export type DecisionAuthority = "user" | "supervisor";
 const MAX_MESSAGE_BYTES = 64 * 1024;
 const DEFAULT_ASK_TIMEOUT_MS = 10 * 60 * 1000;
 const CHANNEL_POLL_MS = Math.min(POLL_INTERVAL_MS, 500);
@@ -38,6 +41,8 @@ interface SupervisorRequest {
 	createdAt: number;
 	expiresAt?: number;
 	reason: SupervisorReason;
+	authority?: DecisionAuthority;
+	authorityImplicit?: boolean;
 	message: string;
 	expectsReply: boolean;
 	orchestratorTarget?: string;
@@ -70,6 +75,7 @@ interface SupervisorReply {
 
 interface ContactSupervisorParams {
 	reason: SupervisorReason;
+	authority?: DecisionAuthority;
 	message?: string;
 	interview?: unknown;
 }
@@ -84,6 +90,8 @@ interface IntercomParams {
 type SupervisorWatch = (filename: fs.PathLike, listener: fs.WatchListener<string>) => fs.FSWatcher;
 
 interface NativeSupervisorChannelDeps {
+	/** Child coordinators relay USER asks upward through the same native request/reply transport. */
+	upstreamSupervisor?: ChildSupervisorMetadata;
 	/** Owned live/final-drain mailboxes. Only a completed poll retires the snapshot, never a demand probe. */
 	getChannelDirs?: () => { dirs: string[]; retire?: () => void };
 	/** Retained scheduled states for the current runtime owner, never foreign owners. */
@@ -95,9 +103,16 @@ interface NativeSupervisorChannelDeps {
 
 const ContactSupervisorParamsSchema = Type.Object({
 	reason: Type.String({ enum: ["need_decision", "interview_request", "progress_update"] }),
+	authority: Type.Optional(Type.String({ enum: ["user", "supervisor"] })),
 	message: Type.Optional(Type.String()),
 	interview: Type.Optional(Type.Unsafe({ type: "object", additionalProperties: true })),
 }, { additionalProperties: false });
+
+export function decisionAuthority(reason: SupervisorReason, authority: unknown): { authority?: DecisionAuthority; authorityImplicit?: boolean } {
+	if (reason === "progress_update") return {};
+	if (authority === "supervisor" || authority === "user") return { authority };
+	return { authority: "user", authorityImplicit: true };
+}
 
 const IntercomParamsSchema = Type.Object({
 	action: Type.String({ enum: ["list", "pending", "status", "reply"] }),
@@ -204,6 +219,7 @@ async function sendSupervisorRequest(params: ContactSupervisorParams, metadata: 
 		createdAt,
 		...(expiresAt !== undefined ? { expiresAt } : {}),
 		reason: params.reason,
+		...decisionAuthority(params.reason, params.authority),
 		message,
 		expectsReply,
 		...(metadata.orchestratorTarget ? { orchestratorTarget: metadata.orchestratorTarget } : {}),
@@ -228,7 +244,7 @@ async function sendSupervisorRequest(params: ContactSupervisorParams, metadata: 
 
 	try {
 		const reply = await waitForReply(metadata.channelDir, requestId, replyDeadline, signal);
-		const details: Record<string, unknown> = { requestId, reason: params.reason };
+		const details: Record<string, unknown> = { requestId, reason: params.reason, ...decisionAuthority(params.reason, params.authority), replyMessage: reply.message };
 		if (params.reason === "interview_request") {
 			const structured = parseStructuredReply(reply.message);
 			if (structured.error) details.structuredReplyParseError = structured.error;
@@ -275,12 +291,14 @@ function parseRequestFile(file: string, channelDir: string): PendingSupervisorRe
 	try {
 		const parsed = JSON.parse(fs.readFileSync(file, "utf-8")) as Partial<SupervisorRequest>;
 		if (parsed.type !== "subagent.supervisor.request") return undefined;
-		if (typeof parsed.id !== "string" || !parsed.id) return undefined;
+		if (typeof parsed.id !== "string" || !parsed.id || parsed.id.length > 256) return undefined;
 		if (parsed.reason !== "need_decision" && parsed.reason !== "interview_request" && parsed.reason !== "progress_update") return undefined;
 		if (typeof parsed.message !== "string" || (!parsed.message.trim() && parsed.reason !== "interview_request")) return undefined;
-		if (typeof parsed.runId !== "string" || typeof parsed.agent !== "string" || typeof parsed.childIndex !== "number") return undefined;
+		if (typeof parsed.runId !== "string" || parsed.runId.length > 256 || typeof parsed.agent !== "string" || parsed.agent.length > 128 || typeof parsed.childIndex !== "number" || !Number.isSafeInteger(parsed.childIndex) || parsed.childIndex < 0) return undefined;
 		return {
 			...parsed as SupervisorRequest,
+			...decisionAuthority(parsed.reason, parsed.authority),
+			expectsReply: parsed.reason !== "progress_update",
 			...(typeof parsed.toolCallId === "string" && parsed.toolCallId.length > 0 ? { toolCallId: parsed.toolCallId } : { toolCallId: undefined }),
 			channelDir,
 			requestFile: file,
@@ -489,7 +507,7 @@ function refreshPendingRequests(pending: Map<string, PendingSupervisorRequest>, 
 
 function formatPendingLine(request: PendingSupervisorRequest): string {
 	const replyHint = request.expectsReply ? ` Reply: ${supervisorReplyHint(request.id)}` : "";
-	const header = `- ${request.id}: ${request.agent} [${request.runId}#${request.childIndex}] ${request.reason}.${replyHint}`;
+	const header = `- ${request.id}: ${request.agent} [${request.runId}#${request.childIndex}] ${request.reason} authority=${request.authority ?? "none"}.${replyHint}`;
 	// The request notice can be missed; pending is the parent's only way to read the question again.
 	return request.message ? `${header}\n  ${request.message.replace(/\n/g, "\n  ")}` : header;
 }
@@ -500,7 +518,9 @@ function requestVisibleText(request: PendingSupervisorRequest): string {
 		`Run: ${request.runId}`,
 		`Agent: ${request.agent}`,
 		`Child index: ${request.childIndex}`,
+		`Authority: ${request.authority ?? "none"}`,
 	];
+	if (request.authority === "user") lines.push("Requires genuine new user input. Do not invent an answer. Nested coordinators relay this request upward automatically.");
 	lines.push("");
 	if (request.message) lines.push(request.message);
 	if (request.reason === "interview_request") {
@@ -537,6 +557,7 @@ function appendSupervisorReplyEntry(pi: ExtensionAPI, request: PendingSupervisor
 		appendEntry.call(pi, SUPERVISOR_REPLY_ENTRY_TYPE, {
 			requestId: request.id,
 			reason: request.reason,
+			authority: request.authority,
 			runId: request.runId,
 			agent: request.agent,
 			childIndex: request.childIndex,
@@ -580,6 +601,8 @@ function publicPendingRequests(pending: Map<string, PendingSupervisorRequest>): 
 		agent: request.agent,
 		childIndex: request.childIndex,
 		reason: request.reason,
+		...decisionAuthority(request.reason, request.authority),
+		...(request.authorityImplicit ? { authorityImplicit: true } : {}),
 		expectsReply: request.expectsReply,
 	}));
 }
@@ -591,7 +614,7 @@ function buildParentSupervisorTool(pi: ExtensionAPI, pending: Map<string, Pendin
 		label: "Subagent Supervisor",
 		description: "Native pi-subagents supervisor channel. Use reply/pending/status to answer child subagent requests without overriding pi-intercom.",
 		parameters: IntercomParamsSchema,
-		async execute(_id, params) {
+		async execute(_id, params, _signal, _update, ctx) {
 			// Discover new request files even when demand-gated polling is idle.
 			discover();
 			refreshPendingRequests(pending, state, onLifecycle, runState);
@@ -605,6 +628,10 @@ function buildParentSupervisorTool(pi: ExtensionAPI, pending: Map<string, Pendin
 			}
 			if (input.action === "reply") {
 				const request = resolvePendingRequest(pending, input);
+				const session = ctx?.sessionManager ?? state.lastUiContext?.sessionManager;
+				if (request.authority === "user" && (!session || session.getSessionId() !== state.supervisorOwnerSessionId || !hasUserAuthority(session, request.id))) {
+					throw new Error("USER_AUTHORITY_REQUIRED: This request requires genuine interactive user input after it became pending. Synthetic messages and autonomous coordinator replies cannot authorize it. Nested coordinators must propagate authority=user using contact_supervisor; the native channel relays user-owned asks automatically.");
+				}
 				const reply = writeReply(request, input.message ?? "");
 				appendSupervisorReplyEntry(pi, request, reply);
 				onLifecycle(request, "resolved");
@@ -636,6 +663,17 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 		return state;
 	};
 	const pending = new Map<string, PendingSupervisorRequest>();
+	const userAttention = new Map<string, PendingSupervisorRequest>();
+	const relays = new Map<string, AbortController>();
+	const unsubscribeInput = typeof pi.on === "function" ? registerUserAuthorityInput(pi) : undefined;
+	const attention = (request: PendingSupervisorRequest, active: boolean): void => {
+		if (request.authority !== "user" || !request.expectsReply) return;
+		if (active === userAttention.has(request.id)) return;
+		if (active) userAttention.set(request.id, request); else userAttention.delete(request.id);
+		try {
+			pi.events?.emit(USER_ATTENTION_EVENT, { version: 1, active, sessionId: request.orchestratorSessionId, requestId: request.id, runId: request.runId, agent: request.agent.slice(0, 128), childIndex: request.childIndex, reason: request.reason, authority: "user" });
+		} catch (error) { console.error("Failed to publish user attention:", error); }
+	};
 	const requestCorrelations = new Map<string, SupervisorRequestCorrelation>();
 	const correlationKey = (request: { runId: string; agent: string; childIndex: number; toolCallId?: string }): string | undefined => {
 		if (!request.toolCallId) return undefined;
@@ -665,6 +703,10 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 	};
 	const observeRequestLifecycle: SupervisorRequestLifecycleObserver = (request, lifecycle) => {
 		if (lifecycle !== "wrong-session") rememberResolvedRequest(request);
+		attention(request, false);
+		relays.get(request.id)?.abort();
+		relays.delete(request.id);
+		clearForegroundSupervisorAttention(request, pending, state);
 	};
 	const getSupervisorRequestState = (event: ControlEvent): SupervisorRequestState => {
 		if (event.currentTool === "intercom" || event.index === undefined) return "unknown";
@@ -751,6 +793,11 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 			}
 			rememberPendingRequest(request);
 			pending.set(request.id, request);
+			if (request.authority === "user") {
+				try { markUserAuthorityBoundary(pi, state.lastUiContext?.sessionManager, request.id); }
+				catch (error) { console.error("Failed to persist user authority boundary; replies fail closed:", error); }
+				attention(request, true);
+			}
 			markForegroundSupervisorAttention(request, state);
 			// The ask is already queued above. A sendMessage failure (no UI, stale context) must not
 			// lose it, and must not abort the loop before the remaining asks register.
@@ -763,6 +810,8 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 						id: request.id,
 						requestId: request.id,
 						reason: request.reason,
+						...decisionAuthority(request.reason, request.authority),
+						...(request.authorityImplicit ? { authorityImplicit: true } : {}),
 						expectsReply: request.expectsReply,
 						runId: request.runId,
 						agent: request.agent,
@@ -772,7 +821,7 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 						requestBody: request.message,
 						replyHint: supervisorReplyHint(request.id),
 					},
-				}, { triggerTurn: true });
+				}, { triggerTurn: request.authority === "supervisor" });
 			} catch (error) {
 				console.error(`Failed to surface supervisor request ${request.id} as a user turn:`, error);
 			}
@@ -783,6 +832,21 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 				childIndex: request.childIndex,
 			});
 			if (pending.has(request.id)) markForegroundSupervisorAttention(request, state);
+			if (request.authority === "user" && deps.upstreamSupervisor) {
+				const controller = new AbortController();
+				relays.set(request.id, controller);
+				// No model turn, invented answer, or second transport. Only an upstream
+				// reply admitted by its owning parent's USER gate can resume this child.
+				void sendSupervisorRequest({ reason: request.reason, authority: "user", message: request.message, interview: request.interview }, deps.upstreamSupervisor, controller.signal).then(result => {
+					if (controller.signal.aborted || !pending.has(request.id)) return;
+					if (requestLifecycle(request, state, Date.now(), runState(request)) !== "pending") return;
+					if (typeof result.details.replyMessage !== "string") return;
+					const reply = writeReply(request, result.details.replyMessage);
+					appendSupervisorReplyEntry(pi, request, reply);
+					pending.delete(request.id);
+					observeRequestLifecycle(request, "resolved");
+				}).catch(error => { if (!controller.signal.aborted) console.error("User authority relay failed; request remains pending:", error); });
+			}
 		}
 		channels?.retire?.();
 	};
@@ -901,6 +965,10 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 		},
 		dispose: () => {
 			started = false;
+			unsubscribeInput?.();
+			for (const controller of relays.values()) controller.abort();
+			relays.clear();
+			for (const request of userAttention.values()) attention(request, false);
 			try {
 				rootWatcher?.close();
 			} catch {

@@ -62,7 +62,8 @@ describe("default factory queued-message probe", () => {
 		assert.equal(modelResolved, false);
 	});
 
-	it("reports no queued messages for an agent-less wrapped session", async () => {
+	it("reports no queued messages and tags coordinator prompt, steer and follow-up as extension input", async () => {
+		const inputs: unknown[][] = [];
 		const factory = createDefaultChildSessionFactory({
 			loadPiCodingAgent: async () => ({
 				ModelRuntime: { create: async () => ({}) },
@@ -76,10 +77,10 @@ describe("default factory queued-message probe", () => {
 						dispose() {},
 						extensionRunner: { hasHandlers: () => false },
 						subscribe: () => () => {},
-						prompt: async () => {},
+						prompt: async (...args: unknown[]) => { inputs.push(args); },
 						abort: async () => {},
-						steer: async () => {},
-						followUp: async () => {},
+						steer: async (...args: unknown[]) => { inputs.push(args); },
+						followUp: async (...args: unknown[]) => { inputs.push(args); },
 						messages: [],
 						sessionId: "agent-less",
 					},
@@ -98,6 +99,9 @@ describe("default factory queued-message probe", () => {
 		});
 		assert.equal(child.hasQueuedMessages?.(), false);
 		assert.equal(childSessionHasQueuedMessages(child), false);
+		await child.prompt("start"); await child.steer("invented answer"); await child.followUp("another child says yes");
+		assert.deepEqual(inputs, [["start", { source: "extension" }], ["invented answer", undefined, { source: "extension" }], ["another child says yes", undefined, { source: "extension" }]]);
+		await child.dispose();
 	});
 
 	it("re-arms from a wrapped session whose agent reports queued input", async () => {

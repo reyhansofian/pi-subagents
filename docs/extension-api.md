@@ -2,6 +2,49 @@
 
 Public seams for other Pi extensions and host integrations: the in-process RPC, the structured delegation API, launch preflight, capability ceilings, the background-work provider contract, and the Herdr integration.
 
+## User decision authority and attention
+
+Blocking `contact_supervisor` requests (`need_decision` and `interview_request`)
+accept `authority?: "user" | "supervisor"`. Missing or invalid authority in an
+old request is conservatively `user` with `authorityImplicit: true`. Progress
+updates remain nonblocking and have no decision authority. The field survives
+native foreground/background mailboxes and Herdr relay, pending tools and TUI.
+
+Only supervisor-owned requests start an autonomous parent turn. A user-owned
+reply is rejected with `USER_AUTHORITY_REQUIRED` until a genuine interactive
+`input` event occurs after the request became pending in that exact parent
+session. Public `appendEntry` records a pending boundary and an input receipt;
+the public current branch journal proves their order across reload/resume.
+Role=user messages, extension inputs, child messages, older inputs and RPC
+inputs do not grant authority. RPC lacks proof of human provenance, so it
+fails closed. Journal-less hosts also fail closed. Trusted extensions can
+write session entries; this is an agent authority boundary, not a sandbox
+against malicious extensions or an operator editing request/session files.
+Input proves the opportunity for a human answer, not its semantic relevance.
+
+Nested native coordinators automatically propagate user requests upward using
+the same supervisor request/reply transport. They do not launch an autonomous
+answer turn. An upstream reply admitted by the root gate is forwarded to the
+waiting grandchild. Autonomous intermediate `subagent_supervisor` replies
+still fail closed. Cancellation, expiry and shutdown cancel outstanding relays.
+
+Listen on the public process-local event bus for `subagents:user-attention:v1`:
+
+```typescript
+{
+  version: 1, active: boolean, sessionId: string,
+  requestId: string, runId: string, agent: string, childIndex: number,
+  reason: "need_decision" | "interview_request", authority: "user"
+}
+```
+
+`sessionId` is the **owning parent's native session ID**, not a session file
+path or root run ID. Consumers must filter on it. No question, prompt or tool
+output is included. One active transition is emitted per discovered request
+in a runtime; resolution, expiry, cancellation, owner change or disposal emits
+its clear. Reload can replay active requests: consumers must deduplicate by
+`sessionId` and stable `requestId`. Delivery failures do not lose pending asks.
+
 ## Trusted workflow resources
 
 Loaded trusted TypeScript extensions can import `registerWorkflowResource` from `pi-subagents/workflow-resources`. This subpath does not load the main extension and exposes no resolver or permit constructor. Its exported types are `RegisterWorkflowResourceInput`, `WorkflowResourceDefinition`, and `WorkflowResourceRegistration`:

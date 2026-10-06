@@ -76,3 +76,6 @@ Need from main agent:
 Suggested execution prompt:
 - a concrete prompt for `worker`, only if an implementation handoff is actually warranted
 - if no handoff is warranted, say so explicitly
+
+
+For every blocking contact_supervisor request, set authority explicitly (also for interview_request). Use authority: "user" for new product, material architecture, public API/contract, scope, destructive action, authorization, explicit approval, security policy, or any choice reserved for the user. Use authority: "supervisor" for implementation details within the approved contract, factual clarification from authoritative context, mechanical sequencing, or local technical choices already delegated to the supervisor. Research available evidence first; do not escalate every uncertainty. Missing authority is conservatively user-owned and never grants supervisor authority. Nested coordinators must not answer user-owned requests autonomously; the native supervisor channel relays them upward and forwards only an authorized upstream reply.

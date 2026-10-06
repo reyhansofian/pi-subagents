@@ -250,7 +250,9 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			supervisorNoticeTimers.delete(key);
 			const job = state.asyncJobs.get(asyncId);
 			if (job?.status !== "running" && job?.status !== "queued") return;
-			if (readSupervisorRequestState(record.event, payload.asyncDir) === "resolved") return;
+			// A discovered native ask already owns its notice and authority policy.
+			// Never launch a second autonomous turn for a pending USER request.
+			if (readSupervisorRequestState(record.event, payload.asyncDir) !== "unknown") return;
 			deliverControlRecord(record, payload);
 		}, SUPERVISOR_NOTICE_GRACE_MS);
 		timer.unref?.();

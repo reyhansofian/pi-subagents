@@ -47,6 +47,11 @@ function makeRecorder() {
 }
 
 describe("subagent control notice delivery", () => {
+	it("never starts an autonomous turn for an undiscovered native supervisor ask", () => {
+		const recorder = makeRecorder();
+		handleSubagentControlNotice({ pi: recorder.pi, state: makeState(), visibleControlNotices: new Set(), details: { source: "async", event: needsAttentionEvent({ reason: "supervisor_request", currentTool: "contact_supervisor" }) } });
+		assert.deepEqual(recorder.sent[0]?.options, { triggerTurn: false });
+	});
 	it("delivers async needs-attention notices immediately", () => {
 		const state = makeState();
 		const recorder = makeRecorder();
