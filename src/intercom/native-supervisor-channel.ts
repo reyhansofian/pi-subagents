@@ -512,7 +512,7 @@ function formatPendingLine(request: PendingSupervisorRequest): string {
 	return request.message ? `${header}\n  ${request.message.replace(/\n/g, "\n  ")}` : header;
 }
 
-function requestVisibleText(request: PendingSupervisorRequest): string {
+function requestVisibleText(request: PendingSupervisorRequest, hasUpstreamSupervisor: boolean): string {
 	const lines = [
 		reasonHeading(request.reason),
 		`Run: ${request.runId}`,
@@ -520,7 +520,17 @@ function requestVisibleText(request: PendingSupervisorRequest): string {
 		`Child index: ${request.childIndex}`,
 		`Authority: ${request.authority ?? "none"}`,
 	];
-	if (request.authority === "user") lines.push("Requires genuine new user input. Do not invent an answer. Nested coordinators relay this request upward automatically.");
+	if (request.authority === "user") {
+		if (hasUpstreamSupervisor) {
+			lines.push("Requires genuine new user input. Do not invent an answer. This request is relayed upward automatically; do not present or answer it autonomously.");
+		} else {
+			lines.push(
+				"Explain the decision, available options, and consequences using the available evidence. Do not invent missing options or an answer.",
+				"Ask the user directly in ordinary text, then stop and wait for genuine new user input. Do not reply to the child or resume its work before that input.",
+				"Attention is already registered. Do not call request_user_attention or register duplicate attention.",
+			);
+		}
+	}
 	lines.push("");
 	if (request.message) lines.push(request.message);
 	if (request.reason === "interview_request") {
@@ -804,7 +814,7 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 			try {
 				pi.sendMessage({
 					customType: SUPERVISOR_REQUEST_MESSAGE_TYPE,
-					content: requestVisibleText(request),
+					content: requestVisibleText(request, Boolean(deps.upstreamSupervisor)),
 					display: true,
 					details: {
 						id: request.id,
@@ -821,7 +831,7 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 						requestBody: request.message,
 						replyHint: supervisorReplyHint(request.id),
 					},
-				}, { triggerTurn: request.authority === "supervisor" });
+				}, { triggerTurn: request.authority === "supervisor" || !deps.upstreamSupervisor });
 			} catch (error) {
 				console.error(`Failed to surface supervisor request ${request.id} as a user turn:`, error);
 			}

@@ -29,8 +29,8 @@ function host(owner = randomUUID(), entries: any[] = [], upstreamSupervisor?: an
 	channel.start();
 	cleanups.push(() => channel.dispose());
 	return { pi, ctx, owner, channel, entries, events, notices, dirs, state,
-		input(source = "interactive") { handlers.get("input")?.({ source, text: "Yes" }, ctx); },
-		call(params: any) { return tools.get("subagent_supervisor").execute("t", params, undefined, undefined, ctx); },
+		input(source = "interactive", context = ctx) { handlers.get("input")?.({ source, text: "Yes" }, context); },
+		call(params: any, context = ctx) { return tools.get("subagent_supervisor").execute("t", params, undefined, undefined, context); },
 	};
 }
 
@@ -68,16 +68,20 @@ for (const mode of ["foreground", "background"]) {
 			const c = child(h, { reason: "need_decision", ...(authority ? { authority } : {}), message: "Preserve API?" }, mode);
 			assert.equal(c.request?.authority, "user");
 			assert.equal(c.request?.authorityImplicit, authority ? undefined : true);
-			assert.equal(h.notices[0].options.triggerTurn, false);
+			assert.equal(h.notices[0].options.triggerTurn, true);
 			const reply = { action: "reply", replyTo: c.request!.id, message: "Preserve it" };
 			await assert.rejects(h.call(reply), /USER_AUTHORITY_REQUIRED/);
 			h.input("extension"); h.input("rpc");
+			const foreignContext = { sessionManager: { ...h.ctx.sessionManager, getSessionId: () => "other-session" } };
+			h.input("interactive", foreignContext);
 			h.entries.push({ type: "message", message: { role: "user", content: "Synthetic" } });
 			h.pi.sendMessage({ customType: "another-child" }, { triggerTurn: true });
 			await assert.rejects(h.call(reply), /USER_AUTHORITY_REQUIRED/);
 			for (let i = 0; i < 3; i++) h.channel.activateTransport();
 			assert.equal(h.events.filter(e => e.active).length, 1);
+			assert.equal(h.notices.filter(n => n.message.details?.requestId === c.request!.id).length, 1);
 			h.input();
+			await assert.rejects(h.call(reply, foreignContext), /USER_AUTHORITY_REQUIRED/);
 			// New extension runtime, same persisted branch. No wall-clock proof.
 			h.channel.dispose();
 			const restored = host(h.owner, JSON.parse(JSON.stringify(h.entries)));
@@ -89,6 +93,41 @@ for (const mode of ["foreground", "background"]) {
 		});
 	}
 }
+
+it("root wake instructs evidence-backed explanation, a direct question, and stopping without duplicate attention", async () => {
+	const h = host();
+	const c = child(h, { reason: "need_decision", authority: "user", message: "Keep the API to preserve callers, or remove it to reduce maintenance?" });
+	const content = h.notices[0].message.content;
+	assert.match(content, /Explain the decision, available options, and consequences using the available evidence/);
+	assert.match(content, /Do not invent missing options or an answer/);
+	assert.match(content, /Ask the user directly in ordinary text, then stop and wait for genuine new user input/);
+	assert.match(content, /Do not reply to the child or resume its work before that input/);
+	assert.match(content, /Attention is already registered\. Do not call request_user_attention or register duplicate attention/);
+	assert.ok(content.includes(c.request!.message));
+	assert.ok(content.includes(c.request!.id));
+	await assert.rejects(h.call({ action: "reply", replyTo: c.request!.id, message: "Remove it" }), /USER_AUTHORITY_REQUIRED/);
+	assert.equal(fs.existsSync(path.join(c.channelDir, "replies", `${c.request!.id}.json`)), false);
+});
+
+it("root structured interview wakes once and preserves the shape and genuine user reply", async () => {
+	const h = host();
+	const interview = { title: "API compatibility", questions: [{ id: "api", prompt: "Keep the API?", options: ["Keep", "Remove"] }] };
+	const c = child(h, { reason: "interview_request", interview, message: "Keep preserves callers; removal reduces maintenance." });
+	assert.equal(h.notices[0].options.triggerTurn, true);
+	assert.deepEqual(h.notices[0].message.details.interview, interview);
+	assert.ok(h.notices[0].message.content.includes(JSON.stringify(interview, null, "\t")));
+	assert.match(h.notices[0].message.content, /Reply with JSON/);
+	for (let i = 0; i < 3; i++) h.channel.activateTransport();
+	assert.equal(h.notices.length, 1);
+	assert.equal(h.events.filter(e => e.active).length, 1);
+	const reply = { action: "reply", replyTo: c.request!.id, message: JSON.stringify({ api: "Keep" }) };
+	await assert.rejects(h.call(reply), /USER_AUTHORITY_REQUIRED/);
+	h.input();
+	await h.call(reply);
+	assert.deepEqual((await c.result).details.structuredReply, { api: "Keep" });
+	assert.deepEqual(h.events.map(e => e.active), [true, false]);
+	assert.equal(h.channel.pending.size, 0);
+});
 
 it("progress stays nonblocking without authority, notice, or attention", async () => {
 	const h = host(); const c = child(h, { reason: "progress_update", message: "Evidence found" });
@@ -108,23 +147,37 @@ for (const ending of ["cancel", "expire", "inactive"]) {
 	});
 }
 
-it("nested coordinator rejects an autonomous USER reply and propagates USER upward on the existing transport", async () => {
-	const root = host(), runId = randomUUID(), agent = "coordinator", channelDir = resolveSupervisorChannelDir(runId, agent, 0);
-	root.dirs.push(channelDir); cleanups.push(() => fs.rmSync(channelDir, { recursive: true, force: true }));
-	const coordinator = host(randomUUID(), [], { channelDir, runId, agent, childIndex: 0, orchestratorSessionId: root.owner });
-	const leaf = child(coordinator, { reason: "need_decision", authority: "user", message: "Preserve API?" });
-	await assert.rejects(coordinator.call({ action: "reply", replyTo: leaf.request!.id, message: "Invented yes" }), /USER_AUTHORITY_REQUIRED/);
-	coordinator.input("extension");
-	await assert.rejects(coordinator.call({ action: "reply", replyTo: leaf.request!.id, message: "Still invented" }), /USER_AUTHORITY_REQUIRED/);
-	root.channel.activateTransport();
-	const [upstream] = root.channel.pending.values();
-	assert.equal(upstream?.authority, "user"); assert.equal(upstream?.agent, "coordinator");
-	await assert.rejects(root.call({ action: "reply", replyTo: upstream!.id, message: "Invented" }), /USER_AUTHORITY_REQUIRED/);
-	assert.equal(root.events.filter(e => e.active).length, 1);
-	root.input(); await root.call({ action: "reply", replyTo: upstream!.id, message: "Keep API" });
-	assert.equal((await leaf.result).details.replyMessage, "Keep API");
-	assert.deepEqual(coordinator.events.map(e => e.active), [true, false]);
-});
+for (const reason of ["need_decision", "interview_request"]) {
+	it(`nested ${reason} relays without an intermediate wake and wakes the root without granting reply authority`, async () => {
+		const root = host(), runId = randomUUID(), agent = "coordinator", channelDir = resolveSupervisorChannelDir(runId, agent, 0);
+		root.dirs.push(channelDir); cleanups.push(() => fs.rmSync(channelDir, { recursive: true, force: true }));
+		const coordinator = host(randomUUID(), [], { channelDir, runId, agent, childIndex: 0, orchestratorSessionId: root.owner });
+		const interview = reason === "interview_request" ? { questions: [{ id: "api", prompt: "Preserve API?", options: ["Keep", "Remove"] }] } : undefined;
+		const leaf = child(coordinator, { reason, authority: "user", message: "Preserve API?", ...(interview ? { interview } : {}) });
+		assert.equal(coordinator.notices[0].options.triggerTurn, false);
+		await assert.rejects(coordinator.call({ action: "reply", replyTo: leaf.request!.id, message: "Invented yes" }), /USER_AUTHORITY_REQUIRED/);
+		coordinator.input("extension");
+		await assert.rejects(coordinator.call({ action: "reply", replyTo: leaf.request!.id, message: "Still invented" }), /USER_AUTHORITY_REQUIRED/);
+		root.channel.activateTransport();
+		const [upstream] = root.channel.pending.values();
+		assert.equal(upstream?.authority, "user"); assert.equal(upstream?.agent, "coordinator");
+		assert.equal(root.notices[0].options.triggerTurn, true);
+		assert.deepEqual(root.notices[0].message.details.interview, interview);
+		assert.match(root.notices[0].message.content, /Ask the user directly in ordinary text, then stop/);
+		for (let i = 0; i < 3; i++) { coordinator.channel.activateTransport(); root.channel.activateTransport(); }
+		assert.equal(coordinator.notices.length, 1);
+		assert.equal(root.notices.length, 1);
+		await assert.rejects(root.call({ action: "reply", replyTo: upstream!.id, message: "Invented" }), /USER_AUTHORITY_REQUIRED/);
+		assert.equal(root.events.filter(e => e.active).length, 1);
+		const message = interview ? JSON.stringify({ api: "Keep" }) : "Keep API";
+		root.input(); await root.call({ action: "reply", replyTo: upstream!.id, message });
+		const result = await leaf.result;
+		assert.equal(result.details.replyMessage, message);
+		if (interview) assert.deepEqual(result.details.structuredReply, { api: "Keep" });
+		assert.deepEqual(coordinator.events.map(e => e.active), [true, false]);
+		assert.deepEqual(root.events.map(e => e.active), [true, false]);
+	});
+}
 
 it("Herdr relay persists explicit and implicit authority and rejects authority-changing replay", async () => {
 	const h = host(), runId = randomUUID(), channelDir = resolveSupervisorChannelDir(runId, "remote", 0);

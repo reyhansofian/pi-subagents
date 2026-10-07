@@ -10,7 +10,11 @@ old request is conservatively `user` with `authorityImplicit: true`. Progress
 updates remain nonblocking and have no decision authority. The field survives
 native foreground/background mailboxes and Herdr relay, pending tools and TUI.
 
-Only supervisor-owned requests start an autonomous parent turn. A user-owned
+Supervisor-owned requests start an autonomous parent turn. User-owned requests
+wake only the root coordinator to explain the decision, available options and
+consequences from the available evidence, ask the user directly, and stop for
+genuine input. The root must not invent missing options or an answer, or register
+duplicate attention. This presentation turn grants no reply authority. A user-owned
 reply is rejected with `USER_AUTHORITY_REQUIRED` until a genuine interactive
 `input` event occurs after the request became pending in that exact parent
 session. Public `appendEntry` records a pending boundary and an input receipt;
