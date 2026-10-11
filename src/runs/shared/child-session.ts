@@ -166,6 +166,9 @@ export interface ChildSessionFactory {
 export type PiCodingAgentModule = typeof import("@earendil-works/pi-coding-agent");
 
 export interface DefaultChildSessionFactoryOptions {
+	confinedProviderTransport?: { model: string; authority?: { modelId: string }; fetch?: typeof globalThis.fetch; readCredential?: (signal?: AbortSignal) => Promise<import("./collaboration-provider-transport.ts").CollaborationOAuthCredential> };
+	/** Confined native runner only: same source credentials/config, read-only auth and private catalog cache. */
+	confinedModelStorage?: { authPath: string; modelsPath: string; modelsStorePath: string; readonlyAuthModule: string };
 	/**
 	 * Loads the pi package the sessions are created from. The parent process
 	 * uses the host's in-process module; the detached runner imports the
@@ -383,11 +386,43 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 	const mcpWaits = new Set<Promise<void>>();
 	let disposals = 0;
 	const sharedRuntime = async (pi: PiCodingAgentModule) => {
-		runtime ??= pi.ModelRuntime.create().catch((error: unknown) => {
+		const storage = options.confinedModelStorage;
+		// SAFETY: The launch pins the selected SDK module; its read-only constructor is checked before use.
+		const authModule = storage ? await import(pathToFileURL(storage.readonlyAuthModule).href) as { ReadOnlyAuthStorage?: new (authPath: string) => NonNullable<Parameters<PiCodingAgentModule["ModelRuntime"]["create"]>[0]>["credentials"] } : undefined;
+		if (storage && !authModule?.ReadOnlyAuthStorage) throw new Error("shared-workspace-unsupported: selected Pi host lacks read-only credential storage; auth write authority was not granted.");
+		const protectedTransport = options.confinedProviderTransport;
+		const credentials = protectedTransport ? {
+			async read(providerId: string, opts?: { signal?: AbortSignal }) {
+				opts?.signal?.throwIfAborted();
+				return providerId === "openai-codex" ? protectedTransport.readCredential?.(opts?.signal) : undefined;
+			},
+			async list(opts?: { signal?: AbortSignal }) {
+				opts?.signal?.throwIfAborted();
+				return protectedTransport.authority ? [{ providerId: "openai-codex", type: "oauth" as const }] : [];
+			},
+			async modify() { throw new Error("Confined provider credential writes are not granted."); },
+			async delete() { throw new Error("Confined provider credential writes are not granted."); },
+		} : storage ? new authModule!.ReadOnlyAuthStorage!(storage.authPath) : undefined;
+		runtime ??= (storage ? pi.ModelRuntime.create({ credentials, modelsPath: storage.modelsPath, modelsStorePath: storage.modelsStorePath }) : pi.ModelRuntime.create()).catch((cause: unknown) => {
 			runtime = undefined;
-			throw error;
+			throw cause;
 		});
-		return runtime;
+		const resolved = await runtime;
+		if (options.confinedProviderTransport && !("collaborationTransportBound" in resolved)) {
+			const transport = options.confinedProviderTransport;
+			const streamSimple = resolved.streamSimple.bind(resolved);
+			resolved.streamSimple = (model, context, requestOptions) => {
+				const identity = transport.model.replace(/:[a-z]+$/u, "");
+				if (model.provider + "/" + model.id !== identity) throw new Error("shared-workspace-unsupported: selected provider/model authority changed.");
+				if (transport.authority && (model.provider !== "openai-codex" || model.api !== "openai-codex-responses" || model.baseUrl !== "https://chatgpt.com/backend-api")) throw new Error("shared-workspace-unsupported: selected provider route changed; no fallback.");
+				if (requestOptions?.fetch) throw new Error("shared-workspace-unsupported: a custom fetch transport requires separate enrollment; callbacks were not discarded.");
+				const confinedOptions = { ...requestOptions };
+				if (transport.fetch) confinedOptions.fetch = transport.fetch;
+				return streamSimple(model, context, confinedOptions);
+			};
+			Object.defineProperty(resolved, "collaborationTransportBound", { value: true });
+		}
+		return resolved;
 	};
 	return {
 		async create(launch) {

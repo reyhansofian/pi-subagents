@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import { isCollaborationNativeRun } from "../shared/collaboration-launch.ts";
 import * as path from "node:path";
 import { DIRS, type AcceptanceInput, type AsyncStatus, type SteeringRecoveryDescriptor, type SubagentRunMode } from "../../shared/types.ts";
 import type { AgentConfig } from "../../agents/agents.ts";
@@ -472,6 +473,7 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 		throw new Error("Async run not found. Provide id or dir.");
 	}
 
+	if (location.asyncDir && isCollaborationNativeRun(path.basename(location.asyncDir))) throw new Error("A collaboration child cannot resume outside its fenced manifest. Continue through runs.collaborate after safe workspace recovery.");
 	const reconciliation = location.asyncDir
 		? reconcileAsyncRun(location.asyncDir, { resultsDir, kill: deps.kill, now: deps.now })
 		: undefined;

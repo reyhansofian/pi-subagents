@@ -5,7 +5,7 @@ import { performance } from "node:perf_hooks";
 import { pathToFileURL } from "node:url";
 import type { Message } from "@earendil-works/pi-ai";
 import { installRunnerHttpDispatcher } from "./runner-http-dispatcher.ts";
-import { writeAtomicJson } from "../../shared/atomic-json.ts";
+import { writeAtomicJson, writePrivateAtomicJson } from "../../shared/atomic-json.ts";
 import { writeAsyncResultFile, writePendingAsyncResultFile } from "./result-files.ts";
 import { createFileCoalescer } from "../../shared/file-coalescer.ts";
 import { createCapacityResilientJsonWriter } from "../../shared/capacity-resilient-json.ts";
@@ -169,6 +169,15 @@ const INTERCOM_DETACH_RECEIPT = "Detached for intercom coordination before task 
 process.env[SUBAGENT_CHILD_ENV] = "1";
 
 export interface SubagentRunConfig {
+	/** Host-only confined launch provenance. Ordinary runners leave this absent. */
+	collaborationGrant?: string;
+	collaborationExtensionPaths?: string[];
+	collaborationProviderTransport?: { model: string; authority?: { modelId: string }; fd?: number };
+	collaborationPrivateDir?: string;
+	collaborationHostStatus?: AsyncStatus;
+	collaborationManifestVersion?: number;
+	collaborationDependencyBindings?: Record<string, { path: string; version: number; digest: string }>;
+	collaborationModelStorage?: { authPath: string; modelsPath: string; modelsStorePath: string; readonlyAuthModule: string };
 	id: string;
 	steps: RunnerStep[];
 	resultPath: string;
@@ -1880,6 +1889,9 @@ export async function runSubagent(
 	const handoffWorkflowKey = config.workflowKey;
 	const handoffChildRunId = handoffWorkflowKey ? id : undefined;
 	const statusPath = path.join(asyncDir, "status.json");
+	// SAFETY: Only the host writes this read-only status; the required startup identity is checked immediately below.
+	const enrolledHostStatus = config.collaborationHostStatus ?? (config.collaborationGrant ? JSON.parse(fs.readFileSync(statusPath, "utf8")) as AsyncStatus : undefined);
+	if (enrolledHostStatus && (enrolledHostStatus.runId !== id || !enrolledHostStatus.pid || enrolledHostStatus.processTerminal?.runnerProcessInstanceId !== config.runnerProcessInstanceId)) throw new Error("Confined runner lacks parent-observed startup identity.");
 	const eventsPath = path.join(asyncDir, "events.jsonl");
 	const logPath = path.join(asyncDir, `subagent-log-${id}.md`);
 	const controlConfig = config.controlConfig ?? DEFAULT_CONTROL_CONFIG;
@@ -2044,8 +2056,8 @@ export async function runSubagent(
 		...(config.deadlineAt !== undefined ? { deadlineAt: config.deadlineAt } : {}),
 		...(config.toolBudget ? { toolBudget: initialToolBudgetState(config.toolBudget) } : {}),
 		...(config.usageBudget ? { usageBudget: usageBudgetState(config.usageBudget, undefined) } : {}),
-		pid: process.pid,
-		pidNamespaceScope: currentPidNamespaceScope(),
+		pid: enrolledHostStatus?.pid ?? process.pid,
+		pidNamespaceScope: enrolledHostStatus?.pidNamespaceScope ?? currentPidNamespaceScope(),
 		cwd,
 		currentStep: 0,
 		chainStepCount: steps.length,
@@ -2074,6 +2086,7 @@ export async function runSubagent(
 		onError: (error, filePath) => console.error(`Failed to update async run index '${filePath}':`, error),
 	});
 	const queueActiveRunIndex = (status: AsyncStatus): void => {
+		if (config.collaborationGrant) return; // Parent owns shared indexes for confined workers.
 		const state = status.state;
 		if (state === lastIndexedStatusState && indexPersistence.pendingCount() === 0) return;
 		indexPersistence.write(asyncDir, { state, toolCallId: status.toolCallId }, (_filePath, payload) => {
@@ -5216,12 +5229,42 @@ export async function runSubagent(
 
 /** Heavy execution entry loaded by the bootstrap only after startup commits. */
 export async function runConfiguredSubagentExecution(config: SubagentRunConfig, options?: DefaultChildSessionFactoryOptions): Promise<void> {
+	if (config.collaborationGrant) {
+		if (!config.collaborationPrivateDir || !path.isAbsolute(config.collaborationPrivateDir)) throw new Error("Confined runner lacks its private proposal directory.");
+		// SAFETY: This host-owned read-only AsyncStatus was persisted before the worker startup permit.
+		const hostStatus = JSON.parse(fs.readFileSync(path.join(config.asyncDir, "status.json"), "utf8")) as AsyncStatus;
+		const { collaborationDigest } = await import("../../workflows/collaboration-manifest.ts");
+		for (const binding of Object.values(config.collaborationDependencyBindings ?? {})) if (collaborationDigest(binding.path) !== binding.digest) throw new Error("Obsolete dependency generation; no writable session was created.");
+		writePrivateAtomicJson(path.join(config.collaborationPrivateDir, "dependency-ack.json"), { executionToken: config.collaborationGrant, manifestVersion: config.collaborationManifestVersion, bindings: config.collaborationDependencyBindings ?? {} });
+		const proceed = path.join(config.asyncDir, "dependency-proceed.json");
+		const deadline = Date.now() + 10000;
+		while (!fs.existsSync(proceed)) {
+			if (Date.now() >= deadline) throw new Error("Dependency refresh acknowledgment was not authorized; no writable session was created.");
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+		// SAFETY: This read-only parent permit is accepted only for the exact execution token and manifest version below.
+		const permit = JSON.parse(fs.readFileSync(proceed, "utf8")) as { executionToken?: string; manifestVersion?: number };
+		if (permit.executionToken !== config.collaborationGrant || permit.manifestVersion !== config.collaborationManifestVersion) throw new Error("Dependency permit belongs to an obsolete execution.");
+		config = { ...config, collaborationHostStatus: hostStatus, asyncDir: config.collaborationPrivateDir, resultPath: path.join(config.collaborationPrivateDir, "result.json") };
+	}
 	let childSessions: ChildSessionFactory;
+	let transport: ReturnType<typeof import("../shared/collaboration-provider-transport.ts")["createCollaborationProviderClient"]> | undefined;
 	try {
 		// Detached Node runners do not receive Pi's CLI dispatcher setup. Binary
 		// hosts install the same dispatcher before entering the shared bootstrap.
 		if (!options?.loadPiCodingAgent) installRunnerHttpDispatcher({ agentDir: getAgentDir(), cwd: process.cwd() });
-		childSessions = await loadRunnerChildSessionFactory(config, options);
+		if (config.collaborationProviderTransport?.fd !== undefined) {
+			const { createCollaborationProviderClient } = await import("../shared/collaboration-provider-transport.ts");
+			transport = createCollaborationProviderClient(config.collaborationProviderTransport.fd);
+			Object.defineProperty(globalThis, "WebSocket", { value: transport.WebSocket, writable: true, configurable: true });
+			globalThis.fetch = transport.fetch;
+		}
+		let factoryOptions = options;
+		if (config.collaborationModelStorage) {
+			factoryOptions = { ...options, confinedModelStorage: config.collaborationModelStorage };
+			if (config.collaborationProviderTransport) factoryOptions.confinedProviderTransport = { ...config.collaborationProviderTransport, fetch: transport?.fetch, readCredential: transport && config.collaborationProviderTransport.authority ? (signal) => transport!.readCredential(config.collaborationProviderTransport!.authority!.modelId, signal) : undefined };
+		}
+		childSessions = await loadRunnerChildSessionFactory(config, factoryOptions);
 	} catch (error) {
 		try {
 			persistRunnerStartupFailure({
@@ -5239,6 +5282,7 @@ export async function runConfiguredSubagentExecution(config: SubagentRunConfig, 
 		} catch (persistenceError) {
 			console.error("Failed to persist runner setup failure:", persistenceError);
 		}
+		transport?.close();
 		throw error;
 	}
 	try {
@@ -5248,6 +5292,6 @@ export async function runConfiguredSubagentExecution(config: SubagentRunConfig, 
 			await childSessions.dispose();
 		} catch (error) {
 			console.error("Failed to dispose runner child sessions:", error);
-		}
+		} finally { transport?.close(); }
 	}
 }

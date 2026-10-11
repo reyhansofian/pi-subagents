@@ -53,6 +53,8 @@ interface SessionLeaseOptions {
 	processStartIdentity?: string;
 	isProcessAlive?: (pid: number) => boolean | undefined;
 	getProcessStartIdentity?: (pid: number) => string | undefined;
+	/** Trusted host proof for a stopped multi-process writer, after owner death is independently proved. */
+	proveWritersStopped?: (owner: SessionLeaseOwner) => boolean;
 }
 
 export class SessionLeaseConflictError extends Error {
@@ -171,10 +173,10 @@ function processDemonstrablyGone(
 	return currentIdentity !== undefined && currentIdentity !== startIdentity;
 }
 
-function demonstrablyStale(owner: SessionLeaseOwner, options: Required<Pick<SessionLeaseOptions, "hostname" | "isProcessAlive" | "getProcessStartIdentity">>): boolean {
+function demonstrablyStale(owner: SessionLeaseOwner, options: Required<Pick<SessionLeaseOptions, "hostname" | "isProcessAlive" | "getProcessStartIdentity">> & Pick<SessionLeaseOptions, "proveWritersStopped">): boolean {
 	if (owner.hostname !== options.hostname) return false;
 	if (!processDemonstrablyGone(owner.pid, owner.processStartIdentity, options)) return false;
-	if (owner.writerState === "spawning") return false;
+	if (owner.writerState === "spawning") return options.proveWritersStopped?.(owner) === true;
 	if (owner.writerState === "none") return true;
 	return owner.writerPid !== undefined
 		&& processDemonstrablyGone(owner.writerPid, owner.writerProcessStartIdentity, options);
@@ -230,6 +232,7 @@ export function acquireSessionLease(request: SessionLeaseRequest, options: Sessi
 		hostname,
 		isProcessAlive: options.isProcessAlive ?? processIsAlive,
 		getProcessStartIdentity: getIdentity,
+		proveWritersStopped: options.proveWritersStopped,
 	};
 
 	for (let attempt = 0; attempt < 4; attempt++) {

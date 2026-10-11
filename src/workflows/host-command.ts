@@ -1,4 +1,6 @@
 import { spawn } from "node:child_process";
+import { waitForCollaborationQuiescence, CollaborationQuiescenceError } from "../runs/shared/collaboration-quiescence.ts";
+import { spawnCollaborationSandbox, type CollaborationSandboxInput } from "../runs/shared/collaboration-sandbox.ts";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -156,6 +158,10 @@ export async function executeWorkflowHostCommand(input: {
 	cwd: string;
 	defaultOutputPath: string;
 	claimedOutputPath?: string;
+	/** Host-only opt-in transport; never accepted by runs.host parameters. */
+	sandbox?: CollaborationSandboxInput;
+	/** Parent-only durable initialization/permit callback for confined checks. */
+	onSandboxInitialized?: (identity: import("../runs/shared/collaboration-sandbox.ts").CollaborationNamespaceIdentity) => void;
 	signal: AbortSignal;
 }): Promise<WorkflowHostCommandResult> {
 	const outputPath = input.params.output ? path.resolve(input.cwd, input.params.output) : input.defaultOutputPath;
@@ -172,7 +178,8 @@ export async function executeWorkflowHostCommand(input: {
 	let settled = false;
 
 	return new Promise((resolve, reject) => {
-		const child = spawn(quoteExecutableForShell(input.params.command), {
+		const confined = input.sandbox ? spawnCollaborationSandbox(input.sandbox) : undefined;
+		const child = confined?.process ?? spawn(quoteExecutableForShell(input.params.command), {
 			cwd: input.cwd,
 			env: process.env,
 			shell: true,
@@ -180,13 +187,18 @@ export async function executeWorkflowHostCommand(input: {
 			windowsHide: true,
 			detached: process.platform !== "win32",
 		});
-		const processTree = typeof child.pid === "number" ? createOwnedProcessTreeController(child.pid, { termGraceMs: 1_000 }) : undefined;
+		if (confined && input.onSandboxInitialized) {
+			if (!confined.initialized) { confined.stop(); reject(new Error("Confined check has no initialization identity.")); return; }
+			void confined.initialized.then((identity) => { input.onSandboxInitialized!(identity); confined.process.stdin.end("PERMIT\n"); }).catch(() => confined.stop());
+		}
+		const processTree = !confined && child.pid !== undefined ? createOwnedProcessTreeController(child.pid, { termGraceMs: 1_000 }) : undefined;
 		let termination: Promise<ProcessTreeCleanup> | undefined;
 		const terminate = (reason: "timeout" | "abort") => {
 			if (settled) return;
 			timedOut = reason === "timeout";
 			stopped = reason === "abort";
-			if (processTree && child.pid !== undefined) termination ??= terminateProcessTree(child.pid, processTree);
+			if (confined) confined.stop();
+			else if (processTree && child.pid !== undefined) termination ??= terminateProcessTree(child.pid, processTree);
 			else {
 				child.kill("SIGTERM");
 				termination ??= Promise.resolve({ state: "unknown", reason: "missing-process-id" });
@@ -210,6 +222,11 @@ export async function executeWorkflowHostCommand(input: {
 			settled = true;
 			clearTimeout(timeout);
 			input.signal.removeEventListener("abort", onAbort);
+			if (confined) {
+				await confined.terminal;
+				if (!confined.initialized) throw new CollaborationQuiescenceError("quiescence-unproven: confined check initialization identity is absent.");
+				await waitForCollaborationQuiescence(await confined.initialized);
+			}
 			const terminal = termination ? await termination : await processTree?.finishAfterWriterClose();
 			const cleanupError = process.platform !== "win32" && terminal?.state === "unknown" ? terminal.reason : undefined;
 			const state = timedOut ? "timed-out" : stopped ? "stopped" : exitCode === 0 && !spawnError && !cleanupError ? "passed" : "failed";
@@ -229,7 +246,8 @@ export async function executeWorkflowHostCommand(input: {
 			}
 			resolve({ key: input.key, kind: "command", ok: state === "passed", state, exitCode, stdout, stderr, outputPath, durationMs: Date.now() - startedAt, ...(error ? { error } : {}) });
 		};
-		child.on("close", (code) => { void finish(code); });
-		child.on("error", (error) => { void finish(null, error); });
+		const failedFinish = (cause: unknown) => reject(new CollaborationQuiescenceError("quiescence-unproven: command termination proof failed: " + (cause instanceof Error ? cause.message : String(cause))));
+		child.on("close", (code) => { void finish(code).catch(failedFinish); });
+		child.on("error", (error) => { void finish(null, error).catch(failedFinish); });
 	});
 }

@@ -181,7 +181,7 @@ export async function runConfiguredSubagent(rawConfig: unknown, options: RunnerB
 		} else if (!executionLoaded) {
 			try {
 				persistRunnerStartupFailure({
-					asyncDir: config.asyncDir,
+					asyncDir: config.collaborationPrivateDir ?? config.asyncDir,
 					runId: config.id,
 					runnerProcessInstanceId: config.runnerProcessInstanceId ?? "unknown-runner-instance",
 					message: `Subagent runner startup failed: ${error instanceof Error ? error.message : String(error)}`,

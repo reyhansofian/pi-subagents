@@ -319,6 +319,8 @@ interface TaskParam {
 }
 
 export interface SubagentParamsLike {
+	/** Host-only one-use confined native launch grant; never a public tool parameter. */
+	collaborationGrant?: string;
 	action?: string;
 	id?: string;
 	runId?: string;
@@ -3543,6 +3545,7 @@ async function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 		if (launchRuleError) return toExecutionErrorResult(params, new Error(launchRuleError), data.contextPolicy.contextSummary);
 		const asyncResult = await executeAsyncSingle(id, compactOptional<Parameters<typeof executeAsyncSingle>[1]>({
 			agent: params.agent!,
+			collaborationGrant: params.collaborationGrant,
 			task: shouldForkAgent(contextPolicy, params.agent!) ? wrapForkTask(params.task ?? "") : (params.task ?? ""),
 			goal: params.task ?? "",
 			agentConfig: a,

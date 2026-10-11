@@ -3,6 +3,10 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
+import { spawnEnrolledCollaborationRunner } from "../shared/collaboration-launch.ts";
+import { validateSubagentRunConfig } from "./subagent-runner-bootstrap.ts";
+import { assertCollaborationQuiescent } from "../shared/collaboration-quiescence.ts";
+import type { CollaborationNamespaceIdentity } from "../shared/collaboration-sandbox.ts";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -77,7 +81,7 @@ import { validateToolBudgetConfig } from "../shared/tool-budget.ts";
 import { usageBudgetState } from "../shared/usage-budget.ts";
 import type { ImportedAsyncRoot } from "./chain-root-attachment.ts";
 import type { SessionLeaseRequest } from "../shared/session-lease.ts";
-import { finalizeProcessTerminal, initializeProcessTerminal, readProcessTerminal } from "./process-terminal.ts";
+import { finalizeProcessTerminal, initializeProcessTerminal, readProcessTerminal, writeProcessTerminalCandidate } from "./process-terminal.ts";
 import { persistRunnerStartupFailure } from "./runner-startup-failure.ts";
 import type { ActiveAsyncCapacityHandle } from "./active-async-capacity.ts";
 import { statusStepDescription } from "./chain-append.ts";
@@ -255,6 +259,7 @@ interface AsyncChainParams {
 }
 
 interface AsyncSingleParams {
+	collaborationGrant?: string;
 	agent: string;
 	task?: string;
 	/** Raw caller-facing goal used only by the started event. */
@@ -649,7 +654,8 @@ export function emitProcessTerminalEvent(ctx: AsyncExecutionContext, proof: unkn
 	}
 }
 
-function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Omit<AsyncStatus, "pid" | "processTerminal">, initialStatusPath: string, launchParentSessionId: string | undefined, onProcessTerminal?: (proof: unknown) => void, onBeforeProceed?: (runnerProcessInstanceId: string) => void, requestedCwd = cwd): SpawnRunnerResult | Promise<SpawnRunnerResult> {
+type NativeRunnerLaunchConfig = Omit<import("./subagent-runner.ts").SubagentRunConfig, "toolBudget"> & Pick<AsyncSingleParams, "toolBudget">;
+async function spawnRunner(cfg: NativeRunnerLaunchConfig, suffix: string, cwd: string, initialStatus: Omit<AsyncStatus, "pid" | "processTerminal">, initialStatusPath: string, launchParentSessionId: string | undefined, onProcessTerminal?: (proof: import("../../shared/types.ts").ProcessTerminal) => void, onBeforeProceed?: (runnerProcessInstanceId: string) => void, requestedCwd = cwd): Promise<SpawnRunnerResult> {
 	const cwdError = preflightLaunchCwd(requestedCwd, cwd);
 	if (cwdError) return { error: cwdError };
 	if (launchParentSessionId !== undefined && (!launchParentSessionId || launchParentSessionId.trim() !== launchParentSessionId)) {
@@ -741,12 +747,19 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 		};
 		if (launchParentSessionId === undefined) delete runnerEnv[SUBAGENT_PARENT_SESSION_ENV];
 		else runnerEnv[SUBAGENT_PARENT_SESSION_ENV] = launchParentSessionId;
-		const proc = spawn(command, args, {
+		const collaborationGrant = cfg.collaborationGrant;
+		let confined: ReturnType<typeof spawnEnrolledCollaborationRunner> | undefined;
+		if (collaborationGrant) {
+			validateSubagentRunConfig(launchConfig);
+			confined = spawnEnrolledCollaborationRunner({ token: collaborationGrant, command, args, cwd, configPath: cfgPath, config: launchConfig, env: runnerEnv, hostStatus: initialStatus });
+		}
+		const proc = confined?.process ?? spawn(command, args, {
 			cwd,
 			...backgroundProcessOptions(),
 			stdio: ["ignore", stdoutFd ?? "ignore", stderrFd ?? "ignore"],
 			env: runnerEnv,
 		});
+		let namespaceIdentity: CollaborationNamespaceIdentity | undefined;
 		let observedProcessExit: { exitCode: number | null; signal: NodeJS.Signals | null } | undefined;
 		proc.once("exit", (exitCode, signal) => { observedProcessExit = { exitCode, signal }; });
 		const processClosed = new Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }>((resolve) => {
@@ -755,8 +768,12 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 				resolve({ exitCode, signal });
 			});
 		});
-		closeFd(stdoutFd);
-		closeFd(stderrFd);
+		if (confined) {
+			let stdoutBytes = 0, stderrBytes = 0;
+			proc.stdout?.on("data", (chunk: Buffer) => { if (stdoutFd !== undefined && stdoutBytes < 1024 * 1024) fs.writeSync(stdoutFd, chunk.subarray(0, Math.max(0, 1024 * 1024 - stdoutBytes))); stdoutBytes += chunk.length; });
+			proc.stderr?.on("data", (chunk: Buffer) => { if (stderrFd !== undefined && stderrBytes < 1024 * 1024) fs.writeSync(stderrFd, chunk.subarray(0, Math.max(0, 1024 * 1024 - stderrBytes))); stderrBytes += chunk.length; });
+			proc.once("close", () => { closeFd(stdoutFd); closeFd(stderrFd); });
+		} else { closeFd(stdoutFd); closeFd(stderrFd); }
 		proc.on("error", (error) => {
 			console.error(`[pi-subagents] async spawn failed: ${error.message}`);
 		});
@@ -766,6 +783,12 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 			const asyncDir = launch.asyncDir;
 			const runId = launch.id;
 			if (typeof asyncDir !== "string" || typeof runId !== "string") return;
+			if (confined && namespaceIdentity) {
+				try {
+					assertCollaborationQuiescent(namespaceIdentity);
+					writeProcessTerminalCandidate(asyncDir, { version: 1, runId, runnerProcessInstanceId, writers: { "0": [] }, expectedWriters: { "0": 0 } });
+				} catch { /* Preserve unknown terminal proof; never transfer from a timeout. */ }
+			}
 			finalizeProcessTerminal(asyncDir, runId, {
 				processInstanceId: runnerProcessInstanceId,
 				closeObservedAt: Date.now(),
@@ -848,6 +871,17 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 			if (launchAsyncDir) persistPreProceedStartupFailure(launchAsyncDir, launchRunId, runnerProcessInstanceId, launchSessionId, launchCompletionOwnerId, message);
 			const terminationObserved = terminateRunnerBeforeProceed(proc.pid);
 			return { pid: proc.pid, runnerProcessInstanceId, error: message, terminationObserved, startupDidNotProceed: true };
+		}
+		if (confined) {
+			try {
+				if (!confined.initialized) throw new Error("Confined launch has no namespace initialization handshake.");
+				const identity = await confined.initialized;
+				namespaceIdentity = identity;
+				writePrivateAtomicJson(path.join(launchAsyncDir!, "collaboration-namespace.json"), { version: 1, runnerProcessInstanceId, ...identity });
+			} catch (error) {
+				confined.stop(); await confined.terminal;
+				return { pid: proc.pid, runnerProcessInstanceId, error: "shared-workspace-unsupported: namespace identity could not be established: " + String(error), startupDidNotProceed: true, terminationObserved: true };
+			}
 		}
 		if (launchBarrierToken && startupProceedPath) {
 			try {
@@ -2012,6 +2046,7 @@ export function executeAsyncSingle(
 			return formatAsyncStartError("single", `Failed to persist async recovery descriptor for '${id}': ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
+	const collaborationConfig = params.collaborationGrant ? { collaborationGrant: params.collaborationGrant, collaborationExtensionPaths: toolPlan.extensionArgs } : undefined;
 	let spawnResultOrPromise: SpawnRunnerResult | Promise<SpawnRunnerResult> = {};
 	const initialStatusAt = Date.now();
 	const initialCompletionOwnerId = ctx.completionOwnerId ?? currentCompletionOwnerId();
@@ -2020,6 +2055,7 @@ export function executeAsyncSingle(
 		spawnResultOrPromise = spawnRunner(
 			{
 				id,
+				...collaborationConfig,
 				steps: [
 					{
 						parentSessionId: launchParentSessionId,

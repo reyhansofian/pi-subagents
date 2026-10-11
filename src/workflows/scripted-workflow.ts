@@ -1,4 +1,8 @@
 import { accessSync, constants, readFileSync, realpathSync, statSync } from "node:fs";
+import { runCollaboration, type CollaborationSummary } from "./collaboration.ts";
+import { readCollaborationJson } from "./collaboration-json.ts";
+import { Type as CollaborationType } from "typebox";
+import { Value as CollaborationValue } from "typebox/value";
 import { createRequire } from "node:module";
 import { dirname, resolve as resolvePath } from "node:path";
 import { Worker } from "node:worker_threads";
@@ -806,6 +810,11 @@ const runs = Object.freeze({
   lanes(laneSpecs) {
     return runLanes(laneSpecs);
   },
+  collaborate(manifest, recovery) {
+    assertJsonValue(manifest, "runs.collaborate manifest");
+    if (recovery !== undefined) assertJsonValue(recovery, "runs.collaborate recovery");
+    return hostCall("collaborate", { manifest, ...(recovery === undefined ? {} : { recovery }) }, { key: manifest.runId, operation: "host" });
+  },
   host(key, params) {
     validateHostCommand(key, params);
     return hostCall("host", { key, params }, { key, operation: "host" });
@@ -1251,6 +1260,7 @@ export interface RunWorkflowScriptOptions {
 	steer?: (key: string, message: string, options: WorkflowSteerOptions, signal: AbortSignal) => Promise<WorkflowSteerResult>;
 	host?: (key: string, params: WorkflowHostCommandParams, signal: AbortSignal) => Promise<WorkflowHostCommandResult>;
 	onHostStep?: (hostStep: HostStepNode) => void;
+	onCollaborationStatus?: (summary: CollaborationSummary) => void;
 	state?: {
 		get: (key: string) => unknown | Promise<unknown>;
 		set: (key: string, value: unknown) => void | Promise<void>;
@@ -2139,7 +2149,8 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 	const childOrder: string[] = [];
 	const launches = new Map<string, { fingerprint: string; promise: Promise<WorkflowScriptChildResult>; observed: boolean; generatedLaneKey?: string }>();
 	const steers = new Map<number, { key: string; promise: Promise<WorkflowSteerResult>; observed: boolean }>();
-	const hostCalls = new Map<number, { key: string; promise: Promise<WorkflowHostCommandResult>; observed: boolean }>();
+	const hostCalls = new Map<number, { key: string; promise: Promise<WorkflowHostCommandResult | CollaborationSummary>; observed: boolean }>();
+	let collaborationRequested = false;
 	const stoppedLaunches = new Set<string>();
 	const childStopControllers = new Map<string, AbortController>();
 	const batchAdmissions = new Map<string, Promise<void>>();
@@ -2417,6 +2428,37 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 					},
 				);
 			};
+			if (collaborationRequested && ["run", "host", "collaborate", "state.set"].includes(message.method)) return respond(Promise.reject(new Error("runs.collaborate exclusively owns workflow mutation; use its declared checks and package controls.")));
+			if (message.method === "collaborate") {
+				if (launches.size || hostCalls.size) return respond(Promise.reject(new Error("runs.collaborate cannot mix with ordinary child or host mutation in the same workflow.")));
+				if (acceptanceRecoveryBarrier) return respond(Promise.reject(new Error(recoveryBarrierMessage(acceptanceRecoveryBarrier.key, "runs.collaborate"))));
+				collaborationRequested = true;
+				const manifestInput = readCollaborationJson(JSON.stringify(message.args.manifest));
+				const key = CollaborationValue.Check(CollaborationType.Object({ runId: CollaborationType.String() }, { additionalProperties: true }), manifestInput) ? manifestInput.runId : "collaboration";
+				const promise = runCollaboration(manifestInput, {
+					signal: childController.signal, admit: options.admit, maximumResidentCapacity: options.globalConcurrencyLimit ?? DEFAULT_GLOBAL_CONCURRENCY_LIMIT, recovery: message.args.recovery === undefined ? undefined : readCollaborationJson(JSON.stringify(message.args.recovery)),
+					onStatus(summary) {
+						try { options.onCollaborationStatus?.(summary); } catch { /* Optional metrics must not hide the existing status projection. */ }
+						hostStepChanged({ version: 1, kind: "host-step", monitorKind: "gate", id: key, label: "Shared workspace",
+							state: summary.state === "completed" ? "done" : summary.state === "failed" ? "error" : summary.state === "interrupted" ? "cancelled" : "running",
+							detail: summary.residents + "/" + Math.min(summary.ceiling, summary.capacityLimit) + " residents; ceiling=" + summary.ceiling + "; barrier=" + summary.barrier + "; verification=" + summary.verification + "; waits=" + summary.packages.filter((pkg) => pkg.reason).map((pkg) => pkg.id + ":" + pkg.reason).join(",").slice(0, 100),
+							reportPath: summary.artifacts.snapshot, updatedAt: Date.now() });
+					},
+					launch: async (childKey, params, signal, admission) => {
+						childOrder.push(childKey);
+						trace.push({ operation: "run", key: childKey, state: "started", ...workflowStringMetadata(params) }); traceChanged();
+						const result = await options.launch(childKey, params, signal, admission);
+						children.set(childKey, result);
+						const nativeIdentity = result.runId ? { runId: result.runId } : undefined;
+						trace.push({ operation: "run", key: childKey, state: result.ok ? "completed" : "failed", ...nativeIdentity, ...workflowStringMetadata(params) }); traceChanged();
+						notifyChildSettled(childKey, result);
+						return result;
+					},
+				});
+				hostCalls.set(message.callId, { key, promise, observed: observedHostCalls.delete(message.callId) });
+				respond(promise, "runs.collaborate result");
+				return;
+			}
 			if (message.method === "state.get" || message.method === "state.set") {
 				if (!options.state) return respond(Promise.reject(new Error("Workflow state is unavailable without a mission.")));
 				let key: string;
