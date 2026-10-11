@@ -26,8 +26,9 @@ export const collaborationManifestRecordSchema = Type.Object({
 	packages: Type.Array(pkg), combinedChecks: Type.Array(check), reconciliation: Type.Optional(pkg),
 	runtime: Type.Object({
 		network: Type.Optional(Type.Union([Type.Literal("none"), Type.Literal("openai-codex")])),
+		context7: Type.Optional(Type.Object({ path: text, digest: text }, { additionalProperties: false })),
 		assets: Type.Array(Type.Object({ path: text, digest: text }, { additionalProperties: false })),
-		extensions: Type.Array(Type.Object({ path: text, digest: text, effects: Type.Array(Type.Union([Type.Literal("local-filesystem"), Type.Literal("provider-network")])) }, { additionalProperties: false })),
+		extensions: Type.Array(Type.Object({ path: text, digest: text, effects: Type.Array(Type.Union([Type.Literal("local-filesystem"), Type.Literal("provider-network"), Type.Literal("context7-network")])) }, { additionalProperties: false })),
 		environment: strings,
 	}, { additionalProperties: false }),
 }, { additionalProperties: false });

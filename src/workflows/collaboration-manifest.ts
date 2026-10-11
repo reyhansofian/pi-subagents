@@ -35,10 +35,12 @@ export interface CollaborationPackage {
 export interface CollaborationRuntime {
 	/** Explicit offline providers need no network. Otherwise enroll the selected native Codex route. */
 	network: "openai-codex" | "none";
+	/** Explicit test-only hosted documentation route, separate from provider authority. */
+	context7?: { path: string; digest: string };
 	/** Fixed runtime assets outside the ticket workspace. Each tree is hashed at enrollment. */
 	assets: { path: string; digest: string }[];
 	/** Host-approved immutable extension identities and their declared effects. */
-	extensions: { path: string; digest: string; effects: ("local-filesystem" | "provider-network")[] }[];
+	extensions: { path: string; digest: string; effects: ("local-filesystem" | "provider-network" | "context7-network")[] }[];
 	/** Explicit names only. Values come from the existing host configuration and never enter artifacts. */
 	environment: string[];
 }
@@ -138,8 +140,10 @@ export function normalizeCollaborationManifest(input: CollaborationManifest | Co
 	if (row.schemaVersion !== 1) throw new Error("Unsupported collaboration schemaVersion.");
 	const workspace = text(row.workspace, "workspace");
 	if (!path.isAbsolute(workspace) || fs.realpathSync.native(workspace) !== path.resolve(workspace) || !fs.statSync(workspace).isDirectory()) throw new Error("workspace must be an existing canonical directory.");
-	const runtime = object(row.runtime, ["assets", "extensions", "environment", "network"], "runtime");
+	const runtime = object(row.runtime, ["assets", "extensions", "environment", "network", "context7"], "runtime");
 	if (runtime.network !== undefined && runtime.network !== "none" && runtime.network !== "openai-codex") throw new Error("shared-workspace-unsupported: required provider transport is not enrolled.");
+	const context7 = runtime.context7 === undefined ? undefined : object(runtime.context7, ["path", "digest"], "runtime.context7");
+	if (runtime.context7 && runtime.network === "none") throw new Error("shared-workspace-unsupported: hosted Context7 cannot use an offline runtime.");
 	const manifest: CollaborationManifest = {
 		schemaVersion: 1, workflowId: id(row.workflowId, "workflowId"), runId: id(row.runId, "runId"), manifestVersion: integer(row.manifestVersion, "manifestVersion"),
 		workspace, goal: text(row.goal, "goal"), rationale: text(row.rationale, "rationale"), constraints: texts(row.constraints, "constraints"), completion: texts(row.completion, "completion"),
@@ -173,12 +177,15 @@ export function normalizeCollaborationManifest(input: CollaborationManifest | Co
 			assets: list(runtime.assets, "runtime.assets", (v, l) => { const a = object(v, ["path", "digest"], l); return { path: text(a.path, l), digest: text(a.digest, l, 64) }; }, 64),
 			extensions: list(runtime.extensions, "runtime.extensions", (v, l) => {
 				const a = object(v, ["path", "digest", "effects"], l);
-				const effects = list(a.effects, l, (e) => { if (e !== "local-filesystem" && e !== "provider-network") throw new Error("Unmanaged/remote capability cannot enroll: " + e); return e; }, 2);
+				const effects = list(a.effects, l, (e) => { if (e !== "local-filesystem" && e !== "provider-network" && e !== "context7-network") throw new Error("Unmanaged/remote capability cannot enroll: " + e); return e; }, 2);
 				return { path: text(a.path, l), digest: text(a.digest, l, 64), effects };
-			}, 32),
+			}, 64),
 			environment: list(runtime.environment, "runtime.environment", (v, l) => text(v, l, 128), 64),
 		},
 	};
+	if (context7) manifest.runtime.context7 = { path: text(context7.path, "runtime.context7.path"), digest: text(context7.digest, "runtime.context7.digest", 64) };
+	if (manifest.runtime.context7 && !manifest.runtime.extensions.some((entry) => entry.path === manifest.runtime.context7!.path && entry.digest === manifest.runtime.context7!.digest && entry.effects.includes("context7-network"))) throw new Error("shared-workspace-unsupported: configured Context7 factory lacks its exact immutable source/effect binding.");
+	for (const entry of manifest.runtime.extensions) if (entry.effects.includes("context7-network") && entry.path !== manifest.runtime.context7?.path) throw new Error("shared-workspace-unsupported: Context7 effect cannot enroll another extension.");
 	if (row.reconciliation !== undefined) manifest.reconciliation = workPackage(row.reconciliation, "reconciliation");
 	const resources = new Map(manifest.resources.map((r) => [r.id, r]));
 	const packages = new Map(manifest.packages.map((p) => [p.id, p]));

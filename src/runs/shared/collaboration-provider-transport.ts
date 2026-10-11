@@ -8,6 +8,7 @@ import type { Duplex } from "node:stream";
 import { createRequire } from "node:module";
 import * as zlib from "node:zlib";
 import { resolveHttpIdleTimeoutMs, runnerHttpDispatcherOptions } from "../background/runner-http-dispatcher.ts";
+import { COLLABORATION_CONTEXT7_ROUTE, validateCollaborationContext7 } from "./collaboration-context7.ts";
 
 /**
  * Ephemeral provider traffic only. Never send this channel to coordination,
@@ -91,7 +92,7 @@ class Channel {
 	}
 }
 
-export interface CollaborationProviderAuthority { modelId: string }
+export interface CollaborationProviderAuthority { modelId: string; context7?: true }
 export interface CollaborationOAuthCredential { type: "oauth"; access: string; refresh: string; expires: number; [key: string]: CollaborationJson | undefined }
 export function collaborationProviderAuthority(model: string | undefined): CollaborationProviderAuthority {
 	if (!Value.Check(Type.String(), model)) throw new Error("shared-workspace-unsupported: collaboration requires the existing resolved model identity.");
@@ -137,7 +138,7 @@ function validateModel(body: Buffer, authority: CollaborationProviderAuthority, 
 }
 
 type WireSocket = Pick<InstanceType<typeof import("undici").WebSocket>, "readyState" | "binaryType" | "protocol" | "extensions" | "send" | "close" | "addEventListener">;
-interface BackendRequest { method: "POST"; headers: Headers; body: Buffer; redirect: "error"; signal: AbortSignal }
+interface BackendRequest { method: "POST" | "GET"; headers: Headers; body?: Buffer; redirect: "error"; signal: AbortSignal }
 interface TransportBackend {
 	fetch: (url: string, init: BackendRequest) => Promise<Response>;
 	WebSocket: new (url: string, options: any) => WireSocket;
@@ -172,7 +173,8 @@ export function attachCollaborationProviderRelay(socket: Duplex, authority: Coll
 }): ProviderRelay {
 	const backend = options.backend ?? nativeBackend(options);
 	const active = new Map<number, ActiveTransport>();
-	let ended = false;
+	let ended = false, highestId = 0;
+	let context7SessionId: string | undefined;
 	const finish = (id: number) => {
 		const operation = active.get(id); if (!operation) return;
 		active.delete(id); operation.abort.abort();
@@ -196,7 +198,7 @@ export function attachCollaborationProviderRelay(socket: Duplex, authority: Coll
 			if (!existing?.reader || existing.busy) throw new Error(FAILURE);
 			existing.busy = true;
 			const chunk = await existing.reader.read();
-			if (!active.has(frame.id)) return;
+			if (active.get(frame.id) !== existing) return;
 			existing.busy = false;
 			if (chunk.done) { channel.send({ id: frame.id, kind: "end" }); finish(frame.id); return; }
 			existing.bytes += chunk.value.length;
@@ -214,7 +216,8 @@ export function attachCollaborationProviderRelay(socket: Duplex, authority: Coll
 			existing.ws.close(Value.Check(Type.Number(), frame.code) ? frame.code : 1000, Value.Check(Type.String(), frame.reason) ? frame.reason.slice(0, 123) : "done");
 			return;
 		}
-		if (existing || ended || active.size >= MAX_ACTIVE) throw new Error(FAILURE);
+		if (existing || ended || active.size >= MAX_ACTIVE || frame.id <= highestId) throw new Error(FAILURE);
+		highestId = frame.id;
 		if (frame.kind === "credential") {
 			if (frame.modelId !== authority.modelId || frame.provider !== "openai-codex" || !options.authPath) throw new Error(FAILURE);
 			const fd = fs.openSync(options.authPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
@@ -230,12 +233,31 @@ export function attachCollaborationProviderRelay(socket: Duplex, authority: Coll
 		}
 		const operation: ActiveTransport = { abort: new AbortController(), bytes: 0 };
 		if (frame.kind === "fetch") {
-			if (frame.url !== HTTP_ROUTE || frame.method !== "POST") throw new Error(FAILURE);
+			const context7 = frame.url === COLLABORATION_CONTEXT7_ROUTE && authority.context7 === true;
+			if (!context7 && (frame.url !== HTTP_ROUTE || frame.method !== "POST")) throw new Error(FAILURE);
 			const requestHeaders = headers(frame.headers), body = decode(frame.body);
-			validateModel(body, authority, requestHeaders.get("content-encoding"));
+			if (context7) {
+				validateCollaborationContext7(frame.method, requestHeaders, body);
+				if (requestHeaders.has("mcp-session-id") && requestHeaders.get("mcp-session-id") !== context7SessionId) throw new Error(FAILURE);
+			}
+			else validateModel(body, authority, requestHeaders.get("content-encoding"));
 			active.set(frame.id, operation);
-			const response = await backend.fetch(HTTP_ROUTE, { method: "POST", headers: requestHeaders, body, redirect: "error", signal: operation.abort.signal });
-			if (!active.has(frame.id)) { await response.body?.cancel(); return; }
+			const method = context7 && frame.method === "GET" ? "GET" : "POST";
+			const request: BackendRequest = { method, headers: requestHeaders, redirect: "error", signal: operation.abort.signal };
+			if (method === "POST") request.body = body;
+			const response = await backend.fetch(context7 ? COLLABORATION_CONTEXT7_ROUTE : HTTP_ROUTE, request);
+			if (context7 && (response.redirected || (response.status >= 300 && response.status < 400) || response.headers.has("set-cookie"))) {
+				await response.body?.cancel(); throw new Error(FAILURE);
+			}
+			if (active.get(frame.id) !== operation) { await response.body?.cancel(); return; }
+			if (context7 && response.ok && method === "POST") {
+				const message = readCollaborationJson(body.toString("utf8"));
+				if (Value.Check(Type.Object({ method: Type.Literal("initialize") }, { additionalProperties: true }), message)) {
+					const issued = response.headers.get("mcp-session-id");
+					if (issued && (issued.length > 256 || /[\r\n]/u.test(issued))) { await response.body?.cancel(); throw new Error(FAILURE); }
+					context7SessionId = issued ?? undefined;
+				}
+			}
 			operation.reader = response.body?.getReader();
 			channel.send({ id: frame.id, kind: "headers", status: response.status, statusText: response.statusText, headers: [...response.headers] });
 			if (!operation.reader) { channel.send({ id: frame.id, kind: "end" }); finish(frame.id); }

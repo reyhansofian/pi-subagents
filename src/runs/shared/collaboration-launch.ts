@@ -25,7 +25,7 @@ export interface CollaborationLaunchGrant {
 	onDependencyAck: () => void;
 	onStarted: (pid: number, runId: string, configuration: CollaborationPackage["configuration"], nativeArtifactDir: string) => void;
 }
-interface Entry { grant: CollaborationLaunchGrant; process?: CollaborationSandboxProcess; used: boolean }
+interface Entry { grant: CollaborationLaunchGrant; process?: CollaborationSandboxProcess; relay?: { close(): void }; used: boolean }
 const grants = new Map<string, Entry>();
 export interface CollaborationLaunchHandle { token: string; drain(): Promise<void>; stopAndDrain(): Promise<void>; stop(): void; dispose(): void }
 export function registerCollaborationLaunch(grant: CollaborationLaunchGrant): CollaborationLaunchHandle {
@@ -44,12 +44,13 @@ export function registerCollaborationLaunch(grant: CollaborationLaunchGrant): Co
 		},
 		async stopAndDrain() {
 			if (!entry.process) return;
+			entry.relay?.close();
 			entry.process.stop();
 			await entry.process.terminal;
 			if (!entry.process.initialized) throw new CollaborationQuiescenceError("quiescence-unproven: namespace identity is absent.");
 			await waitForCollaborationQuiescence(await entry.process.initialized);
 		},
-		stop() { entry.process?.stop(); },
+		stop() { entry.relay?.close(); entry.process?.stop(); },
 		dispose() { if (!entry.process || entry.process.process.exitCode !== null || entry.process.process.signalCode !== null) grants.delete(token); },
 	};
 }
@@ -82,6 +83,25 @@ export function verifyCollaborationRuntime(manifest: CollaborationManifest): voi
 		if (collaborationDigest(canonical) !== asset.digest) throw new Error("shared-workspace-unsupported: immutable runtime identity changed: " + canonical);
 	}
 }
+/** Preserve SDK settings; only Context7 bookkeeping uses the already-owned private home. */
+export function prepareCollaborationAgentHome(sourceHome: string, privateHome: string, context7: boolean): string {
+	if (!context7) return sourceHome;
+	const settings = path.join(sourceHome, "settings.json");
+	if (fs.existsSync(settings)) {
+		const fd = fs.openSync(settings, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+		try {
+			const maxBytes = 256 * 1024;
+			const info = fs.fstatSync(fd);
+			if (!info.isFile() || info.size > maxBytes) throw new Error("shared-workspace-unsupported: SDK settings exceed bounded private enrollment.");
+			const bytes = Buffer.alloc(maxBytes + 1);
+			let count = 0, read: number;
+			while (count < bytes.length && (read = fs.readSync(fd, bytes, count, bytes.length - count, null)) > 0) count += read;
+			if (count > maxBytes) throw new Error("shared-workspace-unsupported: SDK settings grew past their byte bound.");
+			fs.writeFileSync(path.join(privateHome, "settings.json"), bytes.subarray(0, count), { flag: "wx", mode: 0o600 });
+		} finally { fs.closeSync(fd); }
+	}
+	return privateHome;
+}
 export function spawnEnrolledCollaborationRunner(input: {
 	token: string; command: string; args: string[]; cwd: string; configPath: string;
 	config: SubagentRunConfig; env: NodeJS.ProcessEnv; hostStatus: Omit<import("../../shared/types.ts").AsyncStatus, "pid" | "processTerminal">;
@@ -102,8 +122,10 @@ export function spawnEnrolledCollaborationRunner(input: {
 	if (!acceptance) throw new Error("shared-workspace-unsupported: parent-resolved acceptance is absent.");
 	if (acceptance.verify.length || acceptance.toolEvidence.length) throw new Error("shared-workspace-unsupported: acceptance verify/tool-evidence requires parent-certified confined evidence; these gates cannot be trusted from worker proposals. Use declared package checks without disabling required gates.");
 	const authority = manifest.runtime.network === "none" ? undefined : collaborationProviderAuthority(step.model);
+	if (authority && manifest.runtime.context7) authority.context7 = true;
 	if (("runner" in step && step.runner) || ("machine" in step && step.machine)) throw new Error("shared-workspace-unsupported: a fresh native local runner is required.");
 	input.config.collaborationProviderTransport = { model: step.model };
+	if (manifest.runtime.context7) input.config.collaborationContext7 = manifest.runtime.context7;
 	if (authority) { input.config.collaborationProviderTransport.authority = authority; input.config.collaborationProviderTransport.fd = 3; }
 	const resolved = step.launchResolvedExtensions;
 	if (!resolved?.disableAmbientExtensions) throw new Error("shared-workspace-unsupported: ambient extensions have no immutable capability snapshot. Enroll the existing selected extension configuration explicitly; no extensions were removed.");
@@ -117,6 +139,7 @@ export function spawnEnrolledCollaborationRunner(input: {
 		const bundled = canonical.startsWith(packageRoot + path.sep) && manifest.runtime.assets.some((a) => canonical === a.path || canonical.startsWith(a.path + path.sep));
 		if (!bundled && !manifest.runtime.extensions.some((e) => e.path === canonical)) throw new Error("shared-workspace-unsupported: extension lacks host-approved immutable effects: " + canonical);
 	}
+	if (manifest.runtime.context7 && !extensionPaths.includes(manifest.runtime.context7.path)) throw new Error("shared-workspace-unsupported: configured Context7 source is not in the authentic selected profile.");
 	const asyncDir = input.config.asyncDir;
 	const runId = input.config.id;
 	if (!Value.Check(Type.String(), asyncDir) || !Value.Check(Type.String(), runId)) throw new Error("Collaboration runner lacks private artifact identity.");
@@ -170,7 +193,8 @@ export function spawnEnrolledCollaborationRunner(input: {
 		const file = path.join(oldHome, name);
 		if (fs.existsSync(file)) readRuntime.push(fs.realpathSync.native(file));
 	}
-	const env: import("./collaboration-sandbox.ts").CollaborationSandboxInput["env"] = { PATH: process.env.PATH ?? "", HOME: home, TMPDIR: temp, PI_CODING_AGENT_DIR: oldHome, RLM_WORKSPACE: manifest.workspace };
+	const agentHome = prepareCollaborationAgentHome(oldHome, home, Boolean(manifest.runtime.context7));
+	const env: import("./collaboration-sandbox.ts").CollaborationSandboxInput["env"] = { PATH: process.env.PATH ?? "", HOME: home, TMPDIR: temp, PI_CODING_AGENT_DIR: agentHome, RLM_WORKSPACE: manifest.workspace };
 	const runtimeKeys = [...Object.keys(childCacheRetentionEnv()), "PI_CACHE_RETENTION", "PI_SUBAGENT_CACHE_RETENTION", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy", "PI_CODING_AGENT_PACKAGE_ROOT", "PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT", "PI_PACKAGE_DIR", "JITI_ALIAS", "PI_ASYNC_NATIVE_RUNNER", "PI_SUBAGENTS_TEMP_ROOT", "PI_SUBAGENT_PARENT_SESSION"];
 	for (const name of [...runtimeKeys, ...manifest.runtime.environment]) if (input.env[name] !== undefined) env[name] = input.env[name]!;
 	fs.mkdirSync(path.dirname(collaborationRunMarker(runId)), { recursive: true, mode: 0o700 });
@@ -190,6 +214,7 @@ export function spawnEnrolledCollaborationRunner(input: {
 		const socket = sandbox.process.stdio[3] as Duplex | null;
 		if (!socket) { sandbox.stop(); throw new Error("Confined provider transport descriptor is unavailable."); }
 		const relay = attachCollaborationProviderRelay(socket, authority, { agentDir: oldHome, cwd: manifest.workspace, authPath: path.join(oldHome, "auth.json") });
+		entry.relay = relay;
 		sandbox.process.once("close", () => relay.close());
 	}
 	if (!sandbox.process.pid) { sandbox.stop(); throw new Error("Collaboration namespace launch has no process identity."); }

@@ -172,6 +172,7 @@ export interface SubagentRunConfig {
 	/** Host-only confined launch provenance. Ordinary runners leave this absent. */
 	collaborationGrant?: string;
 	collaborationExtensionPaths?: string[];
+	collaborationContext7?: import("../shared/collaboration-context7-adapter.ts").CollaborationContext7Binding;
 	collaborationProviderTransport?: { model: string; authority?: { modelId: string }; fd?: number };
 	collaborationPrivateDir?: string;
 	collaborationHostStatus?: AsyncStatus;
@@ -5261,8 +5262,16 @@ export async function runConfiguredSubagentExecution(config: SubagentRunConfig, 
 		}
 		let factoryOptions = options;
 		if (config.collaborationModelStorage) {
-			factoryOptions = { ...options, confinedModelStorage: config.collaborationModelStorage };
+			factoryOptions = { ...options, confinedModelStorage: config.collaborationModelStorage, confinedContext7: config.collaborationContext7 };
 			if (config.collaborationProviderTransport) factoryOptions.confinedProviderTransport = { ...config.collaborationProviderTransport, fetch: transport?.fetch, readCredential: transport && config.collaborationProviderTransport.authority ? (signal) => transport!.readCredential(config.collaborationProviderTransport!.authority!.modelId, signal) : undefined };
+		}
+		if (config.collaborationContext7) {
+			if (!config.collaborationGrant || !config.collaborationPrivateDir || !config.collaborationManifestVersion || !config.runnerProcessInstanceId || !config.piPackageRoot) throw new Error("Confined Context7 startup observation lacks native execution identity.");
+			const { createCollaborationStartupSink } = await import("../shared/collaboration-startup-observation.ts");
+			factoryOptions = { ...factoryOptions, confinedStartupObservation: createCollaborationStartupSink(config.collaborationPrivateDir, {
+				runId: config.id, executionToken: config.collaborationGrant, manifestVersion: config.collaborationManifestVersion,
+				processInstanceId: config.runnerProcessInstanceId, candidateRoot: path.resolve(new URL("../../..", import.meta.url).pathname), sdkRoot: config.piPackageRoot, adapter: config.collaborationContext7,
+			}) };
 		}
 		childSessions = await loadRunnerChildSessionFactory(config, factoryOptions);
 	} catch (error) {

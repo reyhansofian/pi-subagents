@@ -28,6 +28,8 @@ Provider code and callbacks remain confined in the worker. A bounded ephemeral t
 
 The enrolled route is the native `openai-codex` responses endpoint at `https://chatgpt.com/backend-api/codex/responses` and its WebSocket equivalent. Other routes, custom fetch, different/virtual models, credential writes/refresh and Bun transport are not certified. An explicitly offline provider uses `runtime.network: "none"`, without relaxing network restrictions.
 
+The test-local hosted Context7 authority is `runtime.context7: { path, digest }`, bound to the selected prepared `pi-mcp-adapter` source entry with the `context7-network` effect. The worker loads its ordinary public configured factory as an honest inline registry entry instead of loading the default filesystem factory twice. Only `https://mcp.context7.com/mcp`, MCP POST and same-endpoint GET/SSE are allowed, with the two documentation tools and protocol setup/list/cancellation. Authentication, cookies, redirects, DELETE and other tool effects are denied. This route does not certify local-server confinement or the complete selected profile. Selected loader errors block session creation. Transport admission and native namespace drain do not replace parent-owned acceptance or independent review.
+
 Unknown ambient or required MCP effects remain unsupported. An empty extension list is not evidence that the selected profile has none. Do not disable required tools/extensions to pass enrollment. The parent must obtain an authentic selected snapshot; if it cannot, the live phase is blocked. Unmanaged host writers, administrators and arbitrary remote effects are outside this boundary.
 
 ## Controls and recovery

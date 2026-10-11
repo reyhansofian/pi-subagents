@@ -166,6 +166,10 @@ export interface ChildSessionFactory {
 export type PiCodingAgentModule = typeof import("@earendil-works/pi-coding-agent");
 
 export interface DefaultChildSessionFactoryOptions {
+	/** Internal confined Context7 runner sink; not a launch hook or authorization callback. */
+	confinedStartupObservation?: (facts: import("./collaboration-startup-observation.ts").CollaborationStartupFacts) => void;
+	/** Exact parent-enrolled ordinary adapter source, represented by an inline public factory. */
+	confinedContext7?: import("./collaboration-context7-adapter.ts").CollaborationContext7Binding;
 	confinedProviderTransport?: { model: string; authority?: { modelId: string }; fetch?: typeof globalThis.fetch; readCredential?: (signal?: AbortSignal) => Promise<import("./collaboration-provider-transport.ts").CollaborationOAuthCredential> };
 	/** Confined native runner only: same source credentials/config, read-only auth and private catalog cache. */
 	confinedModelStorage?: { authPath: string; modelsPath: string; modelsStorePath: string; readonlyAuthModule: string };
@@ -439,6 +443,8 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				: await sharedRuntime(pi);
 			const agentDir = getAgentDir();
 			const settingsManager = pi.SettingsManager.create(launch.cwd, agentDir, { projectTrusted: launch.projectTrusted });
+			// Explicit confined sources must not trigger ambient package installation.
+			if (options.confinedContext7) settingsManager.setPackages([]);
 			// Foreground children share Pi's global theme with the parent, so reinitializing it
 			// would overwrite the parent's active light/dark appearance. Detached runners have
 			// no initialized theme and must initialize one for headless extension renderers.
@@ -454,6 +460,16 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				!launch.excludeTools?.includes("codemode")
 				? [{ name: "codemode", factory: createCodemodeExtension(), replaceable: true }]
 				: [];
+			const configuredContext7 = options.confinedContext7;
+			let context7Factories: ChildHookExtension[] = [];
+			if (configuredContext7) {
+				if (launch.ambientExtensions || !launch.extensionPaths.includes(configuredContext7.path)) throw new Error("shared-workspace-unsupported: configured Context7 requires its exact explicit selected source; default and configured factories cannot coexist.");
+				const sdkRoot = resolvePiPackageRoot() ?? process.env[PI_CODING_AGENT_PACKAGE_ROOT_ENV] ?? resolveInstalledPiPackageRoot();
+				if (!sdkRoot) throw new Error("shared-workspace-unsupported: configured Context7 requires the selected prepared SDK.");
+				const { loadCollaborationContext7Adapter } = await import("./collaboration-context7-adapter.ts");
+				context7Factories = [await loadCollaborationContext7Adapter(configuredContext7, sdkRoot)];
+			}
+			const filesystemPaths = launch.extensionPaths.filter((entry) => entry !== configuredContext7?.path);
 			const loader = new pi.DefaultResourceLoader({
 				cwd: launch.cwd,
 				agentDir,
@@ -465,8 +481,8 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				noPromptTemplates: true,
 				noThemes: true,
 				noContextFiles: launch.noContextFiles,
-				additionalExtensionPaths: builtinMcp ? [...launch.extensionPaths, "builtin:mcp"] : launch.extensionPaths,
-				extensionFactories: [...launch.hooks, ...codemode, ...(builtinMcp ? [builtinMcp] : [])],
+				additionalExtensionPaths: builtinMcp ? [...filesystemPaths, "builtin:mcp"] : filesystemPaths,
+				extensionFactories: [...launch.hooks, ...codemode, ...(builtinMcp ? [builtinMcp] : []), ...context7Factories],
 				extensionsOverride: prioritizeChildPromptRuntime,
 				...(launch.systemPrompt !== undefined ? { systemPrompt: launch.systemPrompt } : {}),
 				...(launch.appendSystemPrompt !== undefined ? { appendSystemPrompt: [launch.appendSystemPrompt] } : {}),
@@ -476,9 +492,22 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				applyProcessEnv(launch.processEnv);
 				if (!resetExtensionCacheOnReload(loader) && (launch.ambientExtensions || launch.extensionPaths.length)) launch.onExtensionError?.({ extensionPath: "<loader>", event: "load", error: new Error("pi's extension cache reset is unavailable; extensions loaded into this child share module state with other sessions in this process.") });
 				await loader.reload();
-				const loadErrors = requiredPaths.size > 0
-					? loader.getExtensions().errors.filter(({ path }) => requiredPaths.has(path)) : [];
-				if (loadErrors.length > 0) throw new Error(`Required child extension failed to load: ${loadErrors.map(({ path, error }) => `${path}: ${error}`).join("; ")}`);
+				const selected = loader.getExtensions();
+				const selectedErrors = selected.errors;
+				const observe = options.confinedContext7 ? options.confinedStartupObservation : undefined;
+				const bindingErrors: Array<{ path: string; kind: "bind-error" }> = [];
+				let bindingErrorOverflow = false;
+				const observed = () => {
+					const actual = loader.getExtensions();
+					return {
+						extensions: actual.extensions.map(entry => ({ path: entry.path, resolvedPath: entry.resolvedPath, tools: [...entry.tools.keys()] })),
+						errors: [...actual.errors.map(entry => ({ path: entry.path, kind: "load-error" as const })), ...bindingErrors],
+					};
+				};
+				if (observe) observe({ phase: "loaded", ...observed() });
+				const loadErrors = options.confinedProviderTransport ? selectedErrors
+					: requiredPaths.size > 0 ? selectedErrors.filter(({ path }) => requiredPaths.has(path)) : [];
+				if (loadErrors.length > 0) throw new Error(`${options.confinedProviderTransport ? "Confined selected" : "Required child"} extension failed to load: ${loadErrors.map(({ path, error }) => `${path}: ${error}`).join("; ")}`);
 				const queued = flushQueuedProviderRegistrations(loader, modelRuntime, launch.onExtensionError, requiredPaths);
 				const inherited = launch.parentProviderRegistry
 					? inheritParentProviders(modelRuntime, launch.parentProviderRegistry, queued.claimedProviderIds, launch.onExtensionError)
@@ -519,10 +548,28 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				try {
 					await session.bindExtensions({
 						mode: "print",
-						onError: (error) => launch.onExtensionError?.({ extensionPath: error.extensionPath, event: error.event, error: error.error }),
+						onError: (error) => {
+							if (observe) {
+								if (bindingErrors.length < 64) bindingErrors.push({ path: error.extensionPath, kind: "bind-error" });
+								else bindingErrorOverflow = true;
+							}
+							launch.onExtensionError?.({ extensionPath: error.extensionPath, event: error.event, error: error.error });
+						},
 					});
 				} catch (error) {
 					session.dispose();
+					throw error;
+				}
+				try {
+					if (bindingErrorOverflow) throw new Error("Confined startup binding errors exceed the observation bound.");
+					if (observe) observe({
+						phase: "bound", ...observed(),
+						session: { id: session.sessionManager.getSessionId(), model: session.model ? session.model.provider + "/" + session.model.id : "unresolved", thinking: session.thinkingLevel, registeredTools: session.getAllTools().map(tool => tool.name), activeTools: session.getActiveToolNames() },
+					});
+					if (observe && bindingErrors.length) throw new Error("Confined selected extensions failed during native startup binding.");
+				} catch (error) {
+					try { await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); }
+					finally { session.dispose(); }
 					throw error;
 				}
 				return session;
