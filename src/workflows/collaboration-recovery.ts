@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import { createHash } from "node:crypto";
 import { decodeCollaboration, readCollaborationJson, type CollaborationJson } from "./collaboration-json.ts";
-import { collaborationSnapshotSchema, collaborationRecoverySchema } from "./collaboration-schema.ts";
+import { collaborationSnapshotSchema, collaborationRecoverySchema, collaborationNeverSpawnedSchema } from "./collaboration-schema.ts";
 import * as path from "node:path";
 import { DIRS } from "../shared/types.ts";
 import { assertCollaborationQuiescent, collaborationNamespaceSchema } from "../runs/shared/collaboration-quiescence.ts";
@@ -26,7 +26,21 @@ export function readCollaborationSnapshot(file: string): CollaborationSnapshot {
 	try {
 		const info = fs.fstatSync(fd);
 		if (!info.isFile() || info.size > 1024 * 1024) throw new Error("Collaboration recovery snapshot exceeds its byte bound.");
-		const decoded = decodeCollaboration(collaborationSnapshotSchema, readCollaborationJson(fs.readFileSync(fd, "utf8")), "Invalid collaboration recovery snapshot.");
+		const source = fs.readFileSync(fd, "utf8");
+		// Reject ambiguity at every enclosing object before last-key-wins decoding.
+		const tokens = source.match(/"(?:\\.|[^"\\])*"|[{}\[\]:,]|[^\s{}\[\]:,]+/gu) ?? [];
+		const objects: Array<Set<string> | undefined> = [];
+		for (let index = 0; index < tokens.length; index++) {
+			const token = tokens[index]!;
+			if (token.startsWith('"') && tokens[index + 1] === ":") {
+				const key = JSON.parse(token) as string, object = objects.at(-1);
+				if (object?.has(key)) throw new Error("Invalid duplicate recovery snapshot object key.");
+				object?.add(key);
+			} else if (token === "{") objects.push(new Set());
+			else if (token === "[") objects.push(undefined);
+			else if (token === "}" || token === "]") objects.pop();
+		}
+		const decoded = decodeCollaboration(collaborationSnapshotSchema, readCollaborationJson(source), "Invalid collaboration recovery snapshot.");
 		// SAFETY: The complete persisted domain structure is checked above. Enrollment owns semantic/path validation.
 		const result = decoded as CollaborationSnapshot;
 		return result;
@@ -64,6 +78,24 @@ export function proveCollaborationSnapshotQuiescent(prior: CollaborationSnapshot
 		assertCollaborationQuiescent(check.namespace);
 	}
 	for (const state of [...prior.summary.packages, ...(prior.summary.reconciliation ? [prior.summary.reconciliation] : [])]) {
+		if (state.neverSpawned !== undefined) {
+			const proof = decodeCollaboration(collaborationNeverSpawnedSchema, readCollaborationJson(JSON.stringify(state.neverSpawned)), "Invalid never-spawned proof.");
+			const states = [...prior.summary.packages, ...(prior.summary.reconciliation ? [prior.summary.reconciliation] : [])];
+			const packages = [...prior.manifest.packages, ...(prior.manifest.reconciliation ? [prior.manifest.reconciliation] : [])];
+			if (!["failed", "interrupted"].includes(state.state)
+				|| proof.epoch !== prior.epoch || proof.manifestDigest !== prior.manifestDigest
+				|| proof.manifestDigest !== createHash("sha256").update(JSON.stringify(prior.manifest)).digest("hex")
+				|| proof.manifestVersion !== prior.manifest.manifestVersion || proof.manifestVersion !== prior.summary.manifestVersion
+				|| proof.collaborationRunId !== prior.manifest.runId || proof.collaborationRunId !== prior.summary.runId
+				|| proof.packageId !== state.id || proof.executionId !== state.executionId
+				|| packages.filter((pkg) => pkg.id === state.id).length !== 1
+				|| states.filter((other) => other.id === state.id).length !== 1
+				|| states.filter((other) => other.executionId === state.executionId).length !== 1
+				|| ["runId", "pid", "nativeArtifactDir", "outputDigests", "completionContractDigest", "completionInputs", "completionPrerequisites", "completionManifestVersion", "reusedFrom"].some((key) => Object.hasOwn(state, key))
+				|| Object.values(prior.summary.publications).some((publication) => publication.packageId === state.id || publication.executionId === state.executionId))
+				throw new Error("quiescence-unproven: never-spawned proof is stale, conflicting or not bound to one terminal attempt.");
+			continue;
+		}
 		if (state.state === "blocked" || state.state === "ready") continue;
 		if (!state.runId || !/^[A-Za-z0-9._-]+$/u.test(state.runId)) throw new Error("quiescence-unproven: interrupted startup lacks native identity.");
 		const file = path.join(state.nativeArtifactDir ?? path.join(DIRS.async, state.runId), "collaboration-namespace.json");
@@ -77,7 +109,7 @@ export function proveCollaborationSnapshotQuiescent(prior: CollaborationSnapshot
 export function reuseCollaborationCompletion(prior: CollaborationSnapshot, manifest: CollaborationManifest, state: CollaborationSummary["packages"][number]): void {
 	const oldPackage = prior.manifest.packages.find((pkg) => pkg.id === state.id);
 	const pkg = manifest.packages.find((entry) => entry.id === state.id);
-	if (!oldPackage || !pkg || state.state !== "completed" || !state.completionInputs || !state.completionPrerequisites
+	if (state.neverSpawned !== undefined || !oldPackage || !pkg || state.state !== "completed" || !state.completionInputs || !state.completionPrerequisites
 		|| state.completionContractDigest !== createHash("sha256").update(JSON.stringify(oldPackage)).digest("hex")
 		|| JSON.stringify(pkg) !== JSON.stringify(oldPackage)
 		|| JSON.stringify(Object.keys(state.completionInputs).sort()) !== JSON.stringify(pkg.reads.filter((id) => !pkg.writes.includes(id)).sort())

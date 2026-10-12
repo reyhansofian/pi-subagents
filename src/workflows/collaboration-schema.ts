@@ -1,4 +1,4 @@
-import { Type } from "typebox";
+import { Type, type Static } from "typebox";
 import { collaborationNamespaceSchema } from "../runs/shared/collaboration-quiescence.ts";
 
 const id = Type.String({ minLength: 1, maxLength: 128 });
@@ -29,10 +29,18 @@ export const collaborationManifestRecordSchema = Type.Object({
 		context7: Type.Optional(Type.Object({ path: text, digest: text }, { additionalProperties: false })),
 		assets: Type.Array(Type.Object({ path: text, digest: text }, { additionalProperties: false })),
 		extensions: Type.Array(Type.Object({ path: text, digest: text, effects: Type.Array(Type.Union([Type.Literal("local-filesystem"), Type.Literal("provider-network"), Type.Literal("context7-network")])) }, { additionalProperties: false })),
-		environment: strings,
+		environment: strings, credentialAgentDir: Type.Optional(text),
 	}, { additionalProperties: false }),
 }, { additionalProperties: false });
+export const collaborationNeverSpawnedSchema = Type.Object({
+	version: Type.Literal(1), kind: Type.Literal("never-spawned"),
+	epoch: Type.String({ pattern: "^[a-zA-Z0-9-]{1,128}$" }),
+	manifestDigest: Type.String({ pattern: "^[a-f0-9]{64}$" }), manifestVersion: version,
+	collaborationRunId: id, packageId: id, executionId: id,
+}, { additionalProperties: false });
+export type CollaborationNeverSpawned = Static<typeof collaborationNeverSpawnedSchema>;
 const packageState = Type.Object({
+	neverSpawned: Type.Optional(collaborationNeverSpawnedSchema),
 	id, state: Type.Union([Type.Literal("blocked"), Type.Literal("ready"), Type.Literal("reserved"), Type.Literal("running"), Type.Literal("validating"), Type.Literal("completed"), Type.Literal("failed"), Type.Literal("interrupted")]),
 	completionContractDigest: Type.Optional(text), nativeArtifactDir: Type.Optional(text),
 	completionInputs: Type.Optional(Type.Record(Type.String(), Type.Object({ path: text, version, digest: text, packageId: Type.Optional(text), executionId: Type.Optional(text) }, { additionalProperties: false }))),

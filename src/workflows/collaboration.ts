@@ -8,13 +8,16 @@ import * as path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { normalizeCollaborationManifest, collaborationDigest, collaborationResourcePath, type CollaborationManifest, type CollaborationPackage, type CollaborationCheck } from "./collaboration-manifest.ts";
 import { acquireSessionLease } from "../runs/shared/session-lease.ts";
-import { registerCollaborationLaunch, verifyCollaborationRuntime, collaborationSandboxTools } from "../runs/shared/collaboration-launch.ts";
+import { registerCollaborationLaunch, verifyCollaborationRuntime, collaborationSandboxTools, type CollaborationLaunchHandle } from "../runs/shared/collaboration-launch.ts";
 import { executeWorkflowHostCommand } from "./host-command.ts";
 import { writePrivateAtomicJson } from "../shared/atomic-json.ts";
 import { TEMP_ROOT_DIR } from "../shared/types.ts";
 import type { WorkflowScriptChildResult } from "./scripted-workflow.ts";
 
+import type { CollaborationNeverSpawned } from "./collaboration-schema.ts";
+
 export interface CollaborationPackageState {
+	neverSpawned?: CollaborationNeverSpawned;
 	id: string;
 	state: "blocked" | "ready" | "reserved" | "running" | "validating" | "completed" | "failed" | "interrupted";
 	executionId?: string;
@@ -93,6 +96,48 @@ function workerBrief(manifest: CollaborationManifest, pkg: CollaborationPackage,
 	].join("\n");
 }
 
+/** Journal-first durability fence shared by coordinator persistence and retained checks. */
+export function writeCollaborationState(input: {
+	fd: number; snapshot: string; epoch: string; manifestDigest: string; sequence: number;
+	manifest: CollaborationManifest; summary: CollaborationSummary; event: string; detail: unknown;
+	writeSnapshot?: typeof writePrivateAtomicJson;
+}): void {
+	const record = JSON.stringify({ version: 1, sequence: input.sequence, observedAtMs: Date.now(), epoch: input.epoch, manifestDigest: input.manifestDigest, event: input.event, detail: input.detail }) + "\n";
+	if (Buffer.byteLength(record) > 64 * 1024) throw new Error("Consequential event exceeds the 64 KiB byte bound.");
+	if (fs.fstatSync(input.fd).size + Buffer.byteLength(record) > 8 * 1024 * 1024) throw new Error("Collaboration journal reached its 8 MiB bound; advancement is paused, history is preserved.");
+	// writeFileSync completes partial writes before the durability fence.
+	fs.writeFileSync(input.fd, record); fs.fsyncSync(input.fd);
+	const payload = { version: 1, epoch: input.epoch, manifestDigest: input.manifestDigest, sequence: input.sequence, manifest: input.manifest, summary: input.summary };
+	if (Buffer.byteLength(JSON.stringify(payload)) > 1024 * 1024) throw new Error("Coordination snapshot exceeds its 1 MiB byte bound.");
+	(input.writeSnapshot ?? writePrivateAtomicJson)(input.snapshot, payload);
+	const snapshotFd = fs.openSync(input.snapshot, "r"); try { fs.fsyncSync(snapshotFd); } finally { fs.closeSync(snapshotFd); }
+	const dirFd = fs.openSync(path.dirname(input.snapshot), "r"); try { fs.fsyncSync(dirFd); } finally { fs.closeSync(dirFd); }
+}
+/** Revoke synchronously before the first await; only the native owner can supply proof. */
+export async function settleCollaborationFailure(input: {
+	launch: CollaborationLaunchHandle; state: CollaborationPackageState; signal: AbortSignal; cause: unknown;
+	reconciliation?: boolean; storageFailed: () => boolean; markQuiescenceUnproven: () => void;
+	persist: (event: string, detail: unknown) => void;
+}): Promise<void> {
+	const proof = input.launch.finalizeNeverSpawned();
+	let error = input.cause;
+	try { await input.launch.stopAndDrain(); } catch (drainError) {
+		input.markQuiescenceUnproven();
+		if (!input.reconciliation) error = drainError;
+	}
+	if (Value.Check(Type.Object({ code: Type.Literal("quiescence-unproven") }, { additionalProperties: true }), error)) input.markQuiescenceUnproven();
+	input.state.state = input.signal.aborted ? "interrupted" : "failed";
+	input.state.reason = (input.reconciliation ? String(error) : error instanceof Error ? error.message : String(error)).slice(0, 2048);
+	if (proof) {
+		if (proof.packageId !== input.state.id || proof.executionId !== input.state.executionId) throw new Error("Obsolete failure settlement.");
+		input.state.neverSpawned = proof;
+	}
+	if (!input.storageFailed()) input.persist(input.reconciliation ? "reconciliation-failed" : "interrupted", {
+		...(input.reconciliation ? {} : { packageId: input.state.id }), executionId: input.state.executionId,
+		reason: input.state.reason, ...(proof ? { neverSpawned: proof } : {}),
+	});
+}
+
 /** Lifecycle-driven orchestration inside the existing workflow host. No model polling. */
 export async function runCollaboration(value: Parameters<typeof normalizeCollaborationManifest>[0], options: CollaborationOptions): Promise<CollaborationSummary> {
 	const controller = new AbortController();
@@ -161,16 +206,7 @@ export async function runCollaboration(value: Parameters<typeof normalizeCollabo
 			});
 			summary.pendingConsequential = { barrier: summary.barrier, controlSequence: summary.controlSequence };
 			summary.activeChecks = [...activeChecks.values()];
-			const record = JSON.stringify({ version: 1, sequence: ++sequence, observedAtMs: Date.now(), epoch: lease.owner.token, manifestDigest, event, detail }) + "\n";
-			if (Buffer.byteLength(record) > 64 * 1024) throw new Error("Consequential event exceeds the 64 KiB byte bound.");
-			if (fs.fstatSync(fd).size + Buffer.byteLength(record) > 8 * 1024 * 1024) throw new Error("Collaboration journal reached its 8 MiB bound; advancement is paused, history is preserved.");
-			// writeFileSync completes partial writes before the durability fence.
-			fs.writeFileSync(fd, record); fs.fsyncSync(fd);
-			const payload = { version: 1, epoch: lease.owner.token, manifestDigest, sequence, manifest, summary };
-			if (Buffer.byteLength(JSON.stringify(payload)) > 1024 * 1024) throw new Error("Coordination snapshot exceeds its 1 MiB byte bound.");
-			writePrivateAtomicJson(snapshot, payload);
-			const snapshotFd = fs.openSync(snapshot, "r"); try { fs.fsyncSync(snapshotFd); } finally { fs.closeSync(snapshotFd); }
-			const dirFd = fs.openSync(artifactDir, "r"); try { fs.fsyncSync(dirFd); } finally { fs.closeSync(dirFd); }
+			writeCollaborationState({ fd, snapshot, epoch: lease.owner.token, manifestDigest, sequence: ++sequence, manifest, summary, event, detail });
 		} catch (error) {
 			storageFailed = true;
 			for (const worker of active.values()) worker.stop();
@@ -263,7 +299,7 @@ export async function runCollaboration(value: Parameters<typeof normalizeCollabo
 				const completionInputs = Object.fromEntries(pkg.reads.filter((id) => !pkg.writes.includes(id)).map((id) => [id, { path: collaborationResourcePath(manifest, id), ...summary.publications[id]! }]));
 				const completionPrerequisites = Object.fromEntries(pkg.prerequisites.map((id) => [id, summary.packages.find((p) => p.id === id)!.executionId!]));
 				const launch = registerCollaborationLaunch({
-					manifest, pkg,
+					manifest, pkg, binding: { epoch: lease.owner.token, manifestDigest, executionId },
 					bindings: Object.fromEntries(pkg.reads.filter((id) => !pkg.writes.includes(id)).map((id) => [id, { path: collaborationResourcePath(manifest, id), version: summary.publications[id]!.version, digest: summary.publications[id]!.digest }])),
 					onDependencyAck() { persist("dependency-refresh-acknowledged", { packageId: pkg.id, executionId, manifestVersion: manifest.manifestVersion }); },
 					onStarted(pid, runId, configuration, nativeArtifactDir) {
@@ -275,7 +311,8 @@ export async function runCollaboration(value: Parameters<typeof normalizeCollabo
 				const params = {
 					...pkg.configuration, task: workerBrief(manifest, pkg, summary.publications), cwd: manifest.workspace,
 					async: true, workflowAwaitAsync: true, worktree: false, context: "fresh", collaborationGrant: launch.token,
-					output: pkg.writes.length ? path.join(collaborationResourcePath(manifest, pkg.writes[0]!), ".collaboration-receipt.md") : false,
+					// Native run artifacts retain reports; do not redirect workers into workspace receipts.
+					output: false, outputMode: "inline",
 				};
 				const operation = Promise.resolve().then(async () => {
 					await options.admit?.([{ key, params }], signal);
@@ -291,12 +328,8 @@ export async function runCollaboration(value: Parameters<typeof normalizeCollabo
 					state.outputDigests = Object.fromEntries(pkg.writes.map((resourceId) => [resourceId, collaborationDigest(collaborationResourcePath(manifest, resourceId))]));
 					state.state = "completed"; state.completionManifestVersion = manifest.manifestVersion; persist("published", { packageId: pkg.id, executionId, publications: pkg.publishes });
 				}).catch(async (cause: unknown) => {
-					let error = cause;
-					try { await launch.stopAndDrain(); } catch (drainError) { quiescenceUnproven = true; error = drainError; }
-					if (Value.Check(Type.Object({ code: Type.Literal("quiescence-unproven") }, { additionalProperties: true }), error)) quiescenceUnproven = true;
-					state.state = signal.aborted ? "interrupted" : "failed";
-					state.reason = (error instanceof Error ? error.message : String(error)).slice(0, 2048);
-					if (!storageFailed) persist("interrupted", { packageId: pkg.id, executionId, reason: state.reason });
+					await settleCollaborationFailure({ launch, state, signal, cause, storageFailed: () => storageFailed,
+						markQuiescenceUnproven: () => { quiescenceUnproven = true; }, persist });
 				}).finally(() => {
 					launch.dispose(); active.delete(pkg.id); summary.residents--;
 					if (!storageFailed) persist("resident-released", { packageId: pkg.id, executionId });
@@ -324,12 +357,12 @@ export async function runCollaboration(value: Parameters<typeof normalizeCollabo
 				summary.reconciliation = state; summary.residents = 1; summary.verification = "pending";
 				persist("exclusive-reconciliation-reserved", { packageId: pkg.id, executionId: state.executionId, candidateDigest: summary.candidateDigest });
 				const bindings = Object.fromEntries(pkg.reads.filter((id) => !pkg.writes.includes(id)).map((id) => [id, { path: collaborationResourcePath(manifest, id), version: summary.publications[id]?.version ?? manifest.manifestVersion, digest: collaborationDigest(collaborationResourcePath(manifest, id)) }]));
-				const launch = registerCollaborationLaunch({ manifest, pkg, bindings, readArtifacts: manifest.combinedChecks.map((c) => path.join(artifactDir, "combined." + c.id + ".log")),
+				const launch = registerCollaborationLaunch({ manifest, pkg, binding: { epoch: lease.owner.token, manifestDigest, executionId: state.executionId! }, bindings, readArtifacts: manifest.combinedChecks.map((c) => path.join(artifactDir, "combined." + c.id + ".log")),
 					onDependencyAck() { persist("reconciliation-refresh-acknowledged", { executionId: state.executionId }); },
 					onStarted(pid, runId, configuration, nativeArtifactDir) { summary.effectiveConfiguration[pkg.id] = configuration; state.pid = pid; state.runId = runId; state.nativeArtifactDir = nativeArtifactDir; state.state = "running"; persist("reconciliation-started", { pid, runId }); },
 				});
 				const key = manifest.runId + "." + pkg.id;
-				const params = { ...pkg.configuration, task: workerBrief(manifest, pkg, summary.publications) + "\\nConcrete combined verification failed. Read the concrete failed check logs: " + JSON.stringify(manifest.combinedChecks.map((c) => path.join(artifactDir, "combined." + c.id + ".log"))) + ". Repair only the declared integration scope; other writers have stopped.", cwd: manifest.workspace, async: true, workflowAwaitAsync: true, worktree: false, context: "fresh", collaborationGrant: launch.token, output: pkg.writes.length ? path.join(collaborationResourcePath(manifest, pkg.writes[0]!), ".collaboration-reconciliation.md") : false };
+				const params = { ...pkg.configuration, task: workerBrief(manifest, pkg, summary.publications) + "\\nConcrete combined verification failed. Read the concrete failed check logs: " + JSON.stringify(manifest.combinedChecks.map((c) => path.join(artifactDir, "combined." + c.id + ".log"))) + ". Repair only the declared integration scope; other writers have stopped.", cwd: manifest.workspace, async: true, workflowAwaitAsync: true, worktree: false, context: "fresh", collaborationGrant: launch.token, output: false, outputMode: "inline" };
 				const abortReconciliation = () => launch.stop();
 				signal.addEventListener("abort", abortReconciliation);
 				try {
@@ -344,10 +377,10 @@ export async function runCollaboration(value: Parameters<typeof normalizeCollabo
 					persist("reconciliation-completed", { executionId: state.executionId, candidateDigest: summary.candidateDigest });
 					summary.verification = await check(manifest.combinedChecks, "combined-after-reconciliation") && collaborationDigest(manifest.workspace) === summary.candidateDigest ? "passed" : "failed";
 				} catch (error) {
-					try { await launch.stopAndDrain(); } catch { quiescenceUnproven = true; }
+					const settlement = settleCollaborationFailure({ launch, state, signal, cause: error, reconciliation: true,
+						storageFailed: () => storageFailed, markQuiescenceUnproven: () => { quiescenceUnproven = true; }, persist });
 					summary.verification = "failed";
-					state.state = signal.aborted ? "interrupted" : "failed"; state.reason = String(error).slice(0, 2048);
-					persist("reconciliation-failed", { executionId: state.executionId, reason: state.reason });
+					await settlement;
 				} finally { signal.removeEventListener("abort", abortReconciliation); launch.dispose(); summary.residents = 0; }
 			}
 			summary.state = summary.verification === "passed" ? "completed" : "failed";
@@ -360,6 +393,6 @@ export async function runCollaboration(value: Parameters<typeof normalizeCollabo
 		await Promise.allSettled(Array.from(active.values(), (worker) => worker.promise));
 		controls.close();
 		fs.closeSync(fd);
-		if (!active.size && !activeChecks.size && !quiescenceUnproven) { lease.updateWriter({ state: "none" }); lease.release(); }
+		if (!active.size && !activeChecks.size && !quiescenceUnproven && !storageFailed) { lease.updateWriter({ state: "none" }); lease.release(); }
 	}
 }

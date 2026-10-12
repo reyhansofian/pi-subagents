@@ -31,6 +31,8 @@ async function until<T>(read: () => T | undefined): Promise<T> {
 for (const scenario of ["refill", "reconciliation", "serial", "wide", "live-ceiling", "stop-recover", "partial-failure", "conflict", "storage-failure", "optional-metrics", "replacement", "interface-update", "admission-race", "global-cap", "stale-input", "slow-storage", "concurrent-validation", "checked-writer", "reconciliation-partial", "reconciliation-retry-failed", "forged-status"] as const) it("public runs.collaborate uses the actual detached native runner and refills C after A publishes while B holds: " + scenario, { timeout: 60000 }, async () => {
 	const repo = fs.realpathSync.native(fileURLToPath(new URL("../..", import.meta.url)));
 	const workspace = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "collaboration-ticket-")));
+	// Checked collaboration evidence requires a real host-inspectable staging area.
+	if (scenario === "checked-writer" || scenario === "forged-status") execFileSync("git", ["init", "--quiet", workspace]);
 	const immutable = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "collaboration-fixed-fixture-")));
 	const sdk = "/nix/store/fylxrmnhiffb7f18lmwmwr013r9a1nqy-pi-1.1.0/lib/pi/node_modules/@earendil-works/pi-coding-agent";
 	const oldSdk = process.env.PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT;
@@ -161,7 +163,7 @@ for (const scenario of ["refill", "reconciliation", "serial", "wide", "live-ceil
 			const started = await executeAsyncSingle(runId, {
 				agent: String(params.agent), agentConfig: makeAgent(String(params.agent), { acceptanceRole: scenario === "checked-writer" || scenario === "forged-status" ? "writer" : undefined, extensions: [provider], tools: ["read", "write", "edit", "bash", "codemode", ...(scenario === "interface-update" ? ["contact_supervisor"] : [])] }),
 				task: String(params.task), cwd: workspace, collaborationGrant: String(params.collaborationGrant), controlIntercomTarget: "native-proof-parent",
-				modelOverride: String(params.model), output, parentWorkflowRunId: manifest.workflowId, workflowKey: key, workflowAwaitAsync: true,
+				modelOverride: String(params.model), output, outputMode: params.outputMode as "inline" | "file-only", parentWorkflowRunId: manifest.workflowId, workflowKey: key, workflowAwaitAsync: true,
 				// SAFETY: This fixture binds real native artifacts to its dedicated directory; the native runner owns artifact validation.
 				artifactConfig: { ...DEFAULT_ARTIFACT_CONFIG, enabled: true, dir: immutable }, shareEnabled: false, maxSubagentDepth: 0, timeoutMs: 20000,
 				// SAFETY: The isolated fixture supplies the exact methods/data exercised below; no claimed kernel or SDK behavior is mocked.

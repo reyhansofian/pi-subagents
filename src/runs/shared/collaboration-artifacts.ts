@@ -8,6 +8,7 @@ const ackSchema = Type.Object({
 }, { additionalProperties: false });
 const envelopeSchema = Type.Object({ runId: Type.Optional(Type.String()), id: Type.Optional(Type.String()), state: Type.Optional(Type.String()) }, { additionalProperties: true });
 import { evaluateAcceptance, acceptanceFailureMessage } from "./acceptance.ts";
+import { checkCollaborationStaging } from "./collaboration-staging.ts";
 import type { ResolvedAcceptanceConfig } from "../../shared/types.ts";
 interface CollaborationArtifactProjection { close(): void; flush(): void; ended(code: number | null, signal: string | null): Promise<void> }
 
@@ -101,9 +102,13 @@ export function projectCollaborationArtifacts(input: {
 			const claim = raw.results[0]!;
 			const claimedReport = Value.Check(Type.Object({ childReport: Type.Object({}, { additionalProperties: true }) }, { additionalProperties: true }), claim.acceptance) ? claim.acceptance.childReport : undefined;
 			const output = claim.output + (claimedReport ? "\n```acceptance-report\n" + JSON.stringify(claimedReport) + "\n```" : "");
-			const acceptance = await evaluateAcceptance({ acceptance: input.acceptance, output, cwd: input.cwd });
+			const acceptance = await evaluateAcceptance({
+				acceptance: input.acceptance, output, cwd: input.cwd,
+				...(!input.acceptance.preserveStagedIndex && input.acceptance.evidence.includes("no-staged-files")
+					? { parentStagingCheck: checkCollaborationStaging(input.cwd) } : {}),
+			});
 			const failure = acceptanceFailureMessage(acceptance);
-			const success = raw.success && !(input.acceptance.explicit && failure);
+			const success = raw.success && !failure;
 			const step = { agent: input.agent, model: input.model, thinking: input.thinking, output: claim.output, success, exitCode: success ? 0 : 1, acceptance };
 			writePrivateAtomicJson(path.join(input.parentDir, "status.json"), { ...currentParentStatus(), state: success ? "complete" : "failed", steps: [{ ...step, status: success ? "completed" : "failed" }], collaboration: { version: 1, authority: "parent-evaluated", workerClaimsAreUntrusted: true } });
 			const result = { runId: input.runId, id: input.runId, success, error: failure, results: [step] };

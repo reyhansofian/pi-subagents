@@ -33,6 +33,8 @@ export interface CollaborationPackage {
 	configuration: { agent: string; model?: string; thinking?: string };
 }
 export interface CollaborationRuntime {
+	/** Coordinator-selected host credential/model source; omission retains the SDK profile source. */
+	credentialAgentDir?: string;
 	/** Explicit offline providers need no network. Otherwise enroll the selected native Codex route. */
 	network: "openai-codex" | "none";
 	/** Explicit test-only hosted documentation route, separate from provider authority. */
@@ -132,6 +134,29 @@ export function collaborationResourcePath(manifest: CollaborationManifest, resou
 	if (!resource || resource.kind !== "path" || !resource.path) throw new Error("Unknown path resource " + resourceId);
 	return path.join(manifest.workspace, resource.path);
 }
+/** Select host credential/model input independently of the SDK profile. */
+export function collaborationCredentialAgentDir(manifest: Pick<CollaborationManifest, "workspace" | "runtime">, profileAgentDir: string): string {
+	const explicit = manifest.runtime.credentialAgentDir;
+	const directory = explicit ?? profileAgentDir;
+	const message = "shared-workspace-unsupported: credentialAgentDir must be an existing absolute canonical host directory outside the ticket workspace, never a worker asset.";
+	if (explicit !== undefined) {
+		try {
+			if (typeof explicit !== "string" || !path.isAbsolute(explicit) || fs.realpathSync.native(explicit) !== explicit || !fs.statSync(explicit).isDirectory()) throw new Error(message);
+			if (explicit === manifest.workspace || explicit.startsWith(manifest.workspace + path.sep) || manifest.workspace.startsWith(path.join(explicit, path.sep))) throw new Error(message);
+			if (["/nix/store", "/proc"].some((root) => explicit === root || explicit.startsWith(root + path.sep))) throw new Error(message);
+			const authPath = path.join(explicit, "auth.json");
+			const authInfo = fs.existsSync(authPath) ? fs.statSync(authPath) : undefined;
+			for (const asset of [...manifest.runtime.assets, ...manifest.runtime.extensions]) {
+				const canonical = fs.realpathSync.native(asset.path);
+				const info = fs.statSync(canonical);
+				if (canonical === explicit || explicit.startsWith(path.join(canonical, path.sep)) || canonical === authPath || (authInfo && info.dev === authInfo.dev && info.ino === authInfo.ino)) throw new Error(message);
+			}
+		} catch { throw new Error(message); }
+	}
+	if (path.join(directory, "auth.json").startsWith(manifest.workspace + path.sep)) throw new Error(message);
+	return directory;
+}
+
 export function normalizeCollaborationManifest(input: CollaborationManifest | CollaborationJson): CollaborationManifest {
 	const source = JSON.stringify(input) ?? "null";
 	if (Buffer.byteLength(source) > 256 * 1024) throw new Error("Collaboration manifest exceeds 256 KiB.");
@@ -140,7 +165,7 @@ export function normalizeCollaborationManifest(input: CollaborationManifest | Co
 	if (row.schemaVersion !== 1) throw new Error("Unsupported collaboration schemaVersion.");
 	const workspace = text(row.workspace, "workspace");
 	if (!path.isAbsolute(workspace) || fs.realpathSync.native(workspace) !== path.resolve(workspace) || !fs.statSync(workspace).isDirectory()) throw new Error("workspace must be an existing canonical directory.");
-	const runtime = object(row.runtime, ["assets", "extensions", "environment", "network", "context7"], "runtime");
+	const runtime = object(row.runtime, ["assets", "extensions", "environment", "network", "context7", "credentialAgentDir"], "runtime");
 	if (runtime.network !== undefined && runtime.network !== "none" && runtime.network !== "openai-codex") throw new Error("shared-workspace-unsupported: required provider transport is not enrolled.");
 	const context7 = runtime.context7 === undefined ? undefined : object(runtime.context7, ["path", "digest"], "runtime.context7");
 	if (runtime.context7 && runtime.network === "none") throw new Error("shared-workspace-unsupported: hosted Context7 cannot use an offline runtime.");
@@ -183,6 +208,10 @@ export function normalizeCollaborationManifest(input: CollaborationManifest | Co
 			environment: list(runtime.environment, "runtime.environment", (v, l) => text(v, l, 128), 64),
 		},
 	};
+	if (runtime.credentialAgentDir !== undefined) {
+		manifest.runtime.credentialAgentDir = text(runtime.credentialAgentDir, "runtime.credentialAgentDir");
+		collaborationCredentialAgentDir(manifest, manifest.runtime.credentialAgentDir);
+	}
 	if (context7) manifest.runtime.context7 = { path: text(context7.path, "runtime.context7.path"), digest: text(context7.digest, "runtime.context7.digest", 64) };
 	if (manifest.runtime.context7 && !manifest.runtime.extensions.some((entry) => entry.path === manifest.runtime.context7!.path && entry.digest === manifest.runtime.context7!.digest && entry.effects.includes("context7-network"))) throw new Error("shared-workspace-unsupported: configured Context7 factory lacks its exact immutable source/effect binding.");
 	for (const entry of manifest.runtime.extensions) if (entry.effects.includes("context7-network") && entry.path !== manifest.runtime.context7?.path) throw new Error("shared-workspace-unsupported: Context7 effect cannot enroll another extension.");

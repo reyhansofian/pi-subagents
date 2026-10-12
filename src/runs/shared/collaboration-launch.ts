@@ -8,8 +8,9 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import { projectCollaborationArtifacts } from "./collaboration-artifacts.ts";
 import { waitForCollaborationQuiescence, CollaborationQuiescenceError } from "./collaboration-quiescence.ts";
+import type { CollaborationNeverSpawned } from "../../workflows/collaboration-schema.ts";
 import type { CollaborationManifest, CollaborationPackage } from "../../workflows/collaboration-manifest.ts";
-import { collaborationDigest, collaborationResourcePath } from "../../workflows/collaboration-manifest.ts";
+import { collaborationDigest, collaborationResourcePath, collaborationCredentialAgentDir } from "../../workflows/collaboration-manifest.ts";
 import { spawnCollaborationSandbox, type CollaborationSandboxProcess } from "./collaboration-sandbox.ts";
 import { supervisorChannelDir } from "./child-tool-plan.ts";
 import { ensureSupervisorChannelDir } from "../../intercom/native-supervisor-channel.ts";
@@ -19,22 +20,39 @@ import { childCacheRetentionEnv } from "../../shared/child-cache-retention.ts";
 
 export interface CollaborationLaunchGrant {
 	manifest: CollaborationManifest;
+	binding: { epoch: string; manifestDigest: string; executionId: string };
 	pkg: CollaborationPackage;
 	readArtifacts?: string[];
 	bindings: Record<string, { path: string; version: number; digest: string }>;
 	onDependencyAck: () => void;
 	onStarted: (pid: number, runId: string, configuration: CollaborationPackage["configuration"], nativeArtifactDir: string) => void;
 }
-interface Entry { grant: CollaborationLaunchGrant; process?: CollaborationSandboxProcess; relay?: { close(): void }; used: boolean }
+interface Entry { grant: CollaborationLaunchGrant; proof: CollaborationNeverSpawned; process?: CollaborationSandboxProcess; relay?: { close(): void }; used: boolean; closed: boolean; proofReturned: boolean }
 const grants = new Map<string, Entry>();
-export interface CollaborationLaunchHandle { token: string; drain(): Promise<void>; stopAndDrain(): Promise<void>; stop(): void; dispose(): void }
+export interface CollaborationLaunchHandle { token: string; finalizeNeverSpawned(): CollaborationNeverSpawned | undefined; drain(): Promise<void>; stopAndDrain(): Promise<void>; stop(): void; dispose(): void }
+export function consumeCollaborationSpawnAuthority(token: string): void {
+	const entry = grants.get(token);
+	if (!entry || entry.closed || entry.used) throw new Error("Collaboration execution grant is missing, obsolete or already consumed.");
+	entry.used = true;
+}
 export function registerCollaborationLaunch(grant: CollaborationLaunchGrant): CollaborationLaunchHandle {
-	const token = randomUUID(), entry: Entry = { grant, used: false };
+	const token = randomUUID(), entry: Entry = { grant, used: false, closed: false, proofReturned: false,
+		proof: Object.freeze({ version: 1, kind: "never-spawned", epoch: grant.binding.epoch, manifestDigest: grant.binding.manifestDigest,
+			manifestVersion: grant.manifest.manifestVersion, collaborationRunId: grant.manifest.runId, packageId: grant.pkg.id, executionId: grant.binding.executionId }),
+	};
+	const revoke = () => { entry.closed = true; if (grants.get(token) === entry) grants.delete(token); };
 	grants.set(token, entry);
 	return {
 		token,
+		finalizeNeverSpawned() {
+			revoke();
+			if (entry.used || entry.process || entry.proofReturned) return undefined;
+			entry.proofReturned = true;
+			return entry.proof;
+		},
 		async drain() {
 			if (!entry.used) throw new Error("Native collaboration launch did not enroll; no publication is permitted.");
+			if (!entry.process) throw new CollaborationQuiescenceError("quiescence-unproven: consumed launch lacks process identity.");
 			if (entry.process) {
 				await entry.process.terminal;
 				if (!entry.process.initialized) throw new CollaborationQuiescenceError("quiescence-unproven: namespace identity is absent.");
@@ -43,15 +61,19 @@ export function registerCollaborationLaunch(grant: CollaborationLaunchGrant): Co
 			}
 		},
 		async stopAndDrain() {
-			if (!entry.process) return;
+			revoke();
+			if (!entry.process) {
+				if (entry.used) throw new CollaborationQuiescenceError("quiescence-unproven: consumed launch lacks process identity.");
+				return;
+			}
 			entry.relay?.close();
 			entry.process.stop();
 			await entry.process.terminal;
 			if (!entry.process.initialized) throw new CollaborationQuiescenceError("quiescence-unproven: namespace identity is absent.");
 			await waitForCollaborationQuiescence(await entry.process.initialized);
 		},
-		stop() { entry.relay?.close(); entry.process?.stop(); },
-		dispose() { if (!entry.process || entry.process.process.exitCode !== null || entry.process.process.signalCode !== null) grants.delete(token); },
+		stop() { revoke(); entry.relay?.close(); entry.process?.stop(); },
+		dispose() { revoke(); },
 	};
 }
 export function collaborationRunMarker(runId: string): string {
@@ -102,12 +124,60 @@ export function prepareCollaborationAgentHome(sourceHome: string, privateHome: s
 	}
 	return privateHome;
 }
+/** Validate the exact collections forwarded to the sandbox, including automatic grants. */
+export function assertCollaborationCredentialGrants(authPath: string, grants: Pick<import("./collaboration-sandbox.ts").CollaborationSandboxInput, "readPaths" | "writePaths" | "runtimePaths" | "privateWritePaths">): void {
+	const message = "shared-workspace-unsupported: effective worker grants expose the selected credential source.";
+	const directory = fs.realpathSync.native(path.dirname(authPath));
+	const authInfo = fs.existsSync(authPath) ? fs.lstatSync(authPath) : undefined;
+	if (authInfo && (!authInfo.isFile() || authInfo.nlink !== 1)) throw new Error(message);
+	for (const grant of [...grants.readPaths, ...grants.writePaths, ...grants.runtimePaths, ...(grants.privateWritePaths ?? [])]) {
+		const canonical = fs.realpathSync.native(grant);
+		const info = fs.statSync(canonical);
+		if (canonical === directory || directory.startsWith(canonical === path.sep ? path.sep : canonical + path.sep) || canonical === authPath || (authInfo && info.dev === authInfo.dev && info.ino === authInfo.ino)) throw new Error(message);
+	}
+}
+
+/** Native enrollment boundary: bind one source to the lease, model storage and relay. */
+export function enrollCollaborationModelStorage(input: {
+	manifest: CollaborationManifest; profileAgentDir: string; piPackageRoot: string;
+	privateRoot: string; deadlineAt: number | undefined; requiresCredentialLease: boolean;
+}): { storage: NonNullable<SubagentRunConfig["collaborationModelStorage"]>; modelReadPaths: string[] } {
+	const directory = collaborationCredentialAgentDir(input.manifest, input.profileAgentDir);
+	const authPath = path.join(directory, "auth.json");
+	if (input.requiresCredentialLease) assertCollaborationCredentialLease(authPath, input.deadlineAt);
+	const authInfo = fs.existsSync(authPath) ? fs.lstatSync(authPath) : undefined;
+	if (authInfo && (!authInfo.isFile() || authInfo.nlink !== 1)) throw new Error("shared-workspace-unsupported: credential source must be a single-link regular file without aliases.");
+	const isCredential = (info: fs.Stats) => authInfo && info.dev === authInfo.dev && info.ino === authInfo.ino;
+	const priorCatalog = path.join(directory, "models-store.json");
+	if (fs.existsSync(priorCatalog)) {
+		const fd = fs.openSync(priorCatalog, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+		try {
+			const info = fs.fstatSync(fd);
+			if (!info.isFile() || info.size > 1024 * 1024 || isCredential(info)) throw new Error("shared-workspace-unsupported: existing model catalog cache exceeds bounded enrollment or aliases credentials.");
+			const bytes = Buffer.alloc(info.size); fs.readSync(fd, bytes, 0, bytes.length, 0);
+			fs.writeFileSync(path.join(input.privateRoot, "models-store.json"), bytes, { mode: 0o600 });
+		} finally { fs.closeSync(fd); }
+	}
+	const modelsPath = path.join(directory, "models.json");
+	const modelReadPaths: string[] = [];
+	if (fs.existsSync(modelsPath)) {
+		const canonical = fs.realpathSync.native(modelsPath);
+		const info = fs.statSync(canonical);
+		if (!info.isFile() || isCredential(info) || canonical === authPath || canonical === directory || canonical === input.manifest.workspace || canonical.startsWith(input.manifest.workspace + path.sep)) throw new Error("shared-workspace-unsupported: model metadata cannot grant credential or mutable workspace paths.");
+		modelReadPaths.push(canonical);
+	}
+	return {
+		storage: { readonlyAuthModule: path.join(input.piPackageRoot, "dist/core/auth-storage.js"), authPath, modelsPath, modelsStorePath: path.join(input.privateRoot, "models-store.json") },
+		modelReadPaths,
+	};
+}
+
 export function spawnEnrolledCollaborationRunner(input: {
 	token: string; command: string; args: string[]; cwd: string; configPath: string;
 	config: SubagentRunConfig; env: NodeJS.ProcessEnv; hostStatus: Omit<import("../../shared/types.ts").AsyncStatus, "pid" | "processTerminal">;
 }): CollaborationSandboxProcess {
 	const entry = grants.get(input.token);
-	if (!entry || entry.used) throw new Error("Collaboration execution grant is missing, obsolete or already consumed.");
+	if (!entry || entry.closed || entry.used) throw new Error("Collaboration execution grant is missing, obsolete or already consumed.");
 	const { manifest, pkg } = entry.grant;
 	if (input.env.PI_ASYNC_NATIVE_RUNNER !== "1") throw new Error("shared-workspace-unsupported: the protected provider transport is enrolled only for the existing native Node runner; no Bun/proxy transport fallback was selected.");
 	if (input.cwd !== manifest.workspace) throw new Error("Collaboration runner changed the canonical workspace.");
@@ -175,45 +245,38 @@ export function spawnEnrolledCollaborationRunner(input: {
 	// These are host-owned read paths. Do not copy credentials or change routes.
 	const oldHome = process.env.PI_CODING_AGENT_DIR ?? path.join(process.env.HOME ?? "", ".pi", "agent");
 	if (!Value.Check(Type.String(), input.config.piPackageRoot)) throw new Error("shared-workspace-unsupported: selected host exposes no immutable read-only credential module.");
-	if (path.join(oldHome, "auth.json").startsWith(manifest.workspace + path.sep)) throw new Error("shared-workspace-unsupported: existing credential source must be host-owned outside the ticket workspace.");
-	if (authority) assertCollaborationCredentialLease(path.join(oldHome, "auth.json"), input.config.deadlineAt);
-	const priorCatalog = path.join(oldHome, "models-store.json");
-	if (fs.existsSync(priorCatalog)) {
-		const fd = fs.openSync(priorCatalog, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
-		try {
-			const info = fs.fstatSync(fd);
-			if (!info.isFile() || info.size > 1024 * 1024) throw new Error("shared-workspace-unsupported: existing model catalog cache exceeds bounded enrollment.");
-			const bytes = Buffer.alloc(info.size); fs.readSync(fd, bytes, 0, bytes.length, 0);
-			fs.writeFileSync(path.join(privateRoot, "models-store.json"), bytes, { mode: 0o600 });
-		} finally { fs.closeSync(fd); }
-	}
-	input.config.collaborationModelStorage = { readonlyAuthModule: path.join(input.config.piPackageRoot, "dist/core/auth-storage.js"), authPath: path.join(oldHome, "auth.json"), modelsPath: path.join(oldHome, "models.json"), modelsStorePath: path.join(privateRoot, "models-store.json") };
+	const modelEnrollment = enrollCollaborationModelStorage({
+		manifest, profileAgentDir: oldHome, piPackageRoot: input.config.piPackageRoot,
+		privateRoot, deadlineAt: input.config.deadlineAt, requiresCredentialLease: Boolean(authority),
+	});
+	input.config.collaborationModelStorage = modelEnrollment.storage;
 	writePrivateAtomicJson(input.configPath, input.config);
-	for (const name of ["models.json", "settings.json"]) {
-		const file = path.join(oldHome, name);
-		if (fs.existsSync(file)) readRuntime.push(fs.realpathSync.native(file));
-	}
+	readRuntime.push(...modelEnrollment.modelReadPaths);
+	const settings = path.join(oldHome, "settings.json");
+	if (fs.existsSync(settings)) readRuntime.push(fs.realpathSync.native(settings));
 	const agentHome = prepareCollaborationAgentHome(oldHome, home, Boolean(manifest.runtime.context7));
 	const env: import("./collaboration-sandbox.ts").CollaborationSandboxInput["env"] = { PATH: process.env.PATH ?? "", HOME: home, TMPDIR: temp, PI_CODING_AGENT_DIR: agentHome, RLM_WORKSPACE: manifest.workspace };
 	const runtimeKeys = [...Object.keys(childCacheRetentionEnv()), "PI_CACHE_RETENTION", "PI_SUBAGENT_CACHE_RETENTION", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy", "PI_CODING_AGENT_PACKAGE_ROOT", "PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT", "PI_PACKAGE_DIR", "JITI_ALIAS", "PI_ASYNC_NATIVE_RUNNER", "PI_SUBAGENTS_TEMP_ROOT", "PI_SUBAGENT_PARENT_SESSION"];
 	for (const name of [...runtimeKeys, ...manifest.runtime.environment]) if (input.env[name] !== undefined) env[name] = input.env[name]!;
-	fs.mkdirSync(path.dirname(collaborationRunMarker(runId)), { recursive: true, mode: 0o700 });
-	writePrivateAtomicJson(collaborationRunMarker(runId), { version: 1, runId, workspace: manifest.workspace, manifestVersion: manifest.manifestVersion, packageId: pkg.id });
-	// The coordinator has already persisted the full reservation. Record spawning
-	// before the OS launch; an interrupted startup is a recovery obligation.
-	entry.used = true;
-	const sandbox = spawnCollaborationSandbox({
+	const sandboxInput: import("./collaboration-sandbox.ts").CollaborationSandboxInput = {
 		workspace: manifest.workspace, hostSocketIsolation: true, providerTransport: Boolean(authority), initializationToken: randomUUID(), namespaceRoot, readPaths: reads, writePaths: pkg.writes.map((r) => collaborationResourcePath(manifest, r)),
 		privateWritePaths: privateWrites, runtimePaths: readRuntime,
 		command: fs.realpathSync.native(input.command), args: input.args, env,
 		enrolledEnvironment: [...runtimeKeys, ...manifest.runtime.environment, "RLM_WORKSPACE"], tools,
-	});
+	};
+	assertCollaborationCredentialGrants(modelEnrollment.storage.authPath, sandboxInput);
+	fs.mkdirSync(path.dirname(collaborationRunMarker(runId)), { recursive: true, mode: 0o700 });
+	writePrivateAtomicJson(collaborationRunMarker(runId), { version: 1, runId, workspace: manifest.workspace, manifestVersion: manifest.manifestVersion, packageId: pkg.id });
+	// The coordinator has already persisted the full reservation. Record spawning
+	// before the OS launch; an interrupted startup is a recovery obligation.
+	consumeCollaborationSpawnAuthority(input.token);
+	const sandbox = spawnCollaborationSandbox(sandboxInput);
 	entry.process = sandbox;
 	if (authority) {
 		// SAFETY: providerTransport adds exactly one duplex pipe at stdio[3]; the sandbox owns this descriptor.
 		const socket = sandbox.process.stdio[3] as Duplex | null;
 		if (!socket) { sandbox.stop(); throw new Error("Confined provider transport descriptor is unavailable."); }
-		const relay = attachCollaborationProviderRelay(socket, authority, { agentDir: oldHome, cwd: manifest.workspace, authPath: path.join(oldHome, "auth.json") });
+		const relay = attachCollaborationProviderRelay(socket, authority, { agentDir: oldHome, cwd: manifest.workspace, authPath: modelEnrollment.storage.authPath });
 		entry.relay = relay;
 		sandbox.process.once("close", () => relay.close());
 	}

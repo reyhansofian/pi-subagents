@@ -1140,10 +1140,10 @@ function checkStagedIndexUnchanged(cwd: string, baseline: string): AcceptanceRun
 	}
 }
 
-function runStructuralChecks(acceptance: ResolvedAcceptanceConfig, report: AcceptanceReport, cwd: string): AcceptanceRuntimeCheck[] {
+function runStructuralChecks(acceptance: ResolvedAcceptanceConfig, report: AcceptanceReport, cwd: string, parentStagingCheck?: AcceptanceRuntimeCheck): AcceptanceRuntimeCheck[] {
 	const checks: AcceptanceRuntimeCheck[] = [];
 	for (const kind of acceptance.evidence) {
-		if (kind === "no-staged-files" && acceptance.preserveStagedIndex) continue;
+		if (kind === "no-staged-files" && (acceptance.preserveStagedIndex || parentStagingCheck)) continue;
 		if (kind === "no-staged-files" && report.noStagedFiles === undefined) continue;
 		const status = reportEvidenceStatus(report, kind);
 		checks.push({
@@ -1156,7 +1156,11 @@ function runStructuralChecks(acceptance: ResolvedAcceptanceConfig, report: Accep
 					: `${kind} evidence missing from child report.`,
 		});
 	}
-	if (!acceptance.preserveStagedIndex && acceptance.evidence.includes("no-staged-files")) checks.push(checkNoStagedFiles(cwd));
+	if (!acceptance.preserveStagedIndex && acceptance.evidence.includes("no-staged-files")) {
+		checks.push(parentStagingCheck
+			? { ...parentStagingCheck, id: "no-staged-files", status: parentStagingCheck.status === "passed" ? "passed" : "failed" }
+			: checkNoStagedFiles(cwd));
+	}
 	return checks;
 }
 
@@ -1492,6 +1496,8 @@ export async function evaluateAcceptance(input: {
 	toolNames?: readonly string[];
 	/** Undefined means ambient inventory is unknown; [] means explicitly empty. */
 	availableTools?: readonly string[];
+	/** Host-only collaboration evidence, never read from a child report or launch JSON. */
+	parentStagingCheck?: AcceptanceRuntimeCheck;
 	/** Host-captured launch index tree; required by preserveStagedIndex. */
 	stagedIndexBaseline?: string;
 	/**
@@ -1590,7 +1596,7 @@ export async function evaluateAcceptance(input: {
 		ledger.runtimeChecks = [
 			...ledger.runtimeChecks,
 			...checkCriteriaSatisfied(acceptance.criteria, parsed.report),
-			...runStructuralChecks(acceptance, parsed.report, input.cwd),
+			...runStructuralChecks(acceptance, parsed.report, input.cwd, input.parentStagingCheck),
 		];
 		if (!ledger.runtimeChecks.some((check) => check.status === "failed")) {
 			ledger.status = "checked";
