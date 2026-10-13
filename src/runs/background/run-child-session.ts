@@ -250,6 +250,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 
 		const abortChild = (): void => {
 			if (settled || promptSettled) return;
+			input.launch.session.workerRuntime?.stop();
 			// A hung session creation has no session to abort yet; the settle timer below is the only
 			// thing that ends the run, and a session created afterwards is disposed by the launch block.
 			void session?.abort().catch(() => {
@@ -300,6 +301,8 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 		};
 		function armWatchdogTail(): void {
 			if ((!cleanTerminalAssistantStopReceived && !agentSettledReceived) || watchdogTailTimer || settled || promptSettled) return;
+			// Terminal watchdog/drain lifecycles are not supported verification ancestry.
+			input.launch.session.workerRuntime?.unsupported("terminal-watchdog-bound-unavailable");
 			watchdogTailTimer = setTimeout(() => {
 				watchdogTailTimer = undefined;
 				childWatchdogState = {
@@ -330,6 +333,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 		}
 		function armFinalDrainTimer(): void {
 			if (promptSettled || finalDrainTimer || settled) return;
+			input.launch.session.workerRuntime?.unsupported("terminal-drain-bound-unavailable");
 			finalDrainTimer = setTimeout(() => {
 				if (settled || promptSettled) return;
 				if (input.launch.capture.finalDrainHeld() || observeQueuedDrainHold()) {
@@ -369,6 +373,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 			if (!active) return;
 			clearTimeout(active.timer);
 			activeToolTimeouts.delete(key);
+			input.launch.session.workerRuntime?.toolEnded(key.startsWith("id:") ? key.slice(3) : key);
 			const keys = activeToolTimeoutKeysByName.get(active.toolName)?.filter((candidate) => candidate !== key) ?? [];
 			if (keys.length > 0) activeToolTimeoutKeysByName.set(active.toolName, keys);
 			else activeToolTimeoutKeysByName.delete(active.toolName);
@@ -400,12 +405,14 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 			if (runRemaining !== undefined && timeoutForTool >= runRemaining) return;
 			const key = toolTimeoutCallKey(event, ++toolTimeoutSequence);
 			const toolName = event.toolName;
+			const deadlineAtMs = Date.now() + timeoutForTool;
 			const timer = setTimeout(() => {
 				removeToolTimeoutKey(key);
 				terminateForTimeout(formatToolTimeoutMessage(toolName, timeoutForTool));
 			}, timeoutForTool);
 			timer.unref?.();
 			activeToolTimeouts.set(key, { toolName, timer });
+			if (typeof event.toolCallId === "string") input.launch.session.workerRuntime?.toolStarted(event.toolCallId, { kind: "finite", deadlineAtMs });
 			const keys = activeToolTimeoutKeysByName.get(toolName) ?? [];
 			keys.push(key);
 			activeToolTimeoutKeysByName.set(toolName, keys);
@@ -466,6 +473,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 			input.onChildEvent?.(event);
 
 			if (event.type === "tool_execution_end") {
+				if (typeof event.toolCallId === "string") input.launch.session.workerRuntime?.toolEnded(event.toolCallId);
 				clearActiveToolTimeout(event);
 				removeActiveToolCall(event);
 				return;
@@ -474,6 +482,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 			if (event.type === "tool_execution_start" && event.toolName) {
 				toolCount += 1;
 				const toolArgs = event.args && typeof event.args === "object" && !Array.isArray(event.args) ? event.args : {};
+				if (typeof event.toolCallId === "string") input.launch.session.workerRuntime?.toolStarted(event.toolCallId, { kind: "unbounded" });
 				armToolTimeout({ toolCallId: event.toolCallId, toolName: event.toolName });
 				recordActiveToolCall({ toolCallId: event.toolCallId, toolName: event.toolName, args: toolArgs });
 				if (event.toolName === "structured_output") {

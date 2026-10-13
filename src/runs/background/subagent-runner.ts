@@ -237,6 +237,7 @@ export interface SubagentRunConfig {
 	runnerProcessInstanceId?: string;
 	launchBarrierToken?: string;
 	parentWorkflowRunId?: string;
+	workerEnclosingBounds?: readonly import("../shared/worker-runtime.ts").WorkerBound[];
 	workflowKey?: string;
 	lane?: WorkflowLaneMetadata;
 }
@@ -697,6 +698,7 @@ interface SingleStepContext {
 	stopMessage?: string;
 	/** Resolved configured hard per-tool-call timeout (ms); fast tools still have a default when undefined. */
 	toolTimeoutMs?: number;
+	workerEnclosingBounds?: readonly import("../shared/worker-runtime.ts").WorkerBound[];
 	/** Effective step deadline (Date.now() + effective timeout) when a run budget exists. */
 	deadlineAt?: number;
 	childIntercomTarget?: string;
@@ -1858,13 +1860,14 @@ async function runSingleStepWithTimeout(
 		ctx.registerTimeout?.(action ? triggerTimeout : undefined);
 		if (action && timeoutTriggered) action();
 	};
+	const armedDeadlineAt = Date.now() + timeoutMs;
 	const timer = setTimeout(triggerTimeout, timeoutMs);
 	timer.unref?.();
 	try {
 		return await runSingleStep(step, {
 			...ctx,
 			registerTimeout,
-			deadlineAt: Date.now() + timeoutMs,
+			deadlineAt: armedDeadlineAt,
 			timeoutSignal: combinedAbortSignal([ctx.timeoutSignal, timeoutController.signal]),
 			timeoutMessage,
 		});
@@ -4624,6 +4627,7 @@ export async function runSubagent(
 			try {
 				singleResult = await runSingleStepWithTimeout(executionStep, compactOptional<SingleStepContext>({
 				previousOutput, placeholder, cwd: singleCwd, sessionEnabled,
+				workerEnclosingBounds: config.workerEnclosingBounds,
 				outputs: statusPayload.mode === "single" ? undefined : outputs,
 				sessionDir: config.sessionDir,
 				artifactsDir, artifactConfig, id,

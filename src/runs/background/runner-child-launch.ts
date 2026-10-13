@@ -1,5 +1,7 @@
 /** Native runner construction, separate from its executable entrypoint and attempt loop. */
 import * as path from "node:path";
+import { createWorkerRuntime, workerBound, type WorkerBound } from "../shared/worker-runtime.ts";
+import { snapshotChildLaunchBindings, snapshotChildLaunchIdentity } from "../../shared/child-launch-binding.ts";
 import { buildInProcessChildLaunch, type BuildInProcessChildLaunchInput, type InheritedChildRuntime } from "../shared/child-launch.ts";
 import { deriveForkPromptCacheKey } from "../shared/child-tool-plan.ts";
 import { normalizeExtensionBindings } from "../shared/extension-bindings.ts";
@@ -19,6 +21,8 @@ export interface RunnerChildLaunchContext {
 	capabilityCeiling?: BuildInProcessChildLaunchInput["capabilityCeiling"];
 	inheritedChildRuntime?: InheritedChildRuntime;
 	projectTrusted?: boolean;
+	deadlineAt?: number;
+	workerEnclosingBounds?: readonly WorkerBound[];
 }
 
 export function buildRunnerChildLaunch(step: RunnerSubagentStep, ctx: RunnerChildLaunchContext, attempt: {
@@ -34,7 +38,7 @@ export function buildRunnerChildLaunch(step: RunnerSubagentStep, ctx: RunnerChil
 	const acceptancePrompt = step.effectiveAcceptance
 		? formatAcceptancePrompt(step.effectiveAcceptance, { reportOptional: isAgentContract(step.agentContract), structuredOutput: Boolean(step.structuredOutput?.acceptanceReportPath) })
 		: "";
-	return buildInProcessChildLaunch({
+	const launch = buildInProcessChildLaunch({
 		machine: step.machine,
 		remoteSkillNames: step.skills,
 		remoteReads: step.remoteReads,
@@ -90,4 +94,12 @@ export function buildRunnerChildLaunch(step: RunnerSubagentStep, ctx: RunnerChil
 		inherited: ctx.inheritedChildRuntime,
 		host: "runner",
 	});
+	if (step.workerLaunch) {
+		const identity = snapshotChildLaunchIdentity(step.workerLaunch.identity);
+		if (identity.runId !== ctx.id || identity.agent !== step.agent || identity.cwd !== (step.cwd ?? ctx.cwd) || identity.parentSessionId !== step.parentSessionId) throw new Error("Worker launch transport identity mismatch.");
+		const bindings = snapshotChildLaunchBindings(step.workerLaunch.bindings, step.requiredExtensions ?? []);
+		if (!bindings) throw new Error("Worker binding transport unavailable.");
+		launch.session.workerRuntime = createWorkerRuntime(identity, bindings, workerBound(ctx.deadlineAt), ctx.workerEnclosingBounds ?? (identity.workflow ? [{ kind: "unavailable", reason: "workflow-ancestry-unavailable" }] : []));
+	}
+	return launch;
 }

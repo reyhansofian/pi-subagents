@@ -17,6 +17,7 @@
     "./capability-ceiling": "./src/api/capability-ceiling.ts",
     "./workflow-resources": "./src/api/workflow-resources.ts",
     "./required-child-extensions": "./src/api/required-child-extensions.ts",
+    "./worker-runtime": "./src/api/worker-runtime.ts",
     "./preflight": "./src/api/preflight.ts",
     "./control-channel": "./src/api/control-channel.ts",
     "./intercom-bridge": "./src/api/intercom-bridge.ts",

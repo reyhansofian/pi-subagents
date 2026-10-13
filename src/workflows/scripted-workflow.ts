@@ -1237,6 +1237,10 @@ export interface WorkflowChildSettledNotification {
 	result: WorkflowScriptChildResult;
 }
 
+const armedWorkflowBounds = new WeakMap<AbortSignal, Readonly<{ kind: "finite"; deadlineAtMs: number } | { kind: "unbounded" }>>();
+/** Private signal-object association recorded at the actual workflow timer boundary. */
+export function getArmedWorkflowBound(signal: AbortSignal | undefined) { return signal ? armedWorkflowBounds.get(signal) : undefined; }
+
 export interface RunWorkflowScriptOptions {
 	script: string;
 	/** Normalized raw-script input exposed as the deeply frozen sandbox global `args`. */
@@ -2331,6 +2335,8 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 			traceChanged();
 			finish({ error });
 		};
+		const armedBound = Object.freeze(options.timeoutMs === undefined ? { kind: "unbounded" as const } : { kind: "finite" as const, deadlineAtMs: Date.now() + options.timeoutMs });
+		armedWorkflowBounds.set(childController.signal, armedBound);
 		const timer = options.timeoutMs === undefined
 			? undefined
 			: setTimeout(() => {
@@ -2675,6 +2681,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				const childStopController = new AbortController();
 				childStopControllers.set(key, childStopController);
 				const childSignal = combinedAbortSignal([childController.signal, childStopController.signal]);
+				armedWorkflowBounds.set(childSignal, armedBound);
 				const resumeInput = resumeReference ?? (typeof params.resume === "string" && options.resolveResume ? params.resume : undefined);
 				const resolvedResumeValue = resumeInput
 					? await Promise.resolve().then(() => {

@@ -53,6 +53,8 @@ export interface RunnerSubagentStep {
 	allowedAgents?: string[];
 	extensions?: string[];
 	subagentOnlyExtensions?: string[];
+	/** Private host-created approval transport, not extensionBindings. */
+	workerLaunch?: { identity: Readonly<import("../../shared/required-child-extensions.ts").ChildLaunchIdentity>; bindings: import("../../shared/required-child-extensions.ts").ChildLaunchBindings };
 	/** Private immutable host policy snapshot serialized to the native runner. */
 	requiredExtensions?: import("../../shared/required-child-extensions.ts").RequiredChildExtensionSnapshot;
 	mcpDirectTools?: string[];

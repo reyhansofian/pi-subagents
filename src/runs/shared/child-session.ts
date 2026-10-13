@@ -122,6 +122,8 @@ export interface ChildSessionLaunch {
 	/** The typed runtime config the hooks were built from; informational for factories. */
 	runtime: ChildRuntimeConfig;
 	onExtensionError?: (error: ChildSessionExtensionError) => void;
+	/** Private bound async host controller, never read from model metadata. */
+	workerRuntime?: import("./worker-runtime.ts").WorkerRuntimeController;
 }
 
 export interface ChildSession {
@@ -482,8 +484,15 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				noThemes: true,
 				noContextFiles: launch.noContextFiles,
 				additionalExtensionPaths: builtinMcp ? [...filesystemPaths, "builtin:mcp"] : filesystemPaths,
-				extensionFactories: [...launch.hooks, ...codemode, ...(builtinMcp ? [builtinMcp] : []), ...context7Factories],
-				extensionsOverride: prioritizeChildPromptRuntime,
+				extensionFactories: [...launch.hooks, ...codemode, ...(builtinMcp ? [builtinMcp] : []), ...context7Factories, ...(launch.workerRuntime?.hooks ?? [])],
+				extensionsOverride: (base) => {
+					const ordered = prioritizeChildPromptRuntime(base);
+					if (!launch.workerRuntime) return ordered;
+					const first = ordered.extensions.find(entry => entry.path === "<inline:pi-subagents:worker-first>");
+					const last = ordered.extensions.find(entry => entry.path === "<inline:pi-subagents:worker-last>");
+					if (!first || !last) throw new Error("Protected native hook ordering unavailable.");
+					return { ...ordered, extensions: [first, ...ordered.extensions.filter(entry => entry !== first && entry !== last), last] };
+				},
 				...(launch.systemPrompt !== undefined ? { systemPrompt: launch.systemPrompt } : {}),
 				...(launch.appendSystemPrompt !== undefined ? { appendSystemPrompt: [launch.appendSystemPrompt] } : {}),
 			});
@@ -492,9 +501,9 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				applyProcessEnv(launch.processEnv);
 				if (!resetExtensionCacheOnReload(loader) && (launch.ambientExtensions || launch.extensionPaths.length)) launch.onExtensionError?.({ extensionPath: "<loader>", event: "load", error: new Error("pi's extension cache reset is unavailable; extensions loaded into this child share module state with other sessions in this process.") });
 				await loader.reload();
-				const selected = loader.getExtensions();
-				const selectedErrors = selected.errors;
 				const observe = options.confinedContext7 ? options.confinedStartupObservation : undefined;
+				const selectedErrors = options.confinedProviderTransport || requiredPaths.size > 0 || launch.workerRuntime || observe
+					? loader.getExtensions().errors : [];
 				const bindingErrors: Array<{ path: string; kind: "bind-error" }> = [];
 				let bindingErrorOverflow = false;
 				const observed = () => {
@@ -546,6 +555,15 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				});
 				pinChildCacheRetention(session.agent);
 				try {
+					if (launch.workerRuntime) {
+						const host = session as unknown as { getAllTools(): Array<{ name: string; sourceInfo?: { source?: string } }>; getToolDefinition(name: string): unknown };
+						const native = host.getToolDefinition("bash");
+						const selectedExtensions = loader.getExtensions().extensions;
+						launch.workerRuntime.attach(session.sessionManager, session.sessionManager.getSessionId(), () => {
+							const entries = loader.getExtensions().extensions;
+							return entries === selectedExtensions && entries[0]?.path === "<inline:pi-subagents:worker-first>" && entries.at(-1)?.path === "<inline:pi-subagents:worker-last>" && !!native && host.getToolDefinition("bash") === native && host.getAllTools().find(tool => tool.name === "bash")?.sourceInfo?.source === "builtin";
+						});
+					}
 					await session.bindExtensions({
 						mode: "print",
 						onError: (error) => {
@@ -582,6 +600,7 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 			// extensions loaded into it (ambient extensions included) release their
 			// watchers, servers, and timers. Do the same, then dispose.
 			const shutdown = async (): Promise<void> => {
+				launch.workerRuntime?.close();
 				try {
 					const runner = session.extensionRunner;
 					if (runner.hasHandlers("session_shutdown")) {

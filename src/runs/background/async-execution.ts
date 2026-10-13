@@ -7,7 +7,8 @@ import { spawnEnrolledCollaborationRunner } from "../shared/collaboration-launch
 import { validateSubagentRunConfig } from "./subagent-runner-bootstrap.ts";
 import { assertCollaborationQuiescent } from "../shared/collaboration-quiescence.ts";
 import type { CollaborationNamespaceIdentity } from "../shared/collaboration-sandbox.ts";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
+import { bindRequiredChildLaunch, hasRequiredChildLaunchBinding } from "../../shared/required-child-extensions.ts";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -259,6 +260,8 @@ interface AsyncChainParams {
 }
 
 interface AsyncSingleParams {
+	/** Actual workflow owner observation, supplied only by the enclosing host. */
+	workerEnclosingBound?: import("../shared/worker-runtime.ts").WorkerBound;
 	collaborationGrant?: string;
 	agent: string;
 	task?: string;
@@ -695,6 +698,17 @@ async function spawnRunner(cfg: NativeRunnerLaunchConfig, suffix: string, cwd: s
 	const hasRevivalLease = typeof (cfg as { revivalLease?: unknown }).revivalLease === "object";
 	const launchBarrierToken = hasRevivalLease ? undefined : runnerProcessInstanceId;
 	const launchConfig = { ...cfg, runnerProcessInstanceId, ...(launchBarrierToken ? { launchBarrierToken } : {}) };
+	if (steps.length === 1 && !isParallelGroup(steps[0] as RunnerStep) && !isDynamicRunnerGroup(steps[0] as RunnerStep)) {
+		const step = steps[0] as import("../shared/parallel-utils.ts").RunnerSubagentStep;
+		if (!step.runner && !step.machine && launchParentSessionId && hasRequiredChildLaunchBinding(launchParentSessionId)) {
+			const identity = Object.freeze({ runId: cfg.id, parentSessionId: launchParentSessionId, agent: step.agent, cwd: step.cwd ?? cwd,
+				taskSha256: createHash("sha256").update(step.task).digest("hex"),
+				...(cfg.parentWorkflowRunId && cfg.workflowKey ? { workflow: Object.freeze({ runId: cfg.parentWorkflowRunId, key: cfg.workflowKey }) } : {}),
+			});
+			const bindings = await bindRequiredChildLaunch(identity, step.requiredExtensions ?? []);
+			if (bindings) launchConfig.steps = [{ ...step, workerLaunch: { identity, bindings } }];
+		}
+	}
 	writePrivateAtomicJson(cfgPath, launchConfig);
 	const command = binaryHost ?? nodeExecutable;
 	const launchForStartup = launchConfig as typeof launchConfig & { asyncDir?: unknown; id?: unknown; sessionId?: unknown; completionOwnerId?: unknown; revivalLease?: unknown };
@@ -2136,6 +2150,7 @@ export function executeAsyncSingle(
 				childSessionFactoryModule: childSessionFactoryModule(),
 				projectTrusted: ctx.projectTrusted,
 				inheritedChildRuntime: inheritedChildRuntime(ctx.childRuntime),
+				...(params.workerEnclosingBound ? { workerEnclosingBounds: [params.workerEnclosingBound] } : {}),
 				worktreeSetupHook,
 				worktreeSetupHookTimeoutMs,
 				worktreeBaseDir,
